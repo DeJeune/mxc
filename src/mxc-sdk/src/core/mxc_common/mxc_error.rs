@@ -49,6 +49,19 @@ impl MxcErrorCode {
             Self::BackendError => "backend_error",
         }
     }
+
+    /// The process exit status a failure with this code terminates with.
+    ///
+    /// Every caller-fault code exits 1: the request asked for something that
+    /// will not be done, and only a changed request can succeed. A host fault
+    /// (`backend_unavailable`) and a runtime fault (`backend_error`) exit -1,
+    /// and are told apart by the code rather than by the status.
+    pub fn exit_code(self) -> i32 {
+        match self {
+            Self::BackendUnavailable | Self::BackendError => -1,
+            _ => 1,
+        }
+    }
 }
 
 impl std::fmt::Display for MxcErrorCode {
@@ -185,6 +198,18 @@ impl MxcError {
     /// The API call that failed, when one was in flight.
     pub fn operation(&self) -> Option<&str> {
         self.api_failure.as_ref().map(|f| f.operation.as_str())
+    }
+
+    /// Serialise to the JSON response envelope callers parse.
+    ///
+    /// Falls back to a minimal hand-written envelope if serialisation itself
+    /// fails, so a consumer that requires `error.code` still parses something.
+    pub fn to_envelope_string(&self) -> String {
+        let envelope: ResponseEnvelope<()> = ResponseEnvelope::from_error(self);
+        serde_json::to_string(&envelope).unwrap_or_else(|_| {
+            r#"{"error":{"code":"backend_error","message":"failed to serialise error envelope"}}"#
+                .to_string()
+        })
     }
 
     /// The underlying platform status, when known. Never present without

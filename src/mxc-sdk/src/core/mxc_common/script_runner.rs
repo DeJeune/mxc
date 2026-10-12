@@ -3,6 +3,7 @@
 
 use crate::mxc_common::logger::Logger;
 use crate::mxc_common::models::{ExecutionRequest, ScriptResponse};
+use crate::mxc_common::mxc_error::MxcError;
 use crate::mxc_common::validator::{
     validate_common, validate_network_policy_support, NetworkPolicySupport,
 };
@@ -97,7 +98,8 @@ pub fn handle_dry_run_exit(response: &ScriptResponse, logger: &mut Logger) -> ! 
 ///
 /// The `code` comes from the response's
 /// [`FailurePhase`](crate::mxc_common::models::FailurePhase), so a refused policy is
-/// reported as `policy_validation` rather than being flattened into the generic
+/// reported as `policy_validation` and a host that cannot provide the backend
+/// as `backend_unavailable`, rather than both being flattened into the generic
 /// `backend_error` every other failure uses.
 pub fn emit_backend_error_envelope(response: &ScriptResponse) {
     if response.exit_code == 0 || response.error_message.is_empty() {
@@ -117,6 +119,43 @@ pub fn emit_backend_error_envelope(response: &ScriptResponse) {
     if let Ok(json) = serde_json::to_string(&envelope) {
         eprintln!("{json}");
     }
+}
+
+/// The stderr lines a run's warnings are emitted as, one JSON object each.
+///
+/// Kept separate from [`emit_warning_envelopes`] so the exact bytes a caller
+/// has to parse are testable without capturing the process's stderr.
+fn warning_envelope_lines(warnings: &[String]) -> Vec<String> {
+    warnings
+        .iter()
+        .filter(|warning| !warning.trim().is_empty())
+        .filter_map(|warning| {
+            serde_json::to_string(&serde_json::json!({ "warning": { "message": warning } })).ok()
+        })
+        .collect()
+}
+
+/// Emit each warning as its own structured JSON line on stderr.
+///
+/// Warnings are reported on success as well as on failure, so this is separate
+/// from [`emit_backend_error_envelope`] rather than folded into it. One object
+/// per line keeps the stream parseable a line at a time, matching the error
+/// envelope.
+pub fn emit_warning_envelopes(warnings: &[String]) {
+    for line in warning_envelope_lines(warnings) {
+        eprintln!("{line}");
+    }
+}
+
+/// Emit a typed JSON error envelope on stderr for a failure raised before any
+/// [`ScriptResponse`] exists, then exit with the status its code implies.
+///
+/// Shared by every executor entry point. Without it such a failure prints a
+/// bare line and exits 1, which a caller cannot tell from a typed policy
+/// rejection.
+pub fn emit_mxc_error_exit(error: &MxcError) -> ! {
+    eprintln!("{}", error.to_envelope_string());
+    std::process::exit(error.code.exit_code());
 }
 
 #[cfg(test)]
@@ -162,6 +201,30 @@ mod tests {
             extended_error: "WIN32_ERROR(1920)".to_string(),
             ..Default::default()
         });
+    }
+
+    #[test]
+    fn warning_lines_are_one_parseable_object_each() {
+        let lines = super::warning_envelope_lines(&[
+            "dacl augmentation fell back".to_string(),
+            "quoted \"name\" and \\ backslash".to_string(),
+        ]);
+
+        assert_eq!(
+            lines[0],
+            r#"{"warning":{"message":"dacl augmentation fell back"}}"#
+        );
+        // A warning is free-form text, so it has to survive JSON escaping.
+        let parsed: serde_json::Value = serde_json::from_str(&lines[1]).unwrap();
+        assert_eq!(
+            parsed["warning"]["message"],
+            "quoted \"name\" and \\ backslash"
+        );
+    }
+
+    #[test]
+    fn blank_warnings_do_not_reach_the_stream() {
+        assert!(super::warning_envelope_lines(&[String::new(), "   ".to_string()]).is_empty());
     }
 
     #[test]

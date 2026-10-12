@@ -17,8 +17,8 @@ use mxc_sdk::mxc_common::diagnostic::DiagnosticConfig;
 use mxc_sdk::mxc_common::error::WxcError;
 use mxc_sdk::mxc_common::logger::{Logger, Mode};
 use mxc_sdk::mxc_common::models::{ContainmentBackend, ExecutionRequest, ScriptResponse};
-use mxc_sdk::mxc_common::mxc_error::{MxcError, MxcErrorCode, ResponseEnvelope};
-use mxc_sdk::mxc_common::script_runner::{handle_dry_run_exit, ScriptRunner};
+use mxc_sdk::mxc_common::mxc_error::{MxcError, MxcErrorCode};
+use mxc_sdk::mxc_common::script_runner::{emit_mxc_error_exit, handle_dry_run_exit, ScriptRunner};
 use mxc_sdk::mxc_common::state_aware_dispatch::{resolve_backend, DispatchOutcome};
 use mxc_sdk::mxc_common::state_aware_request::{MxcRequest, ParsedStateAwareRequest, Phase};
 use mxc_sdk::mxc_common::telemetry;
@@ -572,9 +572,7 @@ fn run_state_aware_main(
             diagnostic_logger.log_audit_event(&record);
         }
     }
-    for warning in logger.take_warnings() {
-        eprintln!("{warning}");
-    }
+    mxc_sdk::mxc_common::script_runner::emit_warning_envelopes(&logger.take_warnings());
     let buffered = logger.get_buffer().to_string();
     if !buffered.is_empty() {
         eprint!("{}", buffered);
@@ -710,9 +708,14 @@ fn finalize_state_aware_outcome(
     }
 }
 
+/// Where a request failure is written, which differs by request shape.
 enum RequestErrorRoute<'a> {
-    Diagnostic,
-    Envelope(&'a MxcError),
+    /// One-shot: a typed envelope on stderr, beside the diagnostics, because
+    /// stdout belongs to the script's own output.
+    Stderr(MxcError),
+    /// State-aware: the envelope *is* the operation's response document, so it
+    /// goes to stdout where the caller parses the result.
+    Stdout(&'a MxcError),
 }
 
 fn request_error_route(error: &ParseError) -> RequestErrorRoute<'_> {
@@ -720,8 +723,8 @@ fn request_error_route(error: &ParseError) -> RequestErrorRoute<'_> {
         ParseError::Decode(_)
         | ParseError::Version(_)
         | ParseError::OneShot(_)
-        | ParseError::OneShotMalformed(_) => RequestErrorRoute::Diagnostic,
-        ParseError::StateAware(e) => RequestErrorRoute::Envelope(e),
+        | ParseError::OneShotMalformed(_) => RequestErrorRoute::Stderr(error.to_mxc_error()),
+        ParseError::StateAware(e) => RequestErrorRoute::Stdout(e),
     }
 }
 
@@ -730,10 +733,8 @@ fn reject_state_aware_without_operation(logger: &mut Logger) -> ! {
         remove 'phase' and 'sandboxId' from the config JSON";
     let error = ParseError::OneShot(WxcError::ConfigParse(message.to_string()));
     log_request_parse_rejection(logger, &error, None);
-    eprintln!("Request error");
-    eprintln!("{message}");
     eprint!("{}", logger.get_buffer());
-    process::exit(1);
+    emit_mxc_error_exit(&MxcError::malformed_request(message));
 }
 
 fn log_request_parse_rejection(logger: &mut Logger, error: &ParseError, phase: Option<Phase>) {
@@ -786,18 +787,9 @@ fn print_error_envelope(error: &MxcError) {
 
 /// Serialise `error` to its JSON response-envelope string. Split out of
 /// [`print_error_envelope`] so [`finalize_state_aware_outcome`] can build the
-/// error-exit envelope without printing, and so both the print path and the
-/// state-aware exit path share one serialisation (including the last-resort
-/// fallback when the envelope itself fails to serialise).
+/// error-exit envelope without printing.
 fn error_envelope_string(error: &MxcError) -> String {
-    let envelope: ResponseEnvelope<()> = ResponseEnvelope::from_error(error);
-    serde_json::to_string(&envelope).unwrap_or_else(|_| {
-        // Last-resort path: serialisation of the envelope itself failed — emit a
-        // minimal structurally-valid envelope so consumers that require
-        // `error.code` still parse something.
-        r#"{"error":{"code":"backend_error","message":"failed to serialise error envelope"}}"#
-            .to_string()
-    })
+    error.to_envelope_string()
 }
 
 fn config_input(cli: &Cli) -> Option<(String, bool)> {
@@ -1076,15 +1068,17 @@ fn main() {
                 ) {
                     Ok(MxcRequest::OneShot(request)) => request,
                     Ok(MxcRequest::StateAware(_)) | Err(_) => {
-                        eprintln!("Error: failed to load probe config");
                         eprint!("{}", probe_logger.get_buffer());
-                        process::exit(1);
+                        emit_mxc_error_exit(&MxcError::malformed_request(
+                            "failed to load probe config",
+                        ));
                     }
                 },
                 Err(_) => {
-                    eprintln!("Error: failed to load probe config");
                     eprint!("{}", probe_logger.get_buffer());
-                    process::exit(1);
+                    emit_mxc_error_exit(&MxcError::malformed_request(
+                        "failed to load probe config",
+                    ));
                 }
             }
         } else {
@@ -1092,17 +1086,13 @@ fn main() {
         };
         let output = match mxc_sdk::mxc_engine::probe_execution_request(Some(&request)) {
             Ok(output) => output,
-            Err(error) => {
-                eprintln!("Error: {}", error.message);
-                process::exit(1);
-            }
+            Err(error) => emit_mxc_error_exit(&error.into_mxc_error()),
         };
         match mxc_sdk::process_container_common::probe::to_json_pretty(&output) {
             Ok(s) => println!("{s}"),
-            Err(e) => {
-                eprintln!("Error: probe serialization failed: {e}");
-                process::exit(1);
-            }
+            Err(e) => emit_mxc_error_exit(&MxcError::backend_error(format!(
+                "probe serialization failed: {e}"
+            ))),
         }
         return;
     }
@@ -1142,22 +1132,24 @@ fn main() {
         // Setup exits before any config is read, so a positional here is
         // most likely a runtime name given with a space instead of `=`.
         if let Some(stray) = &cli.config_path {
-            eprintln!(
-                "Error: --setup-hyperlight takes no config path; name runtimes with \
+            emit_mxc_error_exit(&MxcError::malformed_request(format!(
+                "--setup-hyperlight takes no config path; name runtimes with \
                  --setup-hyperlight={stray}"
-            );
-            process::exit(1);
+            )));
         }
         #[cfg(all(feature = "hyperlight", target_arch = "x86_64"))]
         {
             // WHP is delay-loaded; check before setup boots a VM.
             #[cfg(target_os = "windows")]
             if !mxc_sdk::hyperlight_common::is_whp_available() {
-                eprintln!(
-                    "Error: --setup-hyperlight requires Windows Hypervisor Platform (WHP). \
-                     Enable the HypervisorPlatform optional feature and reboot."
+                emit_mxc_error_exit(
+                    &MxcError::backend_unavailable(
+                        "--setup-hyperlight requires Windows Hypervisor Platform (WHP)",
+                    )
+                    .with_remediation(
+                        "Enable the HypervisorPlatform optional feature and reboot.",
+                    ),
                 );
-                process::exit(1);
             }
 
             // Setup is an interactive install: the pull and the warm-up
@@ -1165,27 +1157,24 @@ fn main() {
             let mut logger = Logger::new(Mode::Console);
             let runtimes = match mxc_sdk::hyperlight_common::parse_runtimes(runtime_names) {
                 Ok(runtimes) => runtimes,
-                Err(msg) => {
-                    eprintln!("Error: {msg}");
-                    process::exit(1);
-                }
+                Err(msg) => emit_mxc_error_exit(&MxcError::malformed_request(msg)),
             };
             match mxc_sdk::hyperlight_common::setup(cli.force, &runtimes, &mut logger) {
                 Ok(home) => {
                     eprintln!("hyperlight setup: image home ready at {:?}", home);
                     process::exit(0);
                 }
-                Err(msg) => {
-                    eprintln!("hyperlight setup failed: {msg}");
-                    process::exit(1);
-                }
+                Err(msg) => emit_mxc_error_exit(&MxcError::backend_error(format!(
+                    "hyperlight setup failed: {msg}"
+                ))),
             }
         }
         #[cfg(not(all(feature = "hyperlight", target_arch = "x86_64")))]
         {
             let _ = runtime_names;
-            eprintln!("Error: --setup-hyperlight requires x86_64 (Hyperlight needs KVM or WHP)");
-            process::exit(1);
+            emit_mxc_error_exit(&MxcError::backend_unavailable(
+                "--setup-hyperlight requires x86_64 (Hyperlight needs KVM or WHP)",
+            ));
         }
     }
 
@@ -1197,10 +1186,9 @@ fn main() {
         {
             let image = match cli.image.as_deref() {
                 Some(s) if !s.is_empty() => s,
-                _ => {
-                    eprintln!("Error: --setup-wslc requires --image <name>");
-                    process::exit(1);
-                }
+                _ => emit_mxc_error_exit(&MxcError::malformed_request(
+                    "--setup-wslc requires --image <name>",
+                )),
             };
             let mut logger = Logger::new(if cli.debug {
                 Mode::Console
@@ -1227,15 +1215,16 @@ fn main() {
             match result {
                 Ok(()) => process::exit(0),
                 Err(msg) => {
-                    eprintln!("wslc setup failed: {msg}");
-                    process::exit(1);
+                    emit_mxc_error_exit(&MxcError::backend_error(format!("wslc setup failed: {msg}")))
                 }
             }
         }
         #[cfg(not(feature = "wslc"))]
         {
-            eprintln!("Error: WSLC backend not compiled. Rebuild with --features wslc.");
-            process::exit(1);
+            emit_mxc_error_exit(
+                &MxcError::backend_unavailable("WSLC backend not compiled")
+                    .with_remediation("Rebuild with --features wslc."),
+            );
         }
     }
 
@@ -1267,9 +1256,7 @@ fn main() {
                 process::exit(1);
             }
             None => {
-                eprintln!("Request error");
-                eprintln!("{}", error.into_error());
-                process::exit(1);
+                emit_mxc_error_exit(&MxcError::malformed_request(error.into_error().to_string()));
             }
         },
         None => {
@@ -1286,8 +1273,7 @@ fn main() {
                     eprint!("{}", logger.get_buffer());
                     process::exit(1);
                 }
-                eprintln!("Error: {message}");
-                process::exit(1);
+                emit_mxc_error_exit(&MxcError::malformed_request(message));
             }
             None
         }
@@ -1297,10 +1283,9 @@ fn main() {
     if cli.delete {
         let name = match cli.containername {
             Some(ref n) => n.as_str(),
-            None => {
-                eprintln!("Error: --containername is required with --delete");
-                process::exit(1);
-            }
+            None => emit_mxc_error_exit(&MxcError::malformed_request(
+                "--containername is required with --delete",
+            )),
         };
         let success = delete_app_container_profile(name, &mut logger);
         print!("{}", logger.get_buffer());
@@ -1369,15 +1354,16 @@ fn main() {
         Err(error) => {
             log_request_parse_rejection(&mut logger, &error, None);
             match request_error_route(&error) {
-                RequestErrorRoute::Diagnostic => {
-                    eprint!("Request error\n{}", logger.get_buffer());
+                RequestErrorRoute::Stderr(typed) => {
+                    eprint!("{}", logger.get_buffer());
+                    emit_mxc_error_exit(&typed);
                 }
-                RequestErrorRoute::Envelope(e) => {
+                RequestErrorRoute::Stdout(e) => {
                     print_error_envelope(e);
                     eprint!("{}", logger.get_buffer());
+                    process::exit(e.code.exit_code());
                 }
             }
-            process::exit(1);
         }
     };
 
@@ -1428,27 +1414,25 @@ fn main() {
                 "containment",
                 "",
             );
-            eprintln!("Error: {message}");
             telemetry::emit_early_exit_with_kind(
                 telemetry_active,
                 &request.containment,
                 requested_sandbox_kind,
                 telemetry::FailureReason::ConfigError,
             );
-            process::exit(1);
+            emit_mxc_error_exit(&MxcError::policy_validation(message));
         }
         let injected = apply_permissive_learning_mode(&mut request.policy.capabilities);
         let context = match audit::prepare_request(&mut request, config_file_path(&cli)) {
             Ok(context) => context,
             Err(message) => {
-                eprintln!("Error: {message}");
                 telemetry::emit_early_exit_with_kind(
                     telemetry_active,
                     &request.containment,
                     requested_sandbox_kind,
                     telemetry::FailureReason::ConfigError,
                 );
-                process::exit(1);
+                emit_mxc_error_exit(&MxcError::backend_error(message));
             }
         };
         audit_context = Some(context);
@@ -1470,9 +1454,6 @@ fn main() {
             "process.commandLine",
             "",
         );
-        eprintln!(
-            "Error: no command to run. Provide `process.commandLine` in the policy or pass the command as arguments after the config path."
-        );
         eprint!("{}", logger.get_buffer());
         telemetry::emit_early_exit_with_kind(
             telemetry_active,
@@ -1480,7 +1461,9 @@ fn main() {
             requested_sandbox_kind,
             telemetry::FailureReason::ConfigError,
         );
-        process::exit(1);
+        emit_mxc_error_exit(&MxcError::malformed_request(
+            "no command to run. Provide `process.commandLine` in the policy or pass the command as arguments after the config path.",
+        ));
     }
 
     // Inject learningModeLogging capability when diagnostic console is enabled.
@@ -1589,14 +1572,14 @@ fn main() {
             resolved.runner
         }
         Err(e) => {
+            let error = e.into_mxc_error();
             log_config_rejected(
                 &mut logger,
-                RejectionReason::RunnerUnavailable,
+                rejection_reason_for(&error),
                 request.containment.wire_name(),
                 "containment",
                 "",
             );
-            eprintln!("error: {}", e.message);
             eprint!("{}", logger.get_buffer());
             telemetry::emit_early_exit_with_kind(
                 telemetry_active,
@@ -1604,7 +1587,7 @@ fn main() {
                 requested_sandbox_kind,
                 telemetry::FailureReason::InitError,
             );
-            process::exit(1);
+            emit_mxc_error_exit(&error);
         }
     };
 
@@ -1664,11 +1647,11 @@ fn main() {
     // deny-by-default under --audit). The logger only records these rather than
     // writing them itself, so that `mxc_engine` embedders don't get unannounced
     // writes to a terminal they own. wxc-exec *does* own its terminal, so it
-    // opts in here. Messages carry their own banner; print them verbatim.
+    // opts in here. Warnings travel on the response so a programmatic caller
+    // reads them from one structured place rather than scraping stderr.
     // Emitted before the dry-run branch below, which exits the process.
-    for warning in logger.warnings() {
-        eprintln!("{warning}");
-    }
+    response.warnings.extend(logger.take_warnings());
+    mxc_sdk::mxc_common::script_runner::emit_warning_envelopes(&response.warnings);
 
     #[cfg(target_os = "windows")]
     if let Err(error) = mxc_sdk::mxc_engine::emit_verbose_telemetry(
@@ -1953,7 +1936,7 @@ mod tests {
 
     impl ResolveError {
         fn from_parse(e: ParseError) -> Self {
-            let envelope_routed = matches!(request_error_route(&e), RequestErrorRoute::Envelope(_));
+            let envelope_routed = matches!(request_error_route(&e), RequestErrorRoute::Stdout(_));
 
             let message = match e {
                 ParseError::Decode(err)
@@ -2043,28 +2026,33 @@ mod tests {
 
     #[test]
     fn request_error_route_matches_the_output_conventions() {
-        let decode = ParseError::Decode(WxcError::ConfigParse("decode".to_string()));
-        assert!(matches!(
-            request_error_route(&decode),
-            RequestErrorRoute::Diagnostic
-        ));
-
-        let version = ParseError::Version(WxcError::ConfigParse("version".to_string()));
-        assert!(matches!(
-            request_error_route(&version),
-            RequestErrorRoute::Diagnostic
-        ));
-
-        let oneshot = ParseError::OneShot(WxcError::ConfigParse("oneshot".to_string()));
-        assert!(matches!(
-            request_error_route(&oneshot),
-            RequestErrorRoute::Diagnostic
-        ));
+        // The stderr route still classifies: a one-shot parse failure blames
+        // the request, so it reports a code rather than an untyped exit.
+        for (case, error) in [
+            (
+                "decode",
+                ParseError::Decode(WxcError::ConfigParse("decode".to_string())),
+            ),
+            (
+                "version",
+                ParseError::Version(WxcError::ConfigParse("version".to_string())),
+            ),
+            (
+                "oneshot",
+                ParseError::OneShot(WxcError::ConfigParse("oneshot".to_string())),
+            ),
+        ] {
+            let RequestErrorRoute::Stderr(typed) = request_error_route(&error) else {
+                panic!("{case}: one-shot failures belong on stderr");
+            };
+            assert_eq!(typed.code, MxcErrorCode::MalformedRequest, "{case}");
+            assert_eq!(typed.code.exit_code(), 1, "{case}");
+        }
 
         let stateaware = ParseError::StateAware(MxcError::malformed_request("stateaware"));
         assert!(matches!(
             request_error_route(&stateaware),
-            RequestErrorRoute::Envelope(_)
+            RequestErrorRoute::Stdout(_)
         ));
     }
 
@@ -2289,7 +2277,7 @@ mod tests {
             )
             .unwrap_err();
             assert!(
-                matches!(request_error_route(&error), RequestErrorRoute::Diagnostic),
+                matches!(request_error_route(&error), RequestErrorRoute::Stderr(_)),
                 "{case}: pre-discrimination failures must remain stderr diagnostics"
             );
 
@@ -2328,7 +2316,7 @@ mod tests {
             &mut logger,
         )
         .unwrap_err();
-        let RequestErrorRoute::Envelope(error) = request_error_route(&error) else {
+        let RequestErrorRoute::Stdout(error) = request_error_route(&error) else {
             panic!("identified lifecycle requests must retain their JSON error envelope");
         };
         let envelope: serde_json::Value =
@@ -2349,7 +2337,7 @@ mod tests {
                 .unwrap_err();
         assert!(matches!(
             request_error_route(&error),
-            RequestErrorRoute::Diagnostic
+            RequestErrorRoute::Stderr(_)
         ));
         assert!(logger.get_buffer().contains("duplicate field `telemetry`"));
     }
