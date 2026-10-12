@@ -91,7 +91,7 @@ even syntactically valid.
 |---|---|---|
 | `readonlyPaths` | `(allow file-read* (subpath …))` **plus** `(deny file-write* network-bind network-outbound (subpath …))` | Read the subtree — and explicitly *not* write it or use sockets in it |
 | `readwritePaths` | `(allow file-read* file-write* network-bind network-outbound (subpath …))` | Read, write, and use AF_UNIX sockets |
-| `deniedPaths` | `(deny file-read* file-write* network-bind network-outbound (subpath …))`, emitted **last** | Overrides every allow above it |
+| `deniedPaths` | `(deny file-read* file-read-metadata file-write* network-bind network-outbound (subpath …))`, emitted **last** | Overrides every allow above it |
 
 The paired deny on `readonlyPaths` is emitted for **every** read-only entry, not
 just nested ones. It matters most when a read-only path sits inside a broader
@@ -101,6 +101,12 @@ its own it says nothing about writes and couldn't displace the wider grant.
 Seatbelt is **last-match-wins** among rules that carry a filter, so denies
 emitted after allows win. (An *unfiltered* rule doesn't participate — a blanket
 `(allow network-outbound)` can't override a path-scoped deny.)
+
+A rule naming an operation outright outranks one that only reaches it through a
+wildcard, which is why `deniedPaths` spells out `file-read-metadata` alongside
+`file-read*`: the baseline grants metadata reads unfiltered so path resolution
+works, and without the explicit mention a denied path would still answer
+`stat()` with its real size and timestamps.
 
 Rules are emitted shallow-to-deep, so the **deepest** matching rule wins at any
 given path. `deniedPaths` sits outside that ordering and always outranks.
@@ -157,6 +163,10 @@ and standard tools work:
 | Read **+ write** | `/dev/null`, `/dev/zero`, `/dev/random`, `/dev/urandom` |
 | Read-data only | `/` itself — the loader can't resolve path lookups without it |
 
+Every sandbox also gets an unfiltered `(allow file-read-metadata)`, because the
+kernel reads metadata on each ancestor directory while resolving a path.
+`deniedPaths` names that operation explicitly so it still outranks the grant.
+
 The `/dev/*` entries are writable because shell redirections (`>/dev/null`,
 `</dev/urandom`) need both directions. Writes to `/dev/null` and `/dev/zero` are
 discarded; writes to the entropy devices are harmless.
@@ -182,7 +192,7 @@ Anything it hasn't declared is rejected up front.
 
 ### Fields (supported schema 0.9+)
 
-This is the cross-backend directional shape accepted by the registered exact
+This is the cross-backend directional format accepted by the supported
 contracts. Schema 0.8 is no longer accepted; see the
 [supported network fields](../../schema.md#directional-networking-supported-contracts).
 
@@ -628,7 +638,7 @@ deliberate: the alternative is a rule that matches nothing, which for
 |---|---|
 | `guiAccess: true` with `ui.disable: true`, or with no `ui` section | The GUI rules are only emitted when UI is enabled, so the request would otherwise be dropped without a word |
 | `guiAccess: true` with piped stdio or a caller-controlled PTY | GUI mode needs inherited stdio and an externally owned terminal |
-| `launchMethod` in a supported contract | The field is retired and rejected at exact parsing |
+| `launchMethod` in a supported contract | The field is retired and rejected during JSON parsing |
 
 ## Limitations
 

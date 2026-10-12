@@ -10,6 +10,8 @@
 use std::collections::HashSet;
 
 use crate::mxc_common::filesystem_resolve::FsIntent;
+#[cfg(any(target_os = "linux", test))]
+use crate::mxc_common::models::ContainerPolicy;
 use crate::mxc_common::models::{ExecutionRequest, NetworkAction, ProxyAddress};
 use crate::mxc_common::proxy_env::{is_managed_proxy_key, PROXY_SET_KEYS};
 
@@ -45,14 +47,20 @@ pub(crate) const COMMAND_TAIL: [&str; 3] = ["--", "sh", "-c"];
 /// - We deliberately do NOT bind `/run` wholesale: `/run/user/<uid>`
 ///   holds the caller's D-Bus session socket, keyring sockets, and
 ///   ssh-agent socket. We only bind the well-known DNS stub-resolver
-///   directories so name resolution still works when `/etc/resolv.conf`
+///   directories so the resolver file is *readable* when `/etc/resolv.conf`
 ///   is a symlink (the default on systemd-resolved hosts).
-/// - To keep DNS working when `/etc/resolv.conf` points *outside* those
-///   dirs, we also synthesise a `/var/run -> /run` compat symlink (for
+/// - To keep that file readable when `/etc/resolv.conf` points *outside*
+///   those dirs, we also synthesise a `/var/run -> /run` compat symlink (for
 ///   `/var/run/...`-routed targets — older RHEL/CentOS-era and some
 ///   container images) and `--ro-bind-try` `/mnt/wsl/resolv.conf` (for
 ///   WSL). Neither exposes host `/var` or `/mnt` contents — only the
 ///   resolver path itself.
+/// - Readable is not reachable. A nameserver on the host's loopback — the
+///   systemd-resolved stub at `127.0.0.53`, a local `dnsmasq` — belongs to
+///   the sandbox's own empty loopback once it is in a private network
+///   namespace, so these binds alone leave names unresolvable. Reaching such
+///   a resolver is what `proxy_network::ResolverPin` does, by pointing the
+///   sandbox at slirp's forwarder.
 /// - `/etc` is bound whole because cherry-picking files (`passwd`,
 ///   `nsswitch.conf`, `ssl/`, `ld.so.conf*`, …) is fragile and breaks
 ///   tools that read other config files. Files with sensitive contents
@@ -93,6 +101,57 @@ const BASELINE_RO_BIND_PATHS: &[&str] = &[
     // because the baseline is emitted via `--ro-bind-try`.
     "/mnt/wsl/resolv.conf",
 ];
+
+/// The compatibility symlink the sandbox gets in place of a real `/var/run`,
+/// and the directory it points at.
+pub(crate) const COMPAT_RUN_LINK: &str = "/var/run";
+pub(crate) const COMPAT_RUN_TARGET: &str = "/run";
+
+/// An absolute resolver target with no overlapping known mount destination.
+/// This lexical check does not resolve host or sandbox symlinks.
+#[cfg(any(target_os = "linux", test))]
+pub(crate) fn resolver_target_without_matching_mount(
+    policy: &ContainerPolicy,
+    target: &str,
+) -> bool {
+    if target == "/"
+        || !target.starts_with('/')
+        || target.split('/').any(|part| part == "." || part == "..")
+    {
+        return false;
+    }
+
+    let mut policy_mounts = policy
+        .readwrite_paths
+        .iter()
+        .chain(&policy.readonly_paths)
+        .chain(&policy.denied_paths)
+        .map(String::as_str);
+    for mount in BASELINE_RO_BIND_PATHS
+        .iter()
+        .copied()
+        .chain(["/dev", "/proc", "/tmp", "/var/run"])
+        .chain(policy_mounts.clone())
+    {
+        if !mount.starts_with('/')
+            || mount.split('/').any(|part| part == "." || part == "..")
+            || paths_overlap(target, mount)
+        {
+            return false;
+        }
+    }
+
+    // A policy mount at the link (or an ancestor) replaces the host /etc
+    // entry, so the presence of its target alone would not explain DNS.
+    !policy_mounts.any(|mount| paths_overlap("/etc/resolv.conf", mount))
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn paths_overlap(a: &str, b: &str) -> bool {
+    let a = std::path::Path::new(a);
+    let b = std::path::Path::new(b);
+    a.starts_with(b) || b.starts_with(a)
+}
 
 /// The networking behavior Bubblewrap applies for one execution.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -236,6 +295,50 @@ fn start_directory(request: &ExecutionRequest) -> Option<String> {
         .map(crate::mxc_common::models::sandbox_absolute_path)
 }
 
+/// Find an explicit cwd with no overlapping known mount destination.
+/// This is a lexical hint, not proof of visibility inside Bubblewrap.
+#[cfg(any(target_os = "linux", test))]
+pub(crate) fn cwd_without_matching_mount(request: &ExecutionRequest) -> Option<String> {
+    let dir = start_directory(request)?;
+    if dir == "/"
+        || !request.working_directory.starts_with('/')
+        || request
+            .working_directory
+            .split('/')
+            .any(|part| part == "." || part == "..")
+    {
+        return None;
+    }
+
+    let mounts = BASELINE_RO_BIND_PATHS
+        .iter()
+        .copied()
+        .chain(["/dev", "/proc", "/tmp", "/var/run"])
+        .chain(
+            request
+                .policy
+                .readwrite_paths
+                .iter()
+                .chain(&request.policy.readonly_paths)
+                .chain(&request.policy.denied_paths)
+                .map(String::as_str),
+        );
+    for mount in mounts {
+        if !mount.starts_with('/') || mount.split('/').any(|part| part == "." || part == "..") {
+            return None;
+        }
+        if path_is_within(&dir, mount) || path_is_within(mount, &dir) {
+            return None;
+        }
+    }
+    Some(dir)
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn path_is_within(path: &str, parent: &str) -> bool {
+    std::path::Path::new(path).starts_with(parent)
+}
+
 /// The default environment: `PATH`, `TERM`, and — when one resolves — `HOME`.
 ///
 /// `HOME` names the directory the child actually runs in, so it is a path the
@@ -354,7 +457,11 @@ pub(crate) fn build_args_classified_with_mode(
     // intermediate path would dangle inside the sandbox and DNS would
     // silently fail. The symlink rescues the whole `/var/run/...` family and
     // pulls no host `/var` contents in (bwrap synthesises an empty `/var`).
-    args.extend(["--symlink".into(), "/run".into(), "/var/run".into()]);
+    args.extend([
+        "--symlink".into(),
+        COMPAT_RUN_TARGET.into(),
+        COMPAT_RUN_LINK.into(),
+    ]);
 
     // Standard virtual filesystems (applied before policy mounts so policy
     // paths under /dev, /proc, or /tmp survive).
@@ -442,6 +549,213 @@ mod tests {
             script_code: "echo hello".into(),
             working_directory: "/home/user".into(),
             ..Default::default()
+        }
+    }
+
+    #[test]
+    fn resolver_target_hint_requires_no_mount_overlap() {
+        let mut policy = ContainerPolicy::default();
+        assert!(resolver_target_without_matching_mount(
+            &policy,
+            "/opt/private/resolv.conf"
+        ));
+        for no_warning in [
+            "/run/systemd/resolve/resolv.conf",
+            "/var/run/NetworkManager/resolv.conf",
+            "/mnt/wsl/resolv.conf",
+            "/etc/resolv.conf",
+            "/tmp/resolv.conf",
+        ] {
+            assert!(
+                !resolver_target_without_matching_mount(&policy, no_warning),
+                "unexpected advisory for {no_warning}"
+            );
+        }
+        policy.readonly_paths = vec!["/opt/private".into()];
+        assert!(!resolver_target_without_matching_mount(
+            &policy,
+            "/opt/private/resolv.conf"
+        ));
+        for mount in ["/opt/private/", "/opt//private/"] {
+            policy.readonly_paths = vec![mount.into()];
+            assert!(
+                !resolver_target_without_matching_mount(&policy, "/opt/private/resolv.conf"),
+                "{mount}"
+            );
+        }
+        policy.readonly_paths = vec!["/opt/private/resolv.conf/child".into()];
+        assert!(!resolver_target_without_matching_mount(
+            &policy,
+            "/opt/private/resolv.conf"
+        ));
+        policy.readonly_paths = vec!["/opt/private2".into()];
+        assert!(resolver_target_without_matching_mount(
+            &policy,
+            "/opt/private/resolv.conf"
+        ));
+        policy.readonly_paths = vec!["/".into()];
+        assert!(!resolver_target_without_matching_mount(
+            &policy,
+            "/opt/private/resolv.conf"
+        ));
+    }
+
+    #[test]
+    fn resolver_diagnostic_recognizes_every_emitted_mount_destination() {
+        let mut with_policy = base_request();
+        with_policy.policy.readwrite_paths = vec!["/home/user/data".into()];
+        with_policy.policy.readonly_paths = vec!["/opt/private".into()];
+        with_policy.policy.denied_paths = vec!["/srv/blocked".into()];
+        for request in [base_request(), with_policy] {
+            let args = build_args(&request, None);
+            for triple in args.windows(3) {
+                if matches!(
+                    triple[0].as_str(),
+                    "--ro-bind-try" | "--ro-bind" | "--bind" | "--symlink"
+                ) {
+                    assert!(
+                        !resolver_target_without_matching_mount(&request.policy, &triple[2]),
+                        "unrecognized mount destination: {triple:?}"
+                    );
+                }
+            }
+            for pair in args.windows(2) {
+                if matches!(pair[0].as_str(), "--dev" | "--proc" | "--tmpfs") {
+                    assert!(
+                        !resolver_target_without_matching_mount(&request.policy, &pair[1]),
+                        "unrecognized virtual mount destination: {pair:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn cwd_hint_requires_a_nonoverlapping_absolute_path() {
+        let mut request = base_request();
+        assert_eq!(
+            cwd_without_matching_mount(&request).as_deref(),
+            Some("/home/user")
+        );
+        request.working_directory = "/".into();
+        assert_eq!(cwd_without_matching_mount(&request), None);
+        request.working_directory = "".into();
+        assert_eq!(cwd_without_matching_mount(&request), None);
+        request.working_directory = "home/user".into();
+        assert_eq!(cwd_without_matching_mount(&request), None);
+        request.working_directory = "/home/../home/user".into();
+        assert_eq!(cwd_without_matching_mount(&request), None);
+    }
+
+    #[test]
+    fn cwd_overlap_is_inconclusive_in_either_direction() {
+        let mut request = base_request();
+        for cwd in ["/etc", "/etc/project", "/usr", "/tmp/work", "/var"] {
+            request.working_directory = cwd.into();
+            assert_eq!(cwd_without_matching_mount(&request), None, "{cwd}");
+        }
+        for mount in [
+            "/home",
+            "/home/user",
+            "/home/user/",
+            "/home//user/",
+            "/home/user/data",
+            "/home//user/data/",
+        ] {
+            request.working_directory = "/home/user".into();
+            request.policy.readonly_paths = vec![mount.into()];
+            assert_eq!(cwd_without_matching_mount(&request), None, "{mount}");
+        }
+        for mount in ["/home/user2", "/home/user2/"] {
+            request.policy.readonly_paths = vec![mount.into()];
+            assert_eq!(
+                cwd_without_matching_mount(&request).as_deref(),
+                Some("/home/user"),
+                "{mount}"
+            );
+        }
+        request.policy.readonly_paths = vec!["/alias/../home/user".into()];
+        assert_eq!(cwd_without_matching_mount(&request), None);
+        request.policy.readonly_paths = vec!["/".into()];
+        assert_eq!(cwd_without_matching_mount(&request), None);
+        request.policy.readonly_paths.clear();
+        request.policy.denied_paths = vec!["/home/user/hidden".into()];
+        assert_eq!(cwd_without_matching_mount(&request), None);
+    }
+
+    #[test]
+    fn cwd_proof_uses_the_mounted_baseline_and_virtual_roots() {
+        let request = base_request();
+        let args = build_args(&request, None);
+        for mount in BASELINE_RO_BIND_PATHS {
+            assert!(
+                args.windows(3)
+                    .any(|a| { a == ["--ro-bind-try", *mount, *mount] }),
+                "{mount}"
+            );
+        }
+        for (flag, path) in [
+            ("--dev", "/dev"),
+            ("--proc", "/proc"),
+            ("--tmpfs", "/tmp"),
+            ("--symlink", "/var/run"),
+        ] {
+            assert!(
+                args.windows(2).any(|a| a[0] == flag && a[1] == path)
+                    || (flag == "--symlink"
+                        && args.windows(3).any(|a| a == ["--symlink", "/run", path])),
+                "{flag} {path}"
+            );
+        }
+    }
+
+    #[test]
+    fn ambiguous_resolver_paths_and_shadowed_link_do_not_warn() {
+        let mut policy = ContainerPolicy::default();
+        for target in ["relative/resolv.conf", "/opt/../secret/resolv.conf", "/"] {
+            assert!(!resolver_target_without_matching_mount(&policy, target));
+        }
+        policy.denied_paths = vec!["/etc".into()];
+        assert!(!resolver_target_without_matching_mount(
+            &policy,
+            "/opt/private/resolv.conf"
+        ));
+        policy.denied_paths = vec!["/etc//".into()];
+        assert!(!resolver_target_without_matching_mount(
+            &policy,
+            "/opt/private/resolv.conf"
+        ));
+        policy.denied_paths = vec!["/alias/../etc".into()];
+        assert!(!resolver_target_without_matching_mount(
+            &policy,
+            "/opt/private/resolv.conf"
+        ));
+    }
+
+    #[test]
+    fn cwd_diagnostic_recognizes_every_emitted_mount_destination() {
+        let mut request = base_request();
+        let args = build_args(&request, None);
+        for triple in args.windows(3) {
+            if matches!(
+                triple[0].as_str(),
+                "--ro-bind-try" | "--ro-bind" | "--bind" | "--symlink"
+            ) {
+                request.working_directory = triple[2].clone();
+                assert!(
+                    cwd_without_matching_mount(&request).is_none(),
+                    "unrecognized mount destination: {triple:?}"
+                );
+            }
+        }
+        for pair in args.windows(2) {
+            if matches!(pair[0].as_str(), "--dev" | "--proc" | "--tmpfs") {
+                request.working_directory = pair[1].clone();
+                assert!(
+                    cwd_without_matching_mount(&request).is_none(),
+                    "unrecognized virtual mount destination: {pair:?}"
+                );
+            }
         }
     }
 
@@ -1285,10 +1599,10 @@ mod tests {
         }
     }
 
-    /// DNS stub-resolver dirs must be in the baseline so `/etc/resolv.conf`
-    /// symlinks resolve when the caller has network access. Emitted via
-    /// `--ro-bind-try` so hosts without systemd-resolved / NetworkManager /
-    /// resolvconf still build a valid argument vector.
+    /// DNS stub-resolver dirs must be in the baseline so an `/etc/resolv.conf`
+    /// symlink has a target to resolve to. Emitted via `--ro-bind-try` so hosts
+    /// without systemd-resolved / NetworkManager / resolvconf still build a
+    /// valid argument vector.
     #[test]
     fn baseline_includes_dns_stub_resolver_dirs() {
         let args = build_args(&base_request(), None);
@@ -1302,8 +1616,8 @@ mod tests {
                 .any(|w| w[0] == "--ro-bind-try" && w[1] == path && w[2] == path);
             assert!(
                 found,
-                "baseline must emit `--ro-bind-try {} {}` so DNS works when \
-                 /etc/resolv.conf is a symlink",
+                "baseline must emit `--ro-bind-try {} {}` so the sandbox can read \
+                 /etc/resolv.conf when it is a symlink",
                 path, path
             );
         }
