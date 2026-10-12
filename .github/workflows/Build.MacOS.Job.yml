@@ -7,6 +7,8 @@ jobs:
   build:
     name: arm64
     runs-on: macos-15
+    # A wedged PTY child would otherwise hold the runner for the 6-hour cap.
+    timeout-minutes: 45
     defaults:
       run:
         working-directory: src
