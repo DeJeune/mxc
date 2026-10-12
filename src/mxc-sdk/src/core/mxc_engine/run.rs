@@ -80,9 +80,12 @@ impl ResolvedRunner {
 /// Experimental backends, classified by the engine's backend registry, require
 /// `request.experimental_enabled`; without it they return a
 /// [`backend_unavailable`](MxcError::backend_unavailable) error before any
-/// host-specific resolution. Backends that are not available on this host /
-/// not compiled in return an
-/// [`unsupported_containment`](MxcError::unsupported_containment) error.
+/// host-specific resolution. A backend that this build did not compile in
+/// reports the same code, since only a rebuilt executor can serve it. A
+/// backend that belongs to a different operating system, or one that does not
+/// exist yet, reports
+/// [`unsupported_containment`](MxcError::unsupported_containment) instead,
+/// because naming a backend this host does support will succeed.
 pub fn resolve_runner(
     request: &ExecutionRequest,
     logger: &mut Logger,
@@ -254,7 +257,7 @@ fn resolve_runner_inner_windows(
                             let _ = writeln!(logger, "dacl warning: {w}");
                         }
                     }
-                    Err(MxcError::backend_unavailable(format!("{e}")))
+                    Err(e.to_mxc_error())
                 }
             }
         }
@@ -270,7 +273,7 @@ fn resolve_runner_inner_windows(
             #[cfg(not(feature = "wslc"))]
             {
                 let _ = logger;
-                Err(MxcError::unsupported_containment(
+                Err(MxcError::backend_unavailable(
                     "WSLC backend not compiled. Rebuild with --features wslc.",
                 ))
             }
@@ -296,7 +299,7 @@ fn resolve_runner_inner_windows(
             }
             #[cfg(not(feature = "microvm"))]
             {
-                Err(MxcError::unsupported_containment(
+                Err(MxcError::backend_unavailable(
                     "MicroVM backend not compiled in (build with --features microvm)",
                 ))
             }
@@ -329,7 +332,7 @@ fn resolve_runner_inner_windows(
             }
             #[cfg(not(feature = "isolation_session"))]
             {
-                Err(MxcError::unsupported_containment(
+                Err(MxcError::backend_unavailable(
                     "IsolationSession backend not compiled. Rebuild with --features isolation_session.",
                 ))
             }
@@ -360,7 +363,7 @@ fn resolve_runner_inner(
             }
             #[cfg(not(feature = "microvm"))]
             {
-                Err(MxcError::unsupported_containment(
+                Err(MxcError::backend_unavailable(
                     "MicroVM backend not compiled in (build with --features microvm)",
                 ))
             }
@@ -502,8 +505,9 @@ fn resolve_hyperlight() -> Result<ResolvedRunner, MxcError> {
     }
     #[cfg(not(all(feature = "hyperlight", target_arch = "x86_64")))]
     {
-        Err(MxcError::unsupported_containment(
-            "Hyperlight backend requires x86_64 (Hyperlight needs KVM or WHP)",
+        Err(MxcError::backend_unavailable(
+            "Hyperlight backend not compiled in; it requires x86_64 and --features hyperlight \
+             (Hyperlight needs KVM or WHP).",
         ))
     }
 }

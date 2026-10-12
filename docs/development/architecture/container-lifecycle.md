@@ -629,7 +629,10 @@ because a script's stderr may not end in a newline.
 `code` and `message` are always present. `code` is the machine-readable category a
 consumer branches on; `message` is the human-readable description, and for a failure
 raised by an underlying platform API it is that API's own message, passed through
-verbatim rather than concatenated with the other fields.
+verbatim rather than concatenated with the other fields. The executor's own exit
+code follows `code`: a refused request exits `1`, and an unavailable host or a
+runtime fault exits `-1`. See the error contract in
+[versioning.md](versioning.md#error-contract).
 
 The three optional named fields carry structured failure detail. `operation` and
 `nativeCode` describe an underlying platform call; `remediation` describes the failure:

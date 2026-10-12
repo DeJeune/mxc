@@ -705,6 +705,25 @@ Negotiation failures are **typed and actionable** — never a silent fallback:
   unsupported field. Security policy is deterministic — no relaxation, no fuzzy
   fallback.
 
+Every executor failure is classified by **which side can act on it**, and that
+classification drives both the wire code and the process exit code:
+
+| Side at fault | Failure phase | Wire code | Exit code |
+|---|---|---|---|
+| The request — a different request succeeds | `Rejected` | `policy_validation` | `1` |
+| The host — no request change helps | `BackendUnavailable` | `backend_unavailable` | `-1` |
+| The runtime, during an accepted run | all other phases | `backend_error` | `-1` |
+
+A backend this build did not compile in reports `backend_unavailable`, since
+only a rebuilt executor can serve it. A backend belonging to another operating
+system reports `unsupported_containment`, since naming a supported backend
+succeeds. Earlier phase-specific codes (`config_parse`, `malformed_request`,
+`unsupported_phase`, `malformed_id`) are unchanged and also exit `1`.
+
+`ScriptResponse` carries an optional `warnings` array of diagnostic strings.
+Warnings are advisory and never change the exit code; they are omitted from the
+wire entirely when a run produced none.
+
 The MXC ↔ OS contract therefore reports: which feature failed, whether it was a
 version mismatch or a runtime/capability unavailability (e.g. Hyper-V off), and
 what the user should do (upgrade OS, enable feature, change the config).

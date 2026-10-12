@@ -1132,24 +1132,22 @@ fn main() {
         // Setup exits before any config is read, so a positional here is
         // most likely a runtime name given with a space instead of `=`.
         if let Some(stray) = &cli.config_path {
-            emit_mxc_error_exit(&MxcError::malformed_request(format!(
-                "--setup-hyperlight takes no config path; name runtimes with \
+            eprintln!(
+                "Error: --setup-hyperlight takes no config path; name runtimes with \
                  --setup-hyperlight={stray}"
-            )));
+            );
+            process::exit(1);
         }
         #[cfg(all(feature = "hyperlight", target_arch = "x86_64"))]
         {
             // WHP is delay-loaded; check before setup boots a VM.
             #[cfg(target_os = "windows")]
             if !mxc_sdk::hyperlight_common::is_whp_available() {
-                emit_mxc_error_exit(
-                    &MxcError::backend_unavailable(
-                        "--setup-hyperlight requires Windows Hypervisor Platform (WHP)",
-                    )
-                    .with_remediation(
-                        "Enable the HypervisorPlatform optional feature and reboot.",
-                    ),
+                eprintln!(
+                    "Error: --setup-hyperlight requires Windows Hypervisor Platform (WHP). \
+                     Enable the HypervisorPlatform optional feature and reboot."
                 );
+                process::exit(1);
             }
 
             // Setup is an interactive install: the pull and the warm-up
@@ -1157,24 +1155,27 @@ fn main() {
             let mut logger = Logger::new(Mode::Console);
             let runtimes = match mxc_sdk::hyperlight_common::parse_runtimes(runtime_names) {
                 Ok(runtimes) => runtimes,
-                Err(msg) => emit_mxc_error_exit(&MxcError::malformed_request(msg)),
+                Err(msg) => {
+                    eprintln!("Error: {msg}");
+                    process::exit(1);
+                }
             };
             match mxc_sdk::hyperlight_common::setup(cli.force, &runtimes, &mut logger) {
                 Ok(home) => {
                     eprintln!("hyperlight setup: image home ready at {:?}", home);
                     process::exit(0);
                 }
-                Err(msg) => emit_mxc_error_exit(&MxcError::backend_error(format!(
-                    "hyperlight setup failed: {msg}"
-                ))),
+                Err(msg) => {
+                    eprintln!("hyperlight setup failed: {msg}");
+                    process::exit(1);
+                }
             }
         }
         #[cfg(not(all(feature = "hyperlight", target_arch = "x86_64")))]
         {
             let _ = runtime_names;
-            emit_mxc_error_exit(&MxcError::backend_unavailable(
-                "--setup-hyperlight requires x86_64 (Hyperlight needs KVM or WHP)",
-            ));
+            eprintln!("Error: --setup-hyperlight requires x86_64 (Hyperlight needs KVM or WHP)");
+            process::exit(1);
         }
     }
 
@@ -1186,9 +1187,10 @@ fn main() {
         {
             let image = match cli.image.as_deref() {
                 Some(s) if !s.is_empty() => s,
-                _ => emit_mxc_error_exit(&MxcError::malformed_request(
-                    "--setup-wslc requires --image <name>",
-                )),
+                _ => {
+                    eprintln!("Error: --setup-wslc requires --image <name>");
+                    process::exit(1);
+                }
             };
             let mut logger = Logger::new(if cli.debug {
                 Mode::Console
@@ -1215,16 +1217,15 @@ fn main() {
             match result {
                 Ok(()) => process::exit(0),
                 Err(msg) => {
-                    emit_mxc_error_exit(&MxcError::backend_error(format!("wslc setup failed: {msg}")))
+                    eprintln!("wslc setup failed: {msg}");
+                    process::exit(1);
                 }
             }
         }
         #[cfg(not(feature = "wslc"))]
         {
-            emit_mxc_error_exit(
-                &MxcError::backend_unavailable("WSLC backend not compiled")
-                    .with_remediation("Rebuild with --features wslc."),
-            );
+            eprintln!("Error: WSLC backend not compiled. Rebuild with --features wslc.");
+            process::exit(1);
         }
     }
 
@@ -1650,8 +1651,8 @@ fn main() {
     // opts in here. Warnings travel on the response so a programmatic caller
     // reads them from one structured place rather than scraping stderr.
     // Emitted before the dry-run branch below, which exits the process.
-    response.warnings.extend(logger.take_warnings());
-    mxc_sdk::mxc_common::script_runner::emit_warning_envelopes(&response.warnings);
+    response.extend_warnings(logger.take_warnings());
+    mxc_sdk::mxc_common::script_runner::emit_warning_envelopes(response.warnings());
 
     #[cfg(target_os = "windows")]
     if let Err(error) = mxc_sdk::mxc_engine::emit_verbose_telemetry(

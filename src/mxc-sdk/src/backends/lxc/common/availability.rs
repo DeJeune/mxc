@@ -24,6 +24,15 @@ pub fn is_lxc_available() -> bool {
     *AVAILABLE.get_or_init(|| available_from(probe_lxc_ls()))
 }
 
+/// [`is_lxc_available`] without the cached discovery answer.
+///
+/// Execution must not inherit an advisory verdict: a host that gained the LXC
+/// tools after an earlier probe can run a sandbox now, and a cached `false`
+/// would refuse it for the life of the process.
+pub fn is_lxc_available_uncached() -> bool {
+    available_from(probe_lxc_ls())
+}
+
 fn probe_lxc_ls() -> LxcLsOutcome {
     let child = Command::new("lxc-ls")
         .arg("--version")

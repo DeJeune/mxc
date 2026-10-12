@@ -9,7 +9,7 @@ use std::fmt::Write;
 use std::io::IsTerminal;
 
 use crate::mxc_common::logger::Logger;
-use crate::mxc_common::models::{ExecutionRequest, ScriptResponse};
+use crate::mxc_common::models::{ExecutionRequest, FailurePhase, ScriptResponse};
 use crate::mxc_common::script_runner::ScriptRunner;
 use crate::mxc_common::validator::{validate_network_policy_support, NetworkPolicySupport};
 
@@ -34,13 +34,13 @@ use super::IsolationSessionRunner;
 ///   anything applied — so there is nothing to retain.
 fn reject_unsupported_lifecycle(request: &ExecutionRequest) -> Result<(), ScriptResponse> {
     if !request.lifecycle.destroy_on_exit {
-        return Err(ScriptResponse::error(
+        return Err(ScriptResponse::rejected(
             "lifecycle.destroyOnExit=false is not supported by the isolation session backend; \
              the session is always stopped and the agent user removed",
         ));
     }
     if request.lifecycle.preserve_policy {
-        return Err(ScriptResponse::error(
+        return Err(ScriptResponse::rejected(
             "lifecycle.preservePolicy=true is not supported by the isolation session backend; \
              it installs no persistent filesystem or network enforcement, so there is none \
              to preserve",
@@ -163,8 +163,19 @@ impl ScriptRunner for IsolationSessionRunner {
             standard_out: String::new(),
             standard_err: String::new(),
             error_message: String::new(),
+            failure_phase: exited_phase(exit_code),
             ..Default::default()
         }
+    }
+}
+
+/// The phase a completed run reports, so a workload that failed on its own is
+/// told apart from the sandbox failing around it.
+fn exited_phase(exit_code: i32) -> FailurePhase {
+    if exit_code == 0 {
+        FailurePhase::None
+    } else {
+        FailurePhase::ProcessExited
     }
 }
 
@@ -174,6 +185,13 @@ mod tests {
     use crate::mxc_common::models::{
         ContainerPolicy, LifecycleConfig, NetworkAction, NetworkEgressPolicy, NetworkIngressPolicy,
     };
+
+    #[test]
+    fn a_nonzero_workload_exit_is_reported_as_a_process_exit() {
+        assert_eq!(exited_phase(0), FailurePhase::None);
+        assert_eq!(exited_phase(3), FailurePhase::ProcessExited);
+        assert_eq!(exited_phase(-1), FailurePhase::ProcessExited);
+    }
 
     #[test]
     fn validate_runner_one_shot_rejects_default_network() {
@@ -248,6 +266,29 @@ mod tests {
             "got {}",
             resp.error_message
         );
+    }
+
+    #[test]
+    fn validate_runner_one_shot_lifecycle_refusals_blame_the_request() {
+        let runner = IsolationSessionRunner::new();
+        for lifecycle in [
+            LifecycleConfig {
+                destroy_on_exit: false,
+                preserve_policy: false,
+            },
+            LifecycleConfig {
+                destroy_on_exit: true,
+                preserve_policy: true,
+            },
+        ] {
+            let req = ExecutionRequest {
+                lifecycle,
+                ..canonical_request()
+            };
+            let resp = runner.validate_runner(&req).unwrap_err();
+            assert_eq!(resp.failure_phase, FailurePhase::Rejected);
+            assert_eq!(resp.exit_code, 1);
+        }
     }
 
     #[test]

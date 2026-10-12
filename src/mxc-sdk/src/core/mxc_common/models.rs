@@ -1222,8 +1222,14 @@ pub struct ScriptResponse {
     /// Non-fatal diagnostics raised while building or running the sandbox,
     /// carried on the response so a programmatic caller can filter them
     /// instead of scraping stderr.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub warnings: Vec<String>,
+    ///
+    /// Boxed, like `output_metadata`, to keep `ScriptResponse` small enough to
+    /// serve as a `Result` error type. Reach for it through
+    /// [`warnings`](ScriptResponse::warnings) and
+    /// [`extend_warnings`](ScriptResponse::extend_warnings) rather than the
+    /// field, so the "absent" and "empty" spellings cannot drift apart.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub warnings: Option<Box<Vec<String>>>,
     /// Structured metadata produced after the sandboxed process exits.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub output_metadata: Option<Box<SandboxOutputMetadata>>,
@@ -1238,7 +1244,7 @@ impl Default for ScriptResponse {
             error_message: String::new(),
             extended_error: String::new(),
             failure_phase: FailurePhase::None,
-            warnings: Vec::new(),
+            warnings: None,
             output_metadata: None,
         }
     }
@@ -1335,6 +1341,22 @@ impl ScriptResponse {
             ..Default::default()
         }
     }
+
+    /// The non-fatal diagnostics this run recorded.
+    pub fn warnings(&self) -> &[String] {
+        self.warnings.as_deref().map_or(&[], Vec::as_slice)
+    }
+
+    /// Append diagnostics, allocating only once there is something to record.
+    pub fn extend_warnings(&mut self, warnings: impl IntoIterator<Item = String>) {
+        let mut incoming = warnings.into_iter().peekable();
+        if incoming.peek().is_none() {
+            return;
+        }
+        self.warnings
+            .get_or_insert_with(Box::default)
+            .extend(incoming);
+    }
 }
 
 #[cfg(test)]
@@ -1398,12 +1420,29 @@ mod tests {
         let quiet = serde_json::to_string(&ScriptResponse::default()).unwrap();
         assert!(!quiet.contains("warnings"), "{quiet}");
 
-        let noisy = serde_json::to_string(&ScriptResponse {
-            warnings: vec!["dacl augmentation fell back".to_string()],
-            ..Default::default()
-        })
-        .unwrap();
+        let mut noisy = ScriptResponse::default();
+        noisy.extend_warnings(["dacl augmentation fell back".to_string()]);
+        let noisy = serde_json::to_string(&noisy).unwrap();
         assert!(noisy.contains("dacl augmentation fell back"), "{noisy}");
+    }
+
+    #[test]
+    fn recording_nothing_allocates_nothing() {
+        let mut response = ScriptResponse::default();
+        response.extend_warnings(Vec::new());
+        assert!(response.warnings.is_none());
+        assert!(response.warnings().is_empty());
+    }
+
+    // `ScriptResponse` is used as a `Result` error type, so it has to stay
+    // under clippy's `result_large_err` threshold.
+    #[test]
+    fn the_response_stays_small_enough_to_be_an_error_type() {
+        assert!(
+            std::mem::size_of::<ScriptResponse>() <= 128,
+            "{} bytes",
+            std::mem::size_of::<ScriptResponse>()
+        );
     }
 
     #[test]

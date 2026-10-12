@@ -141,6 +141,9 @@ const PSEC_ENUMERATE_PATHS_UNSUPPORTED_MSG: &str =
 const PSEC_INGRESS_UNSUPPORTED_MSG: &str =
     "network.ingress.hostLoopback='allow' requires Process Security Environment contract version \
      1.1 with ingress support";
+const PSEC_BASELINE_UNSUPPORTED_MSG: &str =
+    "this host does not support the baseline Process Security Environment contract version, so \
+     the BaseContainer backend cannot be provided";
 const CREATE_PROCESS_IN_SECURITY_ENVIRONMENT_API: &str =
     "CreateProcessW(PROC_THREAD_ATTRIBUTE_SECURITY_ENVIRONMENT)";
 
@@ -428,6 +431,25 @@ impl BaseContainerRunner {
         version
     }
 
+    /// Attribute an unsupported PSEC version: a version raised by a requested
+    /// policy feature is the request's fault, while an unsupported baseline
+    /// means the host does not implement the contract at all.
+    fn unsupported_psec_version_response(
+        request: &ExecutionRequest,
+        psec_version: SecurityEnvironmentVersion,
+    ) -> ScriptResponse {
+        if psec_version == SecurityEnvironmentVersion::V1_0 {
+            return ScriptResponse::unavailable(PSEC_BASELINE_UNSUPPORTED_MSG);
+        }
+        ScriptResponse::rejected(if !request.policy.enumerate_paths.is_empty() {
+            PSEC_ENUMERATE_PATHS_UNSUPPORTED_MSG
+        } else if unrestricted_host_loopback_allowed(&request.policy) {
+            PSEC_INGRESS_UNSUPPORTED_MSG
+        } else {
+            "the required Process Security Environment schema version is not supported"
+        })
+    }
+
     /// The single BaseContainer serviceability decision point: return the first
     /// reason the request cannot be enforced, or
     /// [`BaseContainerRequestDecision::Serviceable`] when every check passes.
@@ -521,14 +543,9 @@ impl BaseContainerRunner {
                 ))
             })?;
         if !version_supported {
-            return Err(ScriptResponse::rejected(
-                if !request.policy.enumerate_paths.is_empty() {
-                    PSEC_ENUMERATE_PATHS_UNSUPPORTED_MSG
-                } else if unrestricted_host_loopback_allowed(&request.policy) {
-                    PSEC_INGRESS_UNSUPPORTED_MSG
-                } else {
-                    "the required Process Security Environment schema version is not supported"
-                },
+            return Err(Self::unsupported_psec_version_response(
+                request,
+                psec_version,
             ));
         }
 
@@ -2111,6 +2128,36 @@ mod tests {
     use crate::process_container_common::job_object::to_job_object_uilimit_mask;
     use crate::process_security_environment_spec::process_security_environment_layout as psec_layout;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// A host that does not implement the baseline contract cannot be fixed by
+    /// rewriting the request; a version raised by a requested feature can.
+    #[test]
+    fn an_unsupported_psec_baseline_is_unavailable_not_rejected() {
+        let plain = ExecutionRequest::default();
+        let baseline = BaseContainerRunner::unsupported_psec_version_response(
+            &plain,
+            SecurityEnvironmentVersion::V1_0,
+        );
+        assert_eq!(baseline.failure_phase, FailurePhase::BackendUnavailable);
+        assert_eq!(
+            baseline.exit_code,
+            FailurePhase::BackendUnavailable.failure_exit_code()
+        );
+
+        let enumerate = ExecutionRequest {
+            policy: ContainerPolicy {
+                enumerate_paths: vec![r"C:\project".to_string()],
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let raised = BaseContainerRunner::unsupported_psec_version_response(
+            &enumerate,
+            SecurityEnvironmentVersion::V1_1,
+        );
+        assert_eq!(raised.failure_phase, FailurePhase::Rejected);
+        assert_eq!(raised.error_message, PSEC_ENUMERATE_PATHS_UNSUPPORTED_MSG);
+    }
 
     #[test]
     fn native_capture_probe_requires_base_container_and_complete_learning_mode_abi() {

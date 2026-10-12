@@ -315,7 +315,7 @@ fn spawn_process_container(
                     let _ = writeln!(logger, "dacl warning: {w}");
                 }
             }
-            Err(MxcError::backend_unavailable(format!("{e}")))
+            Err(e.to_mxc_error())
         }
         Err(SpawnDispatchError::Spawn {
             response,

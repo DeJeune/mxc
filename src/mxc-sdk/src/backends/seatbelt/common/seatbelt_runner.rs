@@ -31,7 +31,9 @@ use std::time::{Duration, Instant};
 
 use crate::mxc_common::interruptible_reader::{wrap_pipe, InterruptibleReader, ReadCanceller};
 use crate::mxc_common::logger::Logger;
-use crate::mxc_common::models::{ExecutionRequest, LaunchMethod, ProxyAddress, ScriptResponse};
+use crate::mxc_common::models::{
+    ExecutionRequest, FailurePhase, LaunchMethod, ProxyAddress, ScriptResponse,
+};
 use crate::mxc_common::sandbox_process::{
     boxed_closer, cancel_and_join_discard, duplicate_and_take_native_stdio, group_kill,
     spawn_discard, take_boxed_read, take_boxed_write, wait_with_timeout, NativeStdio, PtySize,
@@ -244,6 +246,11 @@ extern "C" {
 /// from inside the sandbox.
 const DEFAULT_SHELL: &str = "/bin/sh";
 
+/// Apple's sandbox launcher, used verbatim by the `open` launch path's helper
+/// script and treated as the backend's availability marker: a macOS install
+/// without it cannot provide Seatbelt at all.
+const SANDBOX_EXEC: &str = "/usr/bin/sandbox-exec";
+
 /// Markers bracketing the generated profile in the log stream, so a reader can
 /// slice it out. The `Seatbelt: ` prefix cannot collide with profile content:
 /// rules start with `(` and profile comments with `;;`.
@@ -278,9 +285,9 @@ impl SandboxBackend for SeatbeltScriptRunner {
         // Seatbelt's own invariants — the only home for them, so a caller that
         // builds an ExecutionRequest directly gets the same rules.
         crate::seatbelt_common::seatbelt_policy::validate_seatbelt_network_policy(&request.policy)
-            .map_err(error_response)?;
+            .map_err(rejected_response)?;
         crate::seatbelt_common::seatbelt_policy::validate_seatbelt_ui_policy(request)
-            .map_err(error_response)?;
+            .map_err(rejected_response)?;
 
         Ok(())
     }
@@ -293,6 +300,7 @@ impl SandboxBackend for SeatbeltScriptRunner {
     ) -> Result<Box<dyn SandboxProcess>, ScriptResponse> {
         validate_common(request)?;
         self.validate(request)?;
+        ensure_sandbox_exec_present()?;
 
         // The caller manages the proxy. Scope the profile's reachability rule
         // to its address and inject HTTP_PROXY / HTTPS_PROXY. macOS has no
@@ -307,7 +315,8 @@ impl SandboxBackend for SeatbeltScriptRunner {
                 crate::mxc_common::proxy_env::redact_proxy_url(&address.to_url())
             ));
         }
-        let profile = build_profile_with_proxy(request, proxy_address).map_err(error_response)?;
+        let profile =
+            build_profile_with_proxy(request, proxy_address).map_err(rejected_response)?;
         log_generated_profile(&profile, logger);
 
         // Determine launch method + GUI access from the seatbelt config.
@@ -351,7 +360,7 @@ fn spawn_exec(
         } else {
             "a caller-owned PTY"
         };
-        return Err(error_response(format!(
+        return Err(rejected_response(format!(
             "Seatbelt guiAccess requires inherited stdio and cannot use {mode}"
         )));
     }
@@ -393,7 +402,7 @@ fn spawn_exec(
     ) {
         Ok(cwd) => cwd,
         Err(e) => {
-            return Err(error_response(format!(
+            return Err(launch_failed_response(format!(
                 "failed to read the current directory to anchor the relative seatbelt working directory: {e}"
             )))
         }
@@ -428,7 +437,7 @@ fn spawn_exec(
 
     let mut child = command
         .spawn()
-        .map_err(|error| error_response(spawn_error(&error)))?;
+        .map_err(|error| launch_failed_response(spawn_error(&error)))?;
 
     let (stdin, stdout, stderr) = match stdio {
         StdioMode::Pipes => (child.stdin.take(), child.stdout.take(), child.stderr.take()),
@@ -449,7 +458,7 @@ fn spawn_exec(
                 let _ = child.kill();
                 let _ = child.wait();
                 let error = out_result.err().or(err_result.err());
-                return Err(error_response(format!(
+                return Err(launch_failed_response(format!(
                     "Seatbelt: failed to wrap stdio pipes: {}",
                     error.map_or_else(|| "unknown error".to_string(), |e| e.to_string()),
                 )));
@@ -495,7 +504,7 @@ fn spawn_open(
         } else {
             "expose a caller-owned PTY"
         };
-        return Err(error_response(format!(
+        return Err(rejected_response(format!(
             "Seatbelt launchMethod 'open' launches Terminal.app and cannot {mode}"
         )));
     }
@@ -508,7 +517,11 @@ fn spawn_open(
     // 1. Write the profile to a secure temp file.
     let profile_path = match write_secure_temp_file("mxc_sb_profile_", profile, 0o600) {
         Ok(p) => p,
-        Err(e) => return Err(error_response(format!("failed to write profile: {e}"))),
+        Err(e) => {
+            return Err(launch_failed_response(format!(
+                "failed to write profile: {e}"
+            )))
+        }
     };
 
     // 2. Resolve the working directory the way the exec path does. Terminal
@@ -525,14 +538,14 @@ fn spawn_open(
         Ok(cwd) => cwd,
         Err(e) => {
             let _ = fs::remove_file(&profile_path);
-            return Err(error_response(format!(
+            return Err(launch_failed_response(format!(
                 "failed to read the current directory to anchor the relative seatbelt working directory: {e}"
             )));
         }
     };
     if let Some(reason) = working_directory_error(&cwd) {
         let _ = fs::remove_file(&profile_path);
-        return Err(error_response(reason));
+        return Err(rejected_response(reason));
     }
     // An unresolved cwd starts the child at `/`, which is no one's home.
     let home_dir = resolved_cwd.as_ref().map(|_| cwd.clone());
@@ -566,7 +579,7 @@ fn spawn_open(
         Ok(p) => p,
         Err(e) => {
             let _ = fs::remove_file(&profile_path);
-            return Err(error_response(format!(
+            return Err(launch_failed_response(format!(
                 "failed to write helper script: {e}"
             )));
         }
@@ -582,14 +595,16 @@ fn spawn_open(
                 let _ = fs::remove_file(&p);
                 let _ = fs::remove_file(&profile_path);
                 let _ = fs::remove_file(&helper_path);
-                return Err(error_response(format!("failed to rename to .command: {e}")));
+                return Err(launch_failed_response(format!(
+                    "failed to rename to .command: {e}"
+                )));
             }
             new_path
         }
         Err(e) => {
             let _ = fs::remove_file(&profile_path);
             let _ = fs::remove_file(&helper_path);
-            return Err(error_response(format!(
+            return Err(launch_failed_response(format!(
                 "failed to write .command file: {e}"
             )));
         }
@@ -608,7 +623,9 @@ fn spawn_open(
         Ok(c) => c,
         Err(e) => {
             cleanup_files(&[&profile_path, &helper_path, &command_path]);
-            return Err(error_response(format!("failed to launch via open: {e}")));
+            return Err(launch_failed_response(format!(
+                "failed to launch via open: {e}"
+            )));
         }
     };
 
@@ -973,8 +990,9 @@ fn build_sandbox_command(
     pty_size: Option<PtySize>,
     logger: &mut Logger,
 ) -> Result<(Command, Option<LivePty>), ScriptResponse> {
-    let profile_cstr = CString::new(profile)
-        .map_err(|e| error_response(format!("seatbelt profile contains embedded NUL byte: {e}")))?;
+    let profile_cstr = CString::new(profile).map_err(|e| {
+        rejected_response(format!("seatbelt profile contains embedded NUL byte: {e}"))
+    })?;
 
     let _ = writeln!(logger, "Seatbelt: applying sandbox via sandbox_init");
 
@@ -1025,7 +1043,9 @@ fn build_sandbox_command(
                 },
                 &[],
             )
-            .map_err(|error| error_response(format!("Seatbelt: failed to allocate PTY: {error}")))
+            .map_err(|error| {
+                launch_failed_response(format!("Seatbelt: failed to allocate PTY: {error}"))
+            })
         })
         .transpose()?;
 
@@ -1071,12 +1091,38 @@ fn log_generated_profile(profile: &str, logger: &mut Logger) {
     let _ = writeln!(logger, "{PROFILE_LOG_END}");
 }
 
-fn error_response(message: String) -> ScriptResponse {
+/// A request this backend refuses: the host is fine, so only a changed request
+/// can succeed.
+fn rejected_response(message: String) -> ScriptResponse {
+    ScriptResponse::rejected(&message)
+}
+
+/// A fault while bringing the sandboxed child up, after the request was
+/// accepted.
+fn launch_failed_response(message: String) -> ScriptResponse {
     ScriptResponse {
-        exit_code: -1,
+        exit_code: FailurePhase::LaunchFailed.failure_exit_code(),
         error_message: message,
+        failure_phase: FailurePhase::LaunchFailed,
         ..Default::default()
     }
+}
+
+/// Checked before any profile is generated so a host missing Apple's sandbox
+/// tooling is reported as an unavailable backend rather than as a failed
+/// launch.
+fn ensure_sandbox_exec_present() -> Result<(), ScriptResponse> {
+    ensure_sandbox_exec_at(Path::new(SANDBOX_EXEC))
+}
+
+fn ensure_sandbox_exec_at(path: &Path) -> Result<(), ScriptResponse> {
+    if path.is_file() {
+        return Ok(());
+    }
+    Err(ScriptResponse::unavailable(&format!(
+        "Seatbelt is unavailable on this host: {} is missing",
+        path.display()
+    )))
 }
 
 /// The optional run timeout — `None` when `scriptTimeout` is 0 (wait forever).
@@ -1199,7 +1245,7 @@ fn build_helper_script(
          cd '{cwd}' || {{ echo 'mxc: cannot enter working directory {cwd}' >&2; exit 1; }}\n\
          PWD='{cwd}'\n\
          export PWD\n\
-         exec /usr/bin/sandbox-exec -f '{profile}' /bin/sh -c 'clear; {script}'\n",
+         exec {SANDBOX_EXEC} -f '{profile}' /bin/sh -c 'clear; {script}'\n",
         profile = escape_single_quoted(profile_path),
         script = escape_single_quoted(script_code),
     )
@@ -1338,6 +1384,8 @@ mod tests {
         .err()
         .expect("guiAccess PTY must be rejected");
         assert!(error.error_message.contains("caller-owned PTY"));
+        assert_eq!(error.failure_phase, FailurePhase::Rejected);
+        assert_eq!(error.exit_code, FailurePhase::Rejected.failure_exit_code());
     }
 
     #[test]
@@ -1353,6 +1401,37 @@ mod tests {
         .err()
         .expect("open PTY must be rejected");
         assert!(error.error_message.contains("caller-owned PTY"));
+        assert_eq!(error.failure_phase, FailurePhase::Rejected);
+        assert_eq!(error.exit_code, FailurePhase::Rejected.failure_exit_code());
+    }
+
+    #[test]
+    fn a_host_without_sandbox_exec_blames_the_host() {
+        let response = ensure_sandbox_exec_at(Path::new("/nonexistent/sandbox-exec"))
+            .expect_err("a missing sandbox-exec must be reported");
+        assert_eq!(response.failure_phase, FailurePhase::BackendUnavailable);
+        assert_eq!(
+            response.failure_phase.error_code(),
+            crate::mxc_common::mxc_error::MxcErrorCode::BackendUnavailable
+        );
+        assert_eq!(response.exit_code, -1);
+        assert!(response.error_message.contains("sandbox-exec"));
+    }
+
+    #[test]
+    fn the_sandbox_exec_check_passes_on_a_stock_macos_host() {
+        assert!(ensure_sandbox_exec_present().is_ok());
+    }
+
+    #[test]
+    fn a_failed_launch_keeps_the_generic_backend_error_code() {
+        let response = launch_failed_response("failed to spawn sandboxed process".into());
+        assert_eq!(response.failure_phase, FailurePhase::LaunchFailed);
+        assert_eq!(
+            response.failure_phase.error_code(),
+            crate::mxc_common::mxc_error::MxcErrorCode::BackendError
+        );
+        assert_eq!(response.exit_code, -1);
     }
 
     #[test]
@@ -1535,6 +1614,11 @@ mod tests {
         assert!(response.error_message.contains("hostLoopback='allow'"));
         assert!(response.error_message.contains("default='deny'"));
         assert!(!response.error_message.contains("inherit 'default'"));
+        assert_eq!(response.failure_phase, FailurePhase::Rejected);
+        assert_eq!(
+            response.exit_code,
+            FailurePhase::Rejected.failure_exit_code()
+        );
     }
 
     /// The other divergent pair is expressible and must be accepted: it is the

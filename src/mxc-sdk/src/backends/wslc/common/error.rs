@@ -74,7 +74,7 @@ impl WslcError {
         let failure_phase = self.failure_phase();
         let msg = self.to_string();
         ScriptResponse {
-            exit_code: -1,
+            exit_code: failure_phase.failure_exit_code(),
             standard_err: msg.clone(),
             error_message: msg,
             failure_phase,
@@ -162,15 +162,37 @@ mod tests {
 
     #[test]
     fn response_matches_the_untyped_shape_apart_from_the_phase() {
-        let typed = WslcError::Rejected("bad path".to_string()).into_response();
-        let untyped = ScriptResponse::error("bad path");
+        let typed = WslcError::Host("bring-up failed".to_string()).into_response();
+        let untyped = ScriptResponse::error("bring-up failed");
 
         assert_eq!(typed.exit_code, untyped.exit_code);
         assert_eq!(typed.standard_err, untyped.standard_err);
         assert_eq!(typed.error_message, untyped.error_message);
         // The untyped helper left this at the default, which is the bug.
         assert_eq!(untyped.failure_phase, FailurePhase::None);
-        assert_eq!(typed.failure_phase, FailurePhase::Rejected);
+        assert_eq!(typed.failure_phase, FailurePhase::LaunchFailed);
+    }
+
+    /// A WSLc rejection has to cost the caller the same exit code a rejection
+    /// from any other backend does.
+    #[test]
+    fn exit_codes_follow_the_shared_phase_contract() {
+        let s = || "x".to_string();
+        assert_eq!(
+            WslcError::Rejected(s()).into_response().exit_code,
+            ScriptResponse::rejected("x").exit_code
+        );
+        assert_eq!(
+            WslcError::Unavailable(s()).into_response().exit_code,
+            ScriptResponse::unavailable("x").exit_code
+        );
+        for err in [
+            WslcError::Host(s()),
+            WslcError::Runtime(s()),
+            WslcError::sdk("op", -1, ""),
+        ] {
+            assert_eq!(err.into_response().exit_code, -1);
+        }
     }
 
     #[test]

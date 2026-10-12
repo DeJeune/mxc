@@ -596,11 +596,14 @@ once you can see the rules that were emitted.
 | A client is configured with `HTTP_PROXY` but reaches nothing | It's ignoring the proxy vars. Outbound is kernel-scoped to the proxy port, so it can't connect anywhere else | Use a proxy-aware client — see [Proxy support](#proxy-support-what-is-and-isnt-enforced) |
 | A test runner or build tool fails spawning workers | `nestedPty: false`, or its IPC socket sits under a `readonlyPaths`/`deniedPaths` entry | Leave `nestedPty` at `true`; put socket directories in `readwritePaths` |
 | The same config runs on Linux but is rejected on macOS | A `..` segment in a path — Seatbelt-only rejection | Pass the fully resolved path |
+| `Seatbelt is unavailable on this host: /usr/bin/sandbox-exec is missing` | The install has no Apple sandbox tooling, so the backend cannot be provided (`backend_unavailable`, exit `-1`) | Run on a stock macOS install, or pick another backend |
 
 ### What gets rejected
 
 MXC refuses any config it cannot faithfully enforce, rather than quietly
-approximating it. This is the complete list.
+approximating it. This is the complete list. A refusal carries the
+`policy_validation` error code and exit code `1`: nothing ran, and only a
+changed config can succeed.
 
 One documented exception: `ingress.hostLoopback: "deny"` under
 `ingress.default: "allow"` is accepted with the container-to-host half enforced
