@@ -956,6 +956,24 @@ function Test-WasRejected {
                   $both -match ('"code"\s*:\s*"(' + $rejectionCodes + ')"'))
 }
 
+# A run the host could not service at all, reported as a typed
+# `backend_unavailable` envelope on stderr.
+#
+# Host capability probes answer whether an API is present, which is not the
+# same question as whether it is implemented: an export can resolve and still
+# return E_NOTIMPL when called. Behavioural assertions that need a working
+# provider therefore gate on what a real run reported rather than on the probe
+# alone, so such a host skips instead of failing on absent output.
+function Test-BackendUnavailable {
+    param(
+        [Parameter(Mandatory)] [object]$Run,
+        [AllowEmptyString()] [string]$Log
+    )
+    $result = $(if ($Run.PSObject.Properties['Result']) { $Run.Result } else { $Run })
+    $err = "$(if ($result.PSObject.Properties['Stderr']) { $result.Stderr })"
+    return [bool]("$Log`n$err" -match '"code"\s*:\s*"backend_unavailable"')
+}
+
 # The non-network counterpart of Get-NetVerdict's NORUN state.
 #
 # Every negative assertion is satisfied by a workload that never started, so
