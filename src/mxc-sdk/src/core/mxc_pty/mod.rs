@@ -1672,6 +1672,146 @@ mod tests {
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
+    fn close_writer_sends_canonical_terminal_eof() {
+        let _guard = RUN_WITH_PTY_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let mut command = Command::new("/bin/sh");
+        command
+            .arg("-c")
+            .arg("cat >/dev/null; printf 'closed-writer-eof\\n'");
+        let terminal = LivePty::attach(&mut command, PtySize::default(), &[]).expect("attach PTY");
+        let mut child = command.spawn().expect("spawn child");
+        drop(command);
+        let drain = PtyDrain::start(terminal.try_clone_reader().expect("clone reader"));
+
+        terminal.close_writer();
+        // Closing again is a no-op, and the writer can no longer be taken.
+        terminal.close_writer();
+        assert_eq!(
+            terminal
+                .take_writer()
+                .err()
+                .expect("writer was already closed")
+                .kind(),
+            std::io::ErrorKind::BrokenPipe
+        );
+
+        assert!(wait_for_exit(&mut child).success());
+        drop(terminal);
+        let output = drain.finish();
+        assert!(output.contains("closed-writer-eof"), "got: {output:?}");
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn close_writer_after_take_writer_leaves_the_taken_writer_usable() {
+        let _guard = RUN_WITH_PTY_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let mut command = Command::new("/bin/sh");
+        command
+            .arg("-c")
+            .arg("read value; printf 'reply:%s\\n' \"$value\"");
+        let terminal = LivePty::attach(&mut command, PtySize::default(), &[]).expect("attach PTY");
+        let mut child = command.spawn().expect("spawn child");
+        drop(command);
+        let drain = PtyDrain::start(terminal.try_clone_reader().expect("clone reader"));
+
+        let mut writer = terminal.take_writer().expect("take writer");
+        terminal.close_writer();
+        writer.write_all(b"still-writable\r").expect("write input");
+        drop(writer);
+
+        assert!(wait_for_exit(&mut child).success());
+        drop(terminal);
+        let output = drain.finish();
+        assert!(output.contains("reply:still-writable"), "got: {output:?}");
+    }
+
+    /// The drain-before-wait pattern every backend uses: nothing claimed a
+    /// reader, so the runner claims one and discards output while it waits.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn take_unclaimed_reader_drains_output_so_waiting_cannot_deadlock() {
+        let _guard = RUN_WITH_PTY_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let mut command = Command::new("/bin/sh");
+        command
+            .arg("-c")
+            .arg("head -c 200000 /dev/zero; printf 'drained-to-exit\\n'");
+        let terminal = LivePty::attach(&mut command, PtySize::default(), &[]).expect("attach PTY");
+        let mut child = command.spawn().expect("spawn child");
+        drop(command);
+
+        terminal.close_writer();
+        let (reader, canceller) = terminal
+            .take_unclaimed_reader()
+            .expect("take unclaimed reader")
+            .expect("reader was unclaimed");
+        let drain = PtyDrain::start(reader);
+        assert!(
+            terminal
+                .take_unclaimed_reader()
+                .expect("second take")
+                .is_none(),
+            "the reader is claimed after the first take"
+        );
+
+        assert!(wait_for_exit(&mut child).success());
+        let seen = drain.wait_for("drained-to-exit");
+        assert!(seen.contains("drained-to-exit"), "got: {seen:?}");
+        canceller.close();
+        drop(terminal);
+        let _ = drain.finish();
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn take_unclaimed_reader_yields_nothing_once_a_reader_is_claimed() {
+        let _guard = RUN_WITH_PTY_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let mut command = Command::new("/bin/sh");
+        command.arg("-c").arg("printf claimed");
+        let terminal = LivePty::attach(&mut command, PtySize::default(), &[]).expect("attach PTY");
+        let mut child = command.spawn().expect("spawn child");
+        drop(command);
+        let drain = PtyDrain::start(terminal.try_clone_reader().expect("clone reader"));
+
+        assert!(
+            terminal
+                .take_unclaimed_reader()
+                .expect("take unclaimed reader")
+                .is_none(),
+            "a cloned reader belongs to the caller"
+        );
+
+        assert!(wait_for_exit(&mut child).success());
+        drop(terminal);
+        let output = drain.finish();
+        assert!(output.contains("claimed"), "got: {output:?}");
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn take_unclaimed_reader_yields_nothing_after_native_stdio() {
+        let _guard = RUN_WITH_PTY_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let mut command = Command::new("/bin/sh");
+        command.arg("-c").arg("printf bridged");
+        let terminal = LivePty::attach(&mut command, PtySize::default(), &[]).expect("attach PTY");
+        let mut child = command.spawn().expect("spawn child");
+        drop(command);
+        let stdio = terminal.take_native_stdio().expect("take native stdio");
+
+        assert!(
+            terminal
+                .take_unclaimed_reader()
+                .expect("take unclaimed reader")
+                .is_none(),
+            "the native bridge owns terminal output"
+        );
+
+        assert!(wait_for_exit(&mut child).success());
+        terminal.finish_native_bridge();
+        drop(stdio);
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
     fn dropping_untouched_writer_does_not_wait_for_an_input_reader() {
         let _guard = RUN_WITH_PTY_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let mut command = Command::new("/bin/sh");
@@ -2256,6 +2396,50 @@ mod tests {
             "full output bridge did not cancel promptly"
         );
         drop(stdio.stdout);
+    }
+
+    /// macOS has no `F_SETPIPE_SZ`, so fill the output pipe by volume instead.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn native_bridge_cancels_when_the_output_pipe_fills() {
+        let _guard = RUN_WITH_PTY_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let mut command = Command::new("/bin/sh");
+        command.arg("-c").arg("head -c 1000000 /dev/zero");
+        let terminal = LivePty::attach(&mut command, PtySize::default(), &[]).expect("attach PTY");
+        let mut child = command.spawn().expect("spawn child");
+        drop(command);
+        let stdio = terminal.take_native_stdio().expect("take native stdio");
+        drop(stdio.stdin);
+
+        // Never read stdout: the pipe fills, the bridge parks in its
+        // cancellable write, and the child blocks on the terminal behind it.
+        std::thread::sleep(Duration::from_millis(250));
+        assert!(
+            child.try_wait().expect("poll child").is_none(),
+            "child should still be blocked behind the full output pipe"
+        );
+
+        // Run the join off-thread so a bridge that ignores cancellation fails
+        // the test instead of hanging it.
+        let (done, finished) = std::sync::mpsc::sync_channel(1);
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                terminal.finish_native_bridge();
+                let _ = done.send(());
+            });
+            let cancelled = finished.recv_timeout(Duration::from_secs(5)).is_ok();
+            if !cancelled {
+                // Drain so the parked bridge can finish and the scope can join.
+                let mut sink = std::fs::File::from(stdio.stdout.try_clone().expect("clone stdout"));
+                let mut scratch = [0u8; 8192];
+                while sink.read(&mut scratch).unwrap_or(0) > 0 {}
+            }
+            assert!(cancelled, "full output bridge did not cancel promptly");
+        });
+
+        drop(stdio.stdout);
+        drop(terminal);
+        let _ = wait_for_exit(&mut child);
     }
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]
