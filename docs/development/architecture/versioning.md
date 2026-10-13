@@ -717,8 +717,12 @@ classification drives both the wire code and the process exit code:
 A backend this build did not compile in reports `backend_unavailable`, since
 only a rebuilt executor can serve it. A backend belonging to another operating
 system reports `unsupported_containment`, since naming a supported backend
-succeeds. Earlier phase-specific codes (`config_parse`, `malformed_request`,
-`unsupported_phase`, `malformed_id`) are unchanged and also exit `1`.
+succeeds. A tier the host could not build for the policy — an AppContainer
+fallback that cannot represent `enumeratePaths`, or an absent denial-capture
+provider — is also `backend_unavailable` rather than a rejection, because the
+policy was accepted and never judged. Earlier phase-specific codes
+(`config_parse`, `malformed_request`, `unsupported_phase`, `malformed_id`) are
+unchanged and also exit `1`.
 
 `ScriptResponse` carries an optional `warnings` array of diagnostic strings.
 Warnings are advisory and never change the exit code; they are omitted from the

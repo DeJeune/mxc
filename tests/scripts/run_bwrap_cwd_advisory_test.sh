@@ -37,8 +37,12 @@ EOF
 for case in uncovered unrelated; do
     rc=0
     output=$("$LXC_EXEC" --experimental "$WORK_DIR/$case.json" 2>"$WORK_DIR/$case.stderr") || rc=$?
+    # Matched piecewise rather than as one literal line: the advisory is carried
+    # in a JSON warning envelope, so the quotes around the path are escaped.
     if [ "$rc" -eq 0 ] \
-        || ! grep -Fq "WARNING: Bubblewrap: process.cwd \"$CWD\"" "$WORK_DIR/$case.stderr" \
+        || ! grep -Fq '{"warning":' "$WORK_DIR/$case.stderr" \
+        || ! grep -Fq 'Bubblewrap: process.cwd' "$WORK_DIR/$case.stderr" \
+        || ! grep -Fq "$CWD" "$WORK_DIR/$case.stderr" \
         || ! grep -Fq 'filesystem.readonlyPaths' "$WORK_DIR/$case.stderr" \
         || ! grep -Eq '(^|[[:space:]])bwrap:' "$WORK_DIR/$case.stderr"; then
         echo "$case cwd did not report the hint and Bubblewrap's original error: $output"
@@ -48,7 +52,7 @@ for case in uncovered unrelated; do
 done
 output=$("$LXC_EXEC" --experimental "$WORK_DIR/covered.json" 2>"$WORK_DIR/covered.stderr")
 if ! grep -qFx "$CWD" <<<"$output" \
-    || grep -Fq 'WARNING: Bubblewrap: process.cwd ' "$WORK_DIR/covered.stderr"; then
+    || grep -Fq 'Bubblewrap: process.cwd' "$WORK_DIR/covered.stderr"; then
     echo "Covered cwd did not run without an advisory: $output"
     cat "$WORK_DIR/covered.stderr"
     exit 1

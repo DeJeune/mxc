@@ -288,24 +288,20 @@ impl std::error::Error for DispatchError {}
 impl DispatchError {
     /// The wire code this dispatch failure is reported under.
     ///
-    /// The dividing question is whether a changed request could succeed. A
-    /// capability the host's Windows build cannot represent is still a refusal
-    /// of the policy, because dropping the offending field runs; a missing
-    /// permission or an unresolvable system directory is not, because no
-    /// request reaches it.
+    /// Reaching dispatch means the policy was already accepted, so a failure
+    /// here is the host failing to build the tier the policy asked for, not a
+    /// judgement of the policy -- the same distinction the
+    /// [`RejectionReason::RunnerUnavailable`] audit reason draws. The two
+    /// exceptions are failures of an operation the host *could* perform: a SID
+    /// that could not be derived carries its own code, and ACEs that could not
+    /// be applied are a runtime fault.
+    ///
+    /// [`RejectionReason::RunnerUnavailable`]: crate::mxc_common::audit::RejectionReason
     pub fn error_code(&self) -> MxcErrorCode {
         match self {
-            DispatchError::Fallback(
-                FallbackError::DaclFallbackDisabled
-                | FallbackError::EnumeratePathsUnsupported
-                | FallbackError::IngressUnsupported,
-            )
+            DispatchError::Fallback(_)
             | DispatchError::CaptureDenialsUnsupported { .. }
-            | DispatchError::CaptureDenialsUnavailable { .. } => MxcErrorCode::PolicyValidation,
-            DispatchError::Fallback(
-                FallbackError::WriteDacUnavailable { .. }
-                | FallbackError::SystemRootUnresolved { .. },
-            ) => MxcErrorCode::BackendUnavailable,
+            | DispatchError::CaptureDenialsUnavailable { .. } => MxcErrorCode::BackendUnavailable,
             DispatchError::Sid(error) => error.error_code(),
             DispatchError::Dacl { .. } => MxcErrorCode::BackendError,
         }
@@ -855,44 +851,14 @@ mod tests {
     };
 
     #[test]
-    fn a_capability_this_windows_build_cannot_represent_is_a_refusal_of_the_policy() {
-        // Dropping the offending field runs, so the caller is the one who can
-        // act. These used to reach the wire as `backend_unavailable`, which
-        // told the caller to give up on the host instead.
+    fn a_tier_the_host_could_not_build_is_not_blamed_on_the_policy() {
+        // Dispatch runs after the policy was accepted, so none of these are a
+        // verdict on the request. Reporting them as a policy rejection would
+        // send the caller editing a config that was never the problem.
         for error in [
             FallbackError::EnumeratePathsUnsupported,
             FallbackError::IngressUnsupported,
             FallbackError::DaclFallbackDisabled,
-        ] {
-            let dispatch = DispatchError::Fallback(error);
-            assert_eq!(
-                dispatch.error_code(),
-                MxcErrorCode::PolicyValidation,
-                "{dispatch}"
-            );
-            assert_eq!(dispatch.error_code().exit_code(), 1, "{dispatch}");
-        }
-
-        for dispatch in [
-            DispatchError::CaptureDenialsUnsupported {
-                tier: IsolationTier::AppContainerDacl,
-            },
-            DispatchError::CaptureDenialsUnavailable {
-                tier: IsolationTier::AppContainerDacl,
-                reason: "WPR is not installed".to_string(),
-            },
-        ] {
-            assert_eq!(
-                dispatch.error_code(),
-                MxcErrorCode::PolicyValidation,
-                "{dispatch}"
-            );
-        }
-    }
-
-    #[test]
-    fn a_host_the_request_cannot_reach_is_not_blamed_on_the_policy() {
-        for error in [
             FallbackError::WriteDacUnavailable {
                 path: PathBuf::from("C:\\work"),
                 reason: "access denied".to_string(),
@@ -908,6 +874,27 @@ mod tests {
                 "{dispatch}"
             );
             assert_eq!(dispatch.error_code().exit_code(), -1, "{dispatch}");
+        }
+    }
+
+    #[test]
+    fn a_host_without_a_capture_provider_has_not_rejected_capture_denials() {
+        // The suites read acceptance as "not rejected during validation", and
+        // a host with no provider never got as far as judging the section.
+        for dispatch in [
+            DispatchError::CaptureDenialsUnsupported {
+                tier: IsolationTier::AppContainerDacl,
+            },
+            DispatchError::CaptureDenialsUnavailable {
+                tier: IsolationTier::AppContainerDacl,
+                reason: "WPR is not installed".to_string(),
+            },
+        ] {
+            assert_eq!(
+                dispatch.error_code(),
+                MxcErrorCode::BackendUnavailable,
+                "{dispatch}"
+            );
         }
     }
 
