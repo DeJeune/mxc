@@ -168,11 +168,6 @@ fn confine_network_capabilities(command: &mut std::process::Command) {
 /// LXC needs to allow ICMP and prevent programs from using sockets to
 /// bypass the network guards.  The solution is to give the kernel a custom filter to refuse
 /// any socket that carries AF_PACKET.  LXC utilizes seccomp.
-/// A packet socket has more than one spelling, and the filter has to answer all of them.
-/// `socket(PF_INET, SOCK_PACKET, ...)` becomes an AF_PACKET socket after seccomp has
-/// already read the family, so the filter reads the socket type as well.  AF_XDP puts
-/// frames on the wire the same way AF_PACKET does.  io_uring builds a socket without
-/// issuing the syscall this filter inspects, so the ring itself is refused.
 /// see https://docs.kernel.org/userspace-api/seccomp_filter.html and
 /// https://man7.org/linux/man-pages/man2/seccomp.2.html
 #[cfg(target_os = "linux")]
