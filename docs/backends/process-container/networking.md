@@ -116,6 +116,7 @@ PSEC rejects it alongside a proxy. Their ingress default still selects `privateN
 host-loopback setting selects both the `networkLoopback` capability and the `MXC-Loopback` peer rather than an
 identity-scoped proxy peer. The peer alone is insufficient: without the capability, the environment can be created
 but its client cannot reach the host proxy.
+Direct requests use the same capability and peer when native ingress support is unavailable.
 
 The public ingress policy remains required. `hostLoopback: "allow"` supports
 connections to host listeners both with an identity-less runtime proxy and

@@ -3209,6 +3209,80 @@ mod tests {
     }
 
     #[test]
+    fn psec_direct_host_loopback_without_ingress_support_encodes_capability_and_peer() {
+        let mut request = host_loopback_request();
+        request.policy.network_egress = Some(crate::mxc_common::models::NetworkEgressPolicy {
+            default: NetworkAction::Allow,
+            ..Default::default()
+        });
+
+        for version in [
+            SecurityEnvironmentVersion::V1_0,
+            SecurityEnvironmentVersion::V1_1,
+        ] {
+            let bytes = build_psec_v1_security_environment_spec(&request, version, false, false);
+            let spec = psec_layout::root_as_process_security_environment(&bytes).unwrap();
+            let network = spec.network_policy().unwrap();
+
+            assert_eq!(spec.version().minor(), version.minor);
+            assert_eq!(
+                spec.capabilities(),
+                Some("internetClient,privateNetworkClientServer,networkLoopback")
+            );
+            assert_eq!(
+                network.allowed_appcontainer_peer(),
+                Some(
+                    crate::process_container_common::base_container_helpers::LOOPBACK_NETWORK_PEER
+                )
+            );
+            assert!(network.ingress().is_none());
+            assert!(network.proxy().is_none());
+            assert_eq!(
+                network.egress().unwrap().default_action(),
+                psec_layout::FilterAction::allow
+            );
+        }
+    }
+
+    #[test]
+    fn psec_direct_host_loopback_default_and_explicit_deny_do_not_grant_loopback() {
+        for ingress in [
+            None,
+            Some(crate::mxc_common::models::NetworkIngressPolicy {
+                default: NetworkAction::Allow,
+                host_loopback: NetworkAction::Deny,
+            }),
+        ] {
+            let mut request = ExecutionRequest::default();
+            request.policy.network_ingress = ingress;
+            for (version, supports_network_ingress) in [
+                (SecurityEnvironmentVersion::V1_0, false),
+                (SecurityEnvironmentVersion::V1_1, false),
+                (SecurityEnvironmentVersion::V1_1, true),
+            ] {
+                let bytes = build_psec_v1_security_environment_spec(
+                    &request,
+                    version,
+                    supports_network_ingress,
+                    false,
+                );
+                let spec = psec_layout::root_as_process_security_environment(&bytes).unwrap();
+
+                assert!(!spec
+                    .capabilities()
+                    .unwrap_or_default()
+                    .split(',')
+                    .any(|capability| capability == "networkLoopback"));
+                assert!(spec
+                    .network_policy()
+                    .unwrap()
+                    .allowed_appcontainer_peer()
+                    .is_none());
+            }
+        }
+    }
+
+    #[test]
     fn required_psec_contract_uses_v1_1_for_enumeration() {
         assert_eq!(
             BaseContainerRunner::choose_min_required_psec_version_for_request(&enumerate_request()),
