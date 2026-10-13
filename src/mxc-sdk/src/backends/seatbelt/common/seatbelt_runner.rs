@@ -300,7 +300,6 @@ impl SandboxBackend for SeatbeltScriptRunner {
     ) -> Result<Box<dyn SandboxProcess>, ScriptResponse> {
         validate_common(request)?;
         self.validate(request)?;
-        ensure_sandbox_exec_present()?;
 
         // The caller manages the proxy. Scope the profile's reachability rule
         // to its address and inject HTTP_PROXY / HTTPS_PROXY. macOS has no
@@ -334,7 +333,10 @@ impl SandboxBackend for SeatbeltScriptRunner {
             LaunchMethod::Exec => {
                 spawn_exec(&profile, request, gui_access, stdio, logger, proxy_address)
             }
-            LaunchMethod::Open => spawn_open(&profile, request, stdio, logger, proxy_address),
+            LaunchMethod::Open => {
+                ensure_sandbox_exec_present()?;
+                spawn_open(&profile, request, stdio, logger, proxy_address)
+            }
         }
     }
 }
@@ -1108,9 +1110,10 @@ fn launch_failed_response(message: String) -> ScriptResponse {
     }
 }
 
-/// Checked before any profile is generated so a host missing Apple's sandbox
-/// tooling is reported as an unavailable backend rather than as a failed
-/// launch.
+/// Guards the `Open` launch path, which shells out to Apple's sandbox CLI, so
+/// a host missing it is reported as an unavailable backend rather than as a
+/// failed launch. `Exec` applies the profile through `sandbox_init` and does
+/// not need the CLI.
 fn ensure_sandbox_exec_present() -> Result<(), ScriptResponse> {
     ensure_sandbox_exec_at(Path::new(SANDBOX_EXEC))
 }

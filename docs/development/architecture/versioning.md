@@ -722,13 +722,22 @@ example `filesystem.enumeratePaths` or `network.ingress.hostLoopback` on an
 AppContainer fallback) is a `policy_validation` rejection naming that field,
 never a silent drop; but a tier that could not be built at all, or an absent
 denial-capture provider, is `backend_unavailable`, because the policy was
-accepted and never judged. Earlier phase-specific codes (`config_parse`,
+accepted and never judged. An experimental backend named without the
+experimental opt-in is also `backend_unavailable`: the opt-in is an executor
+invocation mode rather than a policy field, so no change to the authored
+request reaches it. Earlier phase-specific codes (`config_parse`,
 `malformed_request`, `unsupported_phase`, `malformed_id`) are unchanged and
 also exit `1`.
 
 `ScriptResponse` carries an optional `warnings` array of diagnostic strings.
 Warnings are advisory and never change the exit code; they are omitted from the
-wire entirely when a run produced none.
+wire entirely when a run produced none. The serialized response and the
+executor's stderr stream are two distinct shapes of the same warnings: on the
+response they are a `warnings: string[]` field, while an executor writes each
+one to stderr as its own line-delimited JSON object,
+`{"warning":{"message":"..."}}`, matching the error envelope
+`{"error":{"code":"...","message":"..."}}`. A caller reading stderr must parse
+the per-line objects; the array exists only on a response it holds directly.
 
 The MXC ↔ OS contract therefore reports: which feature failed, whether it was a
 version mismatch or a runtime/capability unavailability (e.g. Hyper-V off), and

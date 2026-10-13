@@ -3142,6 +3142,14 @@ mod tests {
                 .contains("Script content must not be empty"),
             "expected the shared refusal, got: {refusal:?}"
         );
+        // The shared checks judge the request, so they have to reach the
+        // caller as a rejection on the launch path too, not only through a
+        // standalone `validate`.
+        assert_eq!(refusal.failure_phase, FailurePhase::Rejected);
+        assert_eq!(
+            refusal.exit_code,
+            FailurePhase::Rejected.failure_exit_code()
+        );
     }
 
     /// A caller can only act on a failure it can attribute: a refused policy is
