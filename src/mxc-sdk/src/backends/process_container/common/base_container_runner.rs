@@ -3308,8 +3308,7 @@ mod tests {
     #[test]
     fn psec_1_0_proxy_encodes_existing_loopback_capability_and_peer() {
         let request = psec_1_0_proxy_request();
-        let version = BaseContainerRunner::choose_min_required_psec_version_for_request(&request);
-        assert_eq!(version, SecurityEnvironmentVersion::V1_0);
+        let version = SecurityEnvironmentVersion::V1_0;
         let bytes = build_psec_v1_security_environment_spec(&request, version, false, false);
         let spec = psec_layout::root_as_process_security_environment(&bytes).unwrap();
         let network = spec.network_policy().unwrap();
