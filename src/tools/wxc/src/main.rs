@@ -1608,22 +1608,28 @@ fn main() {
         if !cli.dry_run {
             match audit::finalize(&mut response, context, &exe_dir, cli.audit_verbose) {
                 Ok(cleanup_warnings) => {
-                    for warning in cleanup_warnings {
-                        let message = format!("[audit] warning: {warning}");
-                        let _ = writeln!(logger, "{message}");
-                        eprintln!("{message}");
+                    for warning in &cleanup_warnings {
+                        let _ = writeln!(logger, "[audit] warning: {warning}");
                     }
+                    response.extend_warnings(
+                        cleanup_warnings
+                            .into_iter()
+                            .map(|warning| format!("[audit] {warning}")),
+                    );
                     eprintln!("[audit] artifacts written to {}", context.log_dir.display());
                 }
                 Err(error) => {
                     let message = format!("audit finalization failed: {error}");
                     let _ = writeln!(logger, "[audit] {message}");
-                    eprintln!("error: {message}");
-                    response.exit_code = -1;
                     response.error_message = match response.error_message.is_empty() {
                         true => message,
                         false => format!("{}; {message}", response.error_message),
                     };
+                    // Derived rather than hard-coded so the status keeps
+                    // agreeing with the code the envelope reports: an
+                    // otherwise-clean run carries `backend_error`, and a run
+                    // the backend already refused stays a rejection.
+                    response.exit_code = response.failure_phase.failure_exit_code();
                 }
             }
         }
