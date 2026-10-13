@@ -258,7 +258,6 @@ pub(crate) enum BaseContainerRequestDecision {
     PolicyIncompatible,
     DeniedPathsUnsupported,
     EnumeratePathsUnsupported,
-    IngressUnsupported,
     NativeCaptureUnavailable,
 }
 
@@ -429,28 +428,10 @@ impl BaseContainerRunner {
         supports_version(SecurityEnvironmentVersion::V1_0)
     }
 
-    // Temporary compatibility for explicit identity-less proxies on PSEC 1.0-only
-    // hosts. Remove once those hosts support PSEC 1.1; keep loopback allow opt-in.
-    fn psec_1_0_proxy_loopback_workaround(
-        request: &ExecutionRequest,
-        supports_version: impl FnMut(SecurityEnvironmentVersion) -> Result<bool, LearningModeError>,
-    ) -> Result<bool, LearningModeError> {
-        let policy = &request.policy;
-        if !policy.runtime_network_proxy_specified
-            || !policy.network_proxy.is_enabled()
-            || policy.allowed_proxy_peer.is_some()
-            || !unrestricted_host_loopback_allowed(policy)
-        {
-            return Ok(false);
-        }
-        Self::psec_1_0_only(supports_version)
-    }
-
     /// The single PSEC version-selection point: start at 1.0 and raise it to
     /// the highest version required by any requested native feature.
     fn choose_min_required_psec_version_for_request(
         request: &ExecutionRequest,
-        proxy_loopback_workaround: bool,
     ) -> SecurityEnvironmentVersion {
         let mut version = SecurityEnvironmentVersion::V1_0;
         if !request.policy.denied_paths.is_empty() {
@@ -460,7 +441,15 @@ impl BaseContainerRunner {
             version =
                 version.max(SecurityEnvironmentSupport::FileSystemEnumerate.required_version());
         }
-        if unrestricted_host_loopback_allowed(&request.policy) && !proxy_loopback_workaround {
+
+        // PSEC 1.1 supports unrestricted host loopback, including hosting a loopback
+        // server in the base container and communicating with low IL listeners.
+        // PSEC 1.0 only supports host loopback access to medium IL listeners, so those
+        // requests can still be considered serviceable on PSEC 1.0. Only upgrade to PSEC 1.1
+        // when the host supports the network ingress flag.
+        if unrestricted_host_loopback_allowed(&request.policy)
+            && Self::supports_ingress_host_loopback_allow()
+        {
             version = version.max(SecurityEnvironmentSupport::NetworkIngress.required_version());
         }
         version
@@ -502,15 +491,7 @@ impl BaseContainerRunner {
         if !request.policy.denied_paths.is_empty() && !Self::supports_native_denied_paths() {
             return BaseContainerRequestDecision::DeniedPathsUnsupported;
         }
-        if unrestricted_host_loopback_allowed(&request.policy)
-            && !Self::supports_ingress_host_loopback_allow()
-            && !matches!(
-                Self::psec_1_0_proxy_loopback_workaround(request, secenv::supports_version),
-                Ok(true)
-            )
-        {
-            return BaseContainerRequestDecision::IngressUnsupported;
-        }
+
         BaseContainerRequestDecision::Serviceable
     }
 }
@@ -540,17 +521,7 @@ impl BaseContainerRunner {
             logger,
         );
 
-        let proxy_loopback_workaround =
-            Self::psec_1_0_proxy_loopback_workaround(request, secenv::supports_version).map_err(
-                |error| ScriptResponse {
-                    failure_phase: FailurePhase::BackendUnavailable,
-                    ..ScriptResponse::error(&format!(
-                        "failed to query PSEC proxy compatibility support: {error}"
-                    ))
-                },
-            )?;
-        let psec_version =
-            Self::choose_min_required_psec_version_for_request(request, proxy_loopback_workaround);
+        let psec_version = Self::choose_min_required_psec_version_for_request(request);
         let version_supported =
             secenv::supports_version(psec_version).map_err(|error| ScriptResponse {
                 failure_phase: FailurePhase::BackendUnavailable,
@@ -2329,7 +2300,7 @@ mod tests {
 
     impl BaseContainerRunner {
         fn build_process_security_environment_spec(request: &ExecutionRequest) -> Vec<u8> {
-            let version = Self::choose_min_required_psec_version_for_request(request, false);
+            let version = Self::choose_min_required_psec_version_for_request(request);
             Self::with_capture_factory(fake_capture_factory())
                 .build_capture_aware_security_environment_spec(
                     request,
@@ -3235,10 +3206,7 @@ mod tests {
     #[test]
     fn required_psec_contract_uses_v1_1_for_enumeration() {
         assert_eq!(
-            BaseContainerRunner::choose_min_required_psec_version_for_request(
-                &enumerate_request(),
-                false
-            ),
+            BaseContainerRunner::choose_min_required_psec_version_for_request(&enumerate_request()),
             SecurityEnvironmentVersion::V1_1
         );
     }
@@ -3247,8 +3215,7 @@ mod tests {
     fn required_psec_contract_uses_v1_1_for_host_loopback() {
         assert_eq!(
             BaseContainerRunner::choose_min_required_psec_version_for_request(
-                &host_loopback_request(),
-                false
+                &host_loopback_request()
             ),
             SecurityEnvironmentVersion::V1_1
         );
@@ -3258,8 +3225,7 @@ mod tests {
     fn required_psec_contract_defaults_to_v1_0() {
         assert_eq!(
             BaseContainerRunner::choose_min_required_psec_version_for_request(
-                &ExecutionRequest::default(),
-                false
+                &ExecutionRequest::default()
             ),
             SecurityEnvironmentVersion::V1_0
         );
@@ -3340,92 +3306,9 @@ mod tests {
     }
 
     #[test]
-    fn psec_1_0_proxy_workaround_requires_a_1_0_only_host() {
+    fn psec_1_0_proxy_encodes_existing_loopback_capability_and_peer() {
         let request = psec_1_0_proxy_request();
-        for (supports_1_0, supports_1_1, expected) in [
-            (true, false, true),
-            (true, true, false),
-            (false, false, false),
-        ] {
-            let mut queried = Vec::new();
-            let workaround =
-                BaseContainerRunner::psec_1_0_proxy_loopback_workaround(&request, |version| {
-                    queried.push(version);
-                    Ok(if version == SecurityEnvironmentVersion::V1_1 {
-                        supports_1_1
-                    } else {
-                        supports_1_0
-                    })
-                })
-                .unwrap();
-            assert_eq!(workaround, expected);
-            assert_eq!(
-                queried,
-                if supports_1_1 {
-                    vec![SecurityEnvironmentVersion::V1_1]
-                } else {
-                    vec![
-                        SecurityEnvironmentVersion::V1_1,
-                        SecurityEnvironmentVersion::V1_0,
-                    ]
-                }
-            );
-        }
-    }
-
-    #[test]
-    fn psec_1_0_proxy_workaround_requires_explicit_identity_less_proxy_and_loopback_allow() {
-        for case in 0..4 {
-            let mut request = psec_1_0_proxy_request();
-            match case {
-                0 => request.policy.runtime_network_proxy_specified = false,
-                1 => request.policy.network_proxy = ProxyConfig::default(),
-                2 => request.policy.allowed_proxy_peer = Some("Contoso.Proxy_123".to_string()),
-                3 => {
-                    request
-                        .policy
-                        .network_ingress
-                        .as_mut()
-                        .unwrap()
-                        .host_loopback = NetworkAction::Deny;
-                }
-                _ => unreachable!(),
-            }
-            assert!(!BaseContainerRunner::psec_1_0_proxy_loopback_workaround(
-                &request,
-                |_| panic!("ineligible policy must not query the OS"),
-            )
-            .unwrap());
-        }
-    }
-
-    #[test]
-    fn psec_1_0_proxy_workaround_propagates_version_query_errors() {
-        let request = psec_1_0_proxy_request();
-        for failing_version in [
-            SecurityEnvironmentVersion::V1_0,
-            SecurityEnvironmentVersion::V1_1,
-        ] {
-            let result =
-                BaseContainerRunner::psec_1_0_proxy_loopback_workaround(&request, |version| {
-                    if version == failing_version {
-                        Err(LearningModeError::HResultCall {
-                            function: "IsProcessSecurityEnvironmentVersionSupported",
-                            code: E_NOTIMPL.0,
-                        })
-                    } else {
-                        Ok(false)
-                    }
-                });
-            assert!(matches!(result, Err(LearningModeError::HResultCall { .. })));
-        }
-    }
-
-    #[test]
-    fn psec_1_0_proxy_workaround_encodes_existing_loopback_capability_and_peer() {
-        let request = psec_1_0_proxy_request();
-        let version =
-            BaseContainerRunner::choose_min_required_psec_version_for_request(&request, true);
+        let version = BaseContainerRunner::choose_min_required_psec_version_for_request(&request);
         assert_eq!(version, SecurityEnvironmentVersion::V1_0);
         let bytes = build_psec_v1_security_environment_spec(&request, version, false, false);
         let spec = psec_layout::root_as_process_security_environment(&bytes).unwrap();
@@ -3449,11 +3332,11 @@ mod tests {
     }
 
     #[test]
-    fn psec_1_0_proxy_workaround_does_not_lower_enumeration_requirement() {
+    fn psec_1_0_proxy_does_not_lower_enumeration_requirement() {
         let mut request = psec_1_0_proxy_request();
         request.policy.enumerate_paths = vec!["C:\\tools".to_string()];
         assert_eq!(
-            BaseContainerRunner::choose_min_required_psec_version_for_request(&request, true),
+            BaseContainerRunner::choose_min_required_psec_version_for_request(&request),
             SecurityEnvironmentVersion::V1_1
         );
     }
