@@ -175,6 +175,10 @@ fn refuse_packet_sockets() -> std::io::Result<()> {
     #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
     compile_error!("LXC only understands seccomp system calls for x86_64 and arm64.");
 
+    // Use raw SecComp calls instead of the libseccomp crate.
+    // Using the libseccomp crate pulls in a dependency to the c libseccomp library.
+    // Use raw called here.
+
     // https://docs.kernel.org/networking/filter.html for more information on filtering sockets
     // Filtering sockets requires assembling a small filter program with assembly like syntax.
     // The below code is to consolidate some commands into easy to understand words.
@@ -192,9 +196,6 @@ fn refuse_packet_sockets() -> std::io::Result<()> {
     const SYSCALL_NUMBER: u32 = 0;
     const ARCHITECTURE: u32 = 4;
     const FIRST_ARGUMENT: u32 = 16;
-
-    // The arguments are 64 bits wide and the filter reads 32 bits at a time, so
-    // the second one starts two words after the first.
     const SECOND_ARGUMENT: u32 = 24;
 
     const REFUSE_WITH_EPERM: u32 = libc::SECCOMP_RET_ERRNO | (libc::EPERM as u32);
