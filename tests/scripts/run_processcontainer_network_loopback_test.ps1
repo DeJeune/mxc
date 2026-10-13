@@ -34,8 +34,8 @@ Initialize-WpcContext @PSBoundParameters
 #
 # BaseContainer must reach the host listener without a runtime proxy.
 # AppContainer tiers must reject hostLoopback=allow.
-function Phase-NetworkHostLoopback {
-    Section 'Phase 8d: host-loopback policy'
+function Phase-NetworkDirectHostLoopback {
+    Section 'Phase 8d: direct host-loopback policy'
 
     if ($SkipNetwork) {
         Record-Result -Phase 'P8d' -Name 'host loopback' -Status 'skip' -Detail '-SkipNetwork'
@@ -117,5 +117,5 @@ function Phase-NetworkHostLoopback {
     }
 }
 
-Invoke-WpcPhase -Key 'NetworkHostLoopback' -Body { Phase-NetworkHostLoopback }
+Invoke-WpcPhase -Key 'NetworkDirectHostLoopback' -Body { Phase-NetworkDirectHostLoopback }
 Complete-WpcChild

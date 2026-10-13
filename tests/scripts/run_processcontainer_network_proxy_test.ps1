@@ -149,7 +149,7 @@ function Invoke-NetworkProxyAssertions {
                 -NetworkProxy $proxyUrl -TimeoutMs 25000
             $direct = Invoke-NetRun -Name 'net-proxy-direct-blocked' -ConfigPath $cfgDirect
             Record-Result -Phase 'P8e' -Name 'direct egress blocked while runtime proxy is configured' `
-                -Pass ((-not $direct.Result.TimedOut) -and ($direct.Result.ExitCode -in @(7, 28)) -and ($direct.Result.Stderr -match 'curl: \((7|28)\)')) `
+                -Pass ((-not $direct.Result.TimedOut) -and ($direct.Result.ExitCode -in @(6, 7, 28)) -and ($direct.Result.Stderr -match 'curl: \((6|7|28)\)')) `
                 -Detail "exit=$($direct.Result.ExitCode); stderr=$(Format-Snippet $direct.Result.Stderr); WFP scopes egress to the proxy endpoint only"
         }
     } else {

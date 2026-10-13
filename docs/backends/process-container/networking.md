@@ -102,7 +102,8 @@ common WFP endpoint enforcement. The proxy endpoint is the loopback address and 
 `runtimeConfig.networkProxy`. The packaged row covers both AppContainer and non-AppContainer proxies because their
 client policy and package identity are the same; the enforcement table below separates their additional protections.
 
-`ingress.hostLoopback` is bidirectional. `allowedProxyPeer` authorizes a package family or AppContainer profile without
+`ingress.hostLoopback` requests access in both directions; the supported directions depend on the Windows build.
+`allowedProxyPeer` authorizes a package family or AppContainer profile without
 opening general host-loopback access, so identity-scoped paths keep `hostLoopback: "deny"`. Only an unpackaged
 non-AppContainer proxy lacks an accepted peer identity and requires `hostLoopback: "allow"`. This is a weaker
 development/testing compatibility deployment, not the shared policy's strict host-loopback-closure guarantee.
@@ -115,13 +116,18 @@ PSEC rejects it alongside a proxy. Their ingress default still selects `privateN
 host-loopback setting selects both the `networkLoopback` capability and the `MXC-Loopback` peer rather than an
 identity-scoped proxy peer. The peer alone is insufficient: without the capability, the environment can be created
 but its client cannot reach the host proxy.
+
 The public ingress policy remains required. `hostLoopback: "allow"` supports
 connections to host listeners both with an identity-less runtime proxy and
-without a proxy. On Windows 11 25H2, the initial ProcessContainer release
-(build 26200.9278) supports connections to medium-integrity host listeners.
-Build 26200.9550 adds support for hosting loopback servers inside the container
-and connecting to low-integrity listeners. See
+without a proxy.
+
+ProcessContainer is available on Windows 11 24H2 and later. The initial
+24H2 and 25H2 releases (builds 26100.9278 and 26200.9278, respectively) support
+connections to medium-integrity host listeners. Builds 26100.9550 and
+26200.9550 add support for hosting loopback servers inside the container and
+connecting to low-integrity listeners. See
 [Windows OS-version support](os-version-support.md) for supported releases.
+
 Requests that do not allow host loopback use the PSEC 1.0 capability mapping.
 Requests the PSEC contract cannot preserve continue to an AppContainer tier.
 

@@ -67,10 +67,11 @@ A clean policy rejection is a failure on these hosts.
 Older binaries that omit this probe fact do not enable the capability-specific
 assertions; the existing proxy assertions still apply.
 
-The `NetworkHostLoopback` area requires direct host-loopback access on
+The `NetworkDirectHostLoopback` area requires direct host-loopback access on
 BaseContainer with `hostLoopback: "allow"` and no runtime proxy, including
 older supported Windows hosts. Rejection or tier fallback fails the check;
 omitted and explicit `hostLoopback: "deny"` remain negative controls.
+The previous `NetworkHostLoopback` area selector remains an alias.
 
 Shared helpers live in `tests/scripts/lib/WinProcessContainer.Common.ps1`. It
 must be **dot-sourced, not imported as a module** — `Initialize-WpcContext`
