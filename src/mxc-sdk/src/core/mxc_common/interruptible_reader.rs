@@ -17,7 +17,7 @@
 //! and sets a flag so later reads short-circuit to EOF.
 
 use std::io::{self, Read};
-use std::os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd, RawFd};
+use std::os::fd::{AsFd, AsRawFd, OwnedFd, RawFd};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
@@ -95,19 +95,7 @@ impl InterruptibleReader {
 
         // Self-pipe for wakeups: the write end is non-blocking so `cancel`
         // never stalls; the read end stays blocking but is only ever polled.
-        let mut fds = [0 as RawFd; 2];
-        // SAFETY: `fds` is a valid 2-element array for `pipe` to fill.
-        if unsafe { libc::pipe(fds.as_mut_ptr()) } < 0 {
-            return Err(io::Error::last_os_error());
-        }
-        // SAFETY: `pipe` succeeded, so both fds are freshly owned by us.
-        let wake_r = unsafe { OwnedFd::from_raw_fd(fds[0]) };
-        let wake_w = unsafe { OwnedFd::from_raw_fd(fds[1]) };
-        // `pipe(2)` doesn't set close-on-exec, so mark both ends `FD_CLOEXEC` —
-        // otherwise they leak into any process this thread later forks+execs
-        // (e.g. another sandbox child).
-        set_cloexec(wake_r.as_raw_fd())?;
-        set_cloexec(wake_w.as_raw_fd())?;
+        let (wake_r, wake_w) = new_wake_pipe()?;
         set_nonblocking(wake_w.as_raw_fd())?;
 
         Ok(Self {
@@ -125,7 +113,6 @@ impl InterruptibleReader {
     pub fn canceller(&self) -> ReadCanceller {
         ReadCanceller(Arc::clone(&self.state))
     }
-
     pub fn try_clone_owned_fd(&self) -> io::Result<OwnedFd> {
         self.fd.as_fd().try_clone_to_owned()
     }
@@ -229,6 +216,36 @@ fn set_nonblocking(fd: RawFd) -> io::Result<()> {
     Ok(())
 }
 
+/// Create the wakeup self-pipe with both ends marked close-on-exec.
+///
+/// Linux gets this atomically from `pipe2`. macOS has no such variant, so the
+/// ends are inheritable between creation and the `fcntl` that marks them; a
+/// spawn racing on another thread can capture them. `LivePty` closes anything
+/// that slips through from its `pre_exec` hook.
+fn new_wake_pipe() -> io::Result<(OwnedFd, OwnedFd)> {
+    #[cfg(target_os = "linux")]
+    {
+        nix::unistd::pipe2(nix::fcntl::OFlag::O_CLOEXEC).map_err(io::Error::from)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        use std::os::fd::FromRawFd;
+
+        let mut fds = [0 as RawFd; 2];
+        // SAFETY: `fds` is a valid 2-element array for `pipe` to fill.
+        if unsafe { libc::pipe(fds.as_mut_ptr()) } < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: `pipe` succeeded, so both fds are freshly owned by us.
+        let read = unsafe { OwnedFd::from_raw_fd(fds[0]) };
+        // SAFETY: as above, for the write end.
+        let write = unsafe { OwnedFd::from_raw_fd(fds[1]) };
+        set_cloexec(read.as_raw_fd())?;
+        set_cloexec(write.as_raw_fd())?;
+        Ok((read, write))
+    }
+}
+
 /// Add `FD_CLOEXEC` to `fd`'s descriptor flags so it doesn't leak across `exec`.
 fn set_cloexec(fd: RawFd) -> io::Result<()> {
     // SAFETY: `fd` is a valid open fd; `fcntl` with these commands only reads
@@ -247,6 +264,7 @@ fn set_cloexec(fd: RawFd) -> io::Result<()> {
 mod tests {
     use super::*;
     use std::io::Write;
+    use std::os::fd::FromRawFd;
     use std::time::{Duration, Instant};
 
     /// Build an `InterruptibleReader` over a fresh pipe, returning it plus the

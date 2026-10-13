@@ -377,6 +377,12 @@ impl LivePty {
         unsafe {
             use std::os::unix::process::CommandExt;
             command.pre_exec(move || {
+                // Drop anything captured through the macOS close-on-exec
+                // window before handing the process to the workload.
+                #[cfg(target_os = "macos")]
+                crate::core_modules::mxc_common::inherited_descriptors::
+                    close_unmarked_inherited_descriptors();
+
                 nix::unistd::setsid().map_err(std::io::Error::from)?;
                 let _ = libc::ioctl(0, libc::TIOCSCTTY as _, 0);
 
@@ -2465,6 +2471,257 @@ mod tests {
         drop(stdio.stdout);
         drop(terminal);
         let _ = wait_for_exit(&mut child);
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn size_reports_the_last_applied_dimensions() {
+        let mut command = Command::new("/bin/sh");
+        command.arg("-c").arg("true");
+        let initial = PtySize {
+            rows: 24,
+            cols: 80,
+            pixel_width: 0,
+            pixel_height: 0,
+        };
+        let terminal = LivePty::attach(&mut command, initial, &[]).expect("attach PTY");
+        assert_eq!(terminal.size(), initial);
+
+        let resized = PtySize {
+            rows: 40,
+            cols: 120,
+            pixel_width: 0,
+            pixel_height: 0,
+        };
+        terminal.resize(resized).expect("resize PTY");
+        assert_eq!(terminal.size(), resized);
+
+        // A rejected resize must not disturb the recorded size.
+        assert_eq!(
+            terminal
+                .resize(PtySize {
+                    rows: 0,
+                    cols: 0,
+                    pixel_width: 0,
+                    pixel_height: 0,
+                })
+                .expect_err("zero dimensions are rejected")
+                .kind(),
+            std::io::ErrorKind::InvalidInput
+        );
+        assert_eq!(terminal.size(), resized);
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn is_canonical_mode_follows_the_terminal_discipline() {
+        let _guard = RUN_WITH_PTY_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let mut command = Command::new("/bin/sh");
+        command
+            .arg("-c")
+            .arg("printf 'ready\\n'; read go; stty -icanon; printf 'canonical-off\\n'; read done");
+        let terminal = LivePty::attach(&mut command, PtySize::default(), &[]).expect("attach PTY");
+        let mut child = command.spawn().expect("spawn child");
+        drop(command);
+        let drain = PtyDrain::start(terminal.try_clone_reader().expect("clone reader"));
+        let mut writer = terminal.take_writer().expect("take writer");
+
+        drain.wait_for("ready");
+        assert!(terminal.is_canonical_mode().expect("read discipline"));
+
+        writer.write_all(b"go\r").expect("write input");
+        drain.wait_for("canonical-off");
+        assert!(!terminal.is_canonical_mode().expect("read discipline"));
+
+        drop(writer);
+        let _ = child.kill();
+        let _ = wait_for_exit(&mut child);
+        drop(terminal);
+        let _ = drain.finish();
+    }
+
+    /// `resize` must notify the foreground process group, not just set the
+    /// kernel's window size.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn resize_signals_the_foreground_process_group() {
+        let _guard = RUN_WITH_PTY_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let mut command = Command::new("/bin/sh");
+        command.arg("-c").arg(
+            "trap 'stty size; exit 0' WINCH; printf 'ready\\n'; \
+             i=0; while [ $i -lt 200 ]; do sleep 0.1; i=$((i+1)); done",
+        );
+        let terminal = LivePty::attach(
+            &mut command,
+            PtySize {
+                rows: 24,
+                cols: 80,
+                pixel_width: 0,
+                pixel_height: 0,
+            },
+            &[],
+        )
+        .expect("attach PTY");
+        let mut child = command.spawn().expect("spawn child");
+        drop(command);
+        let drain = PtyDrain::start(terminal.try_clone_reader().expect("clone reader"));
+
+        drain.wait_for("ready");
+        terminal
+            .resize(PtySize {
+                rows: 40,
+                cols: 120,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
+            .expect("resize PTY");
+
+        let seen = drain.wait_for("40 120");
+        assert!(seen.contains("40 120"), "got: {seen:?}");
+        assert!(wait_for_exit(&mut child).success());
+        drop(terminal);
+        let _ = drain.finish();
+    }
+
+    /// A forwarding process switches the terminal to raw mode, so the live
+    /// discipline no longer reports an EOF character. `attach_forwarded`
+    /// captures it up front and still delivers it.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn forwarded_eof_is_delivered_through_a_raw_mode_terminal() {
+        let _guard = RUN_WITH_PTY_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let mut command = Command::new("/bin/sh");
+        command.arg("-c").arg(
+            "stty raw -echo; printf 'ready\\r\\n'; \
+             head -c 1 | od -An -tx1 | tr -d ' \\n'; printf '\\r\\n'",
+        );
+        let terminal = LivePty::attach_forwarded(&mut command, PtySize::default(), &[])
+            .expect("attach forwarded PTY");
+        let mut child = command.spawn().expect("spawn child");
+        drop(command);
+        let drain = PtyDrain::start(terminal.try_clone_reader().expect("clone reader"));
+
+        drain.wait_for("ready");
+        drop(terminal.take_writer().expect("take writer"));
+
+        assert!(wait_for_exit(&mut child).success());
+        drop(terminal);
+        let output = drain.finish();
+        assert!(output.contains("04"), "expected ^D byte; got: {output:?}");
+    }
+
+    /// The contrast to the test above: the default discipline reads the live
+    /// termios, which reports no EOF character once the terminal is raw.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn current_canonical_eof_is_skipped_for_a_raw_mode_terminal() {
+        let _guard = RUN_WITH_PTY_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let mut command = Command::new("/bin/sh");
+        command
+            .arg("-c")
+            .arg("stty raw -echo; printf 'ready\\r\\n'; head -c 1 >/dev/null");
+        let terminal = LivePty::attach(&mut command, PtySize::default(), &[]).expect("attach PTY");
+        let mut child = command.spawn().expect("spawn child");
+        drop(command);
+        let drain = PtyDrain::start(terminal.try_clone_reader().expect("clone reader"));
+
+        drain.wait_for("ready");
+        drop(terminal.take_writer().expect("take writer"));
+
+        std::thread::sleep(Duration::from_secs(1));
+        assert!(
+            child.try_wait().expect("poll child").is_none(),
+            "no EOF byte should reach a raw-mode terminal"
+        );
+
+        let _ = child.kill();
+        let _ = wait_for_exit(&mut child);
+        drop(terminal);
+        let _ = drain.finish();
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn raw_secondary_guard_sets_raw_mode_and_restores_on_drop() {
+        use nix::sys::termios::{self, LocalFlags};
+
+        let (primary, secondary) = open_pty(None).expect("open PTY pair");
+        let before = termios::tcgetattr(&secondary).expect("read termios");
+        assert!(before.local_flags.contains(LocalFlags::ICANON));
+
+        {
+            let _raw = RawSecondaryGuard::install(secondary.as_raw_fd()).expect("install raw mode");
+            let during = termios::tcgetattr(&secondary).expect("read termios");
+            assert!(!during.local_flags.contains(LocalFlags::ICANON));
+            assert!(!during.local_flags.contains(LocalFlags::ECHO));
+        }
+
+        let after = termios::tcgetattr(&secondary).expect("read termios");
+        // PENDIN is kernel-managed status, not settable state.
+        let settable = |flags: LocalFlags| flags - LocalFlags::PENDIN;
+        assert_eq!(settable(after.local_flags), settable(before.local_flags));
+        assert_eq!(after.input_flags, before.input_flags);
+        assert_eq!(after.output_flags, before.output_flags);
+        drop(primary);
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn raw_secondary_guard_declines_a_non_tty() {
+        let (read, write) = create_pipe().expect("create pipe");
+        assert!(RawSecondaryGuard::install(read.as_raw_fd()).is_none());
+        drop((read, write));
+    }
+
+    /// A descriptor caught in the macOS close-on-exec window must not reach
+    /// the workload.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn attach_closes_descriptors_captured_through_the_cloexec_window() {
+        use std::os::fd::{FromRawFd, OwnedFd, RawFd};
+
+        let _guard = RUN_WITH_PTY_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+        // A pipe left unmarked, exactly as the window leaves one.
+        let mut fds = [0 as RawFd; 2];
+        // SAFETY: `fds` is a valid 2-element array for `pipe` to fill.
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+        // SAFETY: `pipe` succeeded, so both fds are freshly owned here.
+        let read = unsafe { OwnedFd::from_raw_fd(fds[0]) };
+        // SAFETY: as above, for the write end.
+        let write = unsafe { OwnedFd::from_raw_fd(fds[1]) };
+        let target = write.as_raw_fd();
+
+        let mut command = Command::new("/bin/sh");
+        command.arg("-c").arg(format!(
+            "if echo leaked >&{target} 2>/dev/null; then echo LEAKED; else echo CLOSED; fi"
+        ));
+        let terminal = LivePty::attach(&mut command, PtySize::default(), &[]).expect("attach PTY");
+        let mut child = command.spawn().expect("spawn child");
+        drop(command);
+        let drain = PtyDrain::start(terminal.try_clone_reader().expect("clone reader"));
+
+        assert!(wait_for_exit(&mut child).success());
+        drop(terminal);
+        let output = drain.finish();
+        assert!(output.contains("CLOSED"), "fd {target} leaked: {output:?}");
+        drop((read, write));
+    }
+
+    /// The scrub must spare the pipe the Rust runtime uses to report a failed
+    /// `exec`; closing it would make every failure look like a success.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn attach_still_reports_a_failed_exec() {
+        let _guard = RUN_WITH_PTY_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+        let mut command = Command::new("/nonexistent/mxc-pty-missing-binary");
+        let terminal = LivePty::attach(&mut command, PtySize::default(), &[]).expect("attach PTY");
+        let error = command
+            .spawn()
+            .expect_err("missing binary must fail to spawn");
+        assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
+        drop(terminal);
     }
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]
