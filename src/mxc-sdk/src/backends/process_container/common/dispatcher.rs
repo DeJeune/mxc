@@ -288,18 +288,25 @@ impl std::error::Error for DispatchError {}
 impl DispatchError {
     /// The wire code this dispatch failure is reported under.
     ///
-    /// Reaching dispatch means the policy was already accepted, so a failure
-    /// here is the host failing to build the tier the policy asked for, not a
-    /// judgement of the policy -- the same distinction the
-    /// [`RejectionReason::RunnerUnavailable`] audit reason draws. The two
-    /// exceptions are failures of an operation the host *could* perform: a SID
-    /// that could not be derived carries its own code, and ACEs that could not
-    /// be applied are a runtime fault.
+    /// A field the selected tier cannot represent is a refusal of the policy:
+    /// the message names the field, and a request that drops it runs. The rest
+    /// are the tier itself being unavailable -- none could be built, or a
+    /// required provider is absent -- so the policy was never judged, which is
+    /// the same distinction the [`RejectionReason::RunnerUnavailable`] audit
+    /// reason draws. A SID that could not be derived carries its own code, and
+    /// ACEs that could not be applied are a runtime fault.
     ///
     /// [`RejectionReason::RunnerUnavailable`]: crate::mxc_common::audit::RejectionReason
     pub fn error_code(&self) -> MxcErrorCode {
         match self {
-            DispatchError::Fallback(_)
+            DispatchError::Fallback(
+                FallbackError::EnumeratePathsUnsupported | FallbackError::IngressUnsupported,
+            ) => MxcErrorCode::PolicyValidation,
+            DispatchError::Fallback(
+                FallbackError::DaclFallbackDisabled
+                | FallbackError::WriteDacUnavailable { .. }
+                | FallbackError::SystemRootUnresolved { .. },
+            )
             | DispatchError::CaptureDenialsUnsupported { .. }
             | DispatchError::CaptureDenialsUnavailable { .. } => MxcErrorCode::BackendUnavailable,
             DispatchError::Sid(error) => error.error_code(),
@@ -851,13 +858,28 @@ mod tests {
     };
 
     #[test]
-    fn a_tier_the_host_could_not_build_is_not_blamed_on_the_policy() {
-        // Dispatch runs after the policy was accepted, so none of these are a
-        // verdict on the request. Reporting them as a policy rejection would
-        // send the caller editing a config that was never the problem.
+    fn a_field_the_tier_cannot_represent_is_a_refusal_of_the_policy() {
+        // Documented as a rejection rather than a silent drop, and the caller
+        // is the one who can act: a request without the field runs.
         for error in [
             FallbackError::EnumeratePathsUnsupported,
             FallbackError::IngressUnsupported,
+        ] {
+            let dispatch = DispatchError::Fallback(error);
+            assert_eq!(
+                dispatch.error_code(),
+                MxcErrorCode::PolicyValidation,
+                "{dispatch}"
+            );
+            assert_eq!(dispatch.error_code().exit_code(), 1, "{dispatch}");
+        }
+    }
+
+    #[test]
+    fn a_tier_that_could_not_be_built_is_not_blamed_on_the_policy() {
+        // No tier exists to judge the policy against, so reporting a rejection
+        // would send the caller editing a config that was never the problem.
+        for error in [
             FallbackError::DaclFallbackDisabled,
             FallbackError::WriteDacUnavailable {
                 path: PathBuf::from("C:\\work"),
@@ -895,6 +917,7 @@ mod tests {
                 MxcErrorCode::BackendUnavailable,
                 "{dispatch}"
             );
+            assert_eq!(dispatch.error_code().exit_code(), -1, "{dispatch}");
         }
     }
 

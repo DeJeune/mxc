@@ -111,11 +111,11 @@ function Phase-FsEnumerate {
         $r = Invoke-Wxc -Wxc $WxcDebug -ConfigPath $cfg -LogPath $log -TimeoutSec 30
         $combined = "$($r.Stdout)`n$($r.Stderr)`n$(Read-Log $log)"
 
-        # enumeratePaths cannot be represented by an AppContainer tier, so the
-        # host could not build one for this policy: the refusal is typed
-        # `backend_unavailable` and exits -1. A silent exit 0 is the defect.
-        Record-Result -Phase 'P4e' -Name 'unsupported host refuses the run (typed backend_unavailable, exit -1)' `
-            -Pass (-not $r.TimedOut -and $r.ExitCode -eq -1 -and (Test-BackendUnavailable -Run $r -Log $combined)) `
+        # enumeratePaths cannot degrade to an AppContainer tier, so the refusal
+        # names the field and exits 1; -1 would mean a launch API failed, which
+        # would mean the policy was never judged.
+        Record-Result -Phase 'P4e' -Name 'unsupported host refuses the run (exit=1)' `
+            -Pass (-not $r.TimedOut -and $r.ExitCode -eq 1) `
             -Detail "exit=$($r.ExitCode); timedOut=$($r.TimedOut)"
         Record-Result -Phase 'P4e' -Name 'refusal is attributed to enumeratePaths, not generic' `
             -Pass ($combined -match '(?i)enumeratePaths') `
