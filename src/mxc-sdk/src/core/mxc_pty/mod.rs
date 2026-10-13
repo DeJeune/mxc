@@ -2127,7 +2127,7 @@ mod tests {
         input.write_all(b"hello").expect("write partial input");
         drop(input);
 
-        assert!(child.wait().expect("wait child").success());
+        assert!(wait_for_exit(&mut child).success());
         terminal.finish_native_bridge();
         let mut text = String::new();
         output.read_to_string(&mut text).expect("read output");
@@ -2156,7 +2156,7 @@ mod tests {
             stdio.stdout
         });
 
-        assert!(child.wait().expect("wait child").success());
+        assert!(wait_for_exit(&mut child).success());
         terminal.finish_native_bridge();
         let stdout = input_thread.join().expect("input thread");
         let mut output = std::fs::File::from(stdout);
@@ -2178,7 +2178,7 @@ mod tests {
         let stdio = terminal.take_native_stdio().expect("take native stdio");
         drop(stdio.stdin);
 
-        assert!(child.wait().expect("wait child").success());
+        assert!(wait_for_exit(&mut child).success());
         let start = std::time::Instant::now();
         terminal.finish_native_bridge();
         assert!(
@@ -2297,7 +2297,7 @@ mod tests {
             output.read_to_end(&mut bytes).expect("read output");
             bytes
         });
-        assert!(child.wait().expect("wait child").success());
+        assert!(wait_for_exit(&mut child).success());
         terminal.finish_native_bridge();
 
         let output = output_thread.join().expect("output thread");
@@ -2325,7 +2325,7 @@ mod tests {
             let buffer = vec![b'x'; 1024 * 1024];
             let _ = input.write_all(&buffer);
         });
-        assert!(child.wait().expect("wait child").success());
+        assert!(wait_for_exit(&mut child).success());
 
         let start = std::time::Instant::now();
         terminal.finish_native_bridge();
@@ -2349,7 +2349,32 @@ mod tests {
         drop(stdio.stdin);
         drop(stdio.stdout);
 
-        assert!(child.wait().expect("wait child").success());
+        assert!(wait_for_exit(&mut child).success());
+        terminal.finish_native_bridge();
+    }
+
+    /// The closed-consumer case above drains the child's whole output in one
+    /// read, so it only catches a bridge that stops draining because Darwin
+    /// blocks the secondary's close. Gate a bulk write behind the close so the
+    /// child also blocks on a full terminal queue, which catches it anywhere.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn native_bridge_keeps_draining_after_the_output_consumer_closes() {
+        let _guard = RUN_WITH_PTY_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let mut command = Command::new("/bin/sh");
+        command.arg("-c").arg("read go; head -c 1000000 /dev/zero");
+        let terminal = LivePty::attach(&mut command, PtySize::default(), &[]).expect("attach PTY");
+        let mut child = command.spawn().expect("spawn child");
+        drop(command);
+        let stdio = terminal.take_native_stdio().expect("take native stdio");
+
+        // Close the consumer first so the echoed input already triggers EPIPE.
+        drop(stdio.stdout);
+        let mut input = std::fs::File::from(stdio.stdin);
+        input.write_all(b"go\n").expect("write input");
+        drop(input);
+
+        assert!(wait_for_exit(&mut child).success());
         terminal.finish_native_bridge();
     }
 
