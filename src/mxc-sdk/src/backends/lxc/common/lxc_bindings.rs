@@ -200,8 +200,8 @@ fn refuse_packet_sockets() -> std::io::Result<()> {
 
     const REFUSE_WITH_EPERM: u32 = libc::SECCOMP_RET_ERRNO | (libc::EPERM as u32);
 
-    // io_uring answers "this kernel has no such call" rather than "you may not",
-    // because that is the answer a library probing for io_uring falls back on.
+    // ENOSYS is the errno from a kernel built without io_uring.  The refusal
+    // borrows it to read as absence rather than denial.
     const REFUSE_WITH_ENOSYS: u32 = libc::SECCOMP_RET_ERRNO | (libc::ENOSYS as u32);
 
     const NO_FLAGS: libc::c_ulong = 0;
