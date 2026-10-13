@@ -115,12 +115,13 @@ PSEC rejects it alongside a proxy. Their ingress default still selects `privateN
 host-loopback setting selects both the `networkLoopback` capability and the `MXC-Loopback` peer rather than an
 identity-scoped proxy peer. The peer alone is insufficient: without the capability, the environment can be created
 but its client cannot reach the host proxy.
-The public ingress policy remains required. Direct-egress host-loopback allow
-requires PSEC 1.1 and the ingress support flag. For an identity-less
-`runtimeConfig.networkProxy` with explicit `hostLoopback: "allow"`, MXC also
-supports a compatibility workaround on hosts that support PSEC 1.0 but not 1.1.
-Hosts that support PSEC 1.1 or newer must still advertise the ingress support
-flag; accepting a 1.0 payload does not enable this workaround.
+The public ingress policy remains required. `hostLoopback: "allow"` supports
+connections to host listeners both with an identity-less runtime proxy and
+without a proxy. On Windows 11 25H2, the initial ProcessContainer release
+(build 26200.9278) supports connections to medium-integrity host listeners.
+Build 26200.9550 adds support for hosting loopback servers inside the container
+and connecting to low-integrity listeners. See
+[Windows OS-version support](os-version-support.md) for supported releases.
 Requests that do not allow host loopback use the PSEC 1.0 capability mapping.
 Requests the PSEC contract cannot preserve continue to an AppContainer tier.
 

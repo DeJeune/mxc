@@ -1061,12 +1061,12 @@ function Start-LoopbackListener {
     }
 }
 
-# Contained command line that fetches a host-loopback URL. Same two-branch
-# token contract as Get-AnchorFetchCommand.
+# Fetch directly so a child-launch failure cannot look like blocked networking.
 function Get-LoopbackFetchCommand {
-    param([Parameter(Mandatory)][string]$Url, [int]$TimeoutSec = 5)
+    param([Parameter(Mandatory)][string]$Url, [int]$TimeoutSec = 5, [switch]$UseProxyEnv)
     $curl = Join-Path $env:SystemRoot 'System32\curl.exe'
-    return "$env:SystemRoot\System32\cmd.exe /c `"$curl --silent --show-error --max-time $TimeoutSec --output NUL $Url && echo NET=REACHED || echo NET=BLOCKED`""
+    $noProxy = if ($UseProxyEnv) { '' } else { '*' }
+    return "`"$curl`" --silent --show-error --max-time $TimeoutSec --noproxy `"$noProxy`" $Url"
 }
 
 

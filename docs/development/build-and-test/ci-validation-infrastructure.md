@@ -170,6 +170,10 @@ across the system drive on every run and again on teardown — acceptable on a
 disposable runner, which is why the switch is off by default and only CI opts
 in. Temporary until pwsh 7.7 leaves preview.
 
+`NetworkHostLoopback` requires direct host-loopback access on BaseContainer
+without a runtime proxy, including older supported Windows hosts. Rejection
+or tier fallback fails the check; omitted and explicit deny are negative controls.
+
 The suite's git workloads also restamp the ownership of the repo they build.
 The 1ES agent runs elevated, and an elevated token's *default owner* is
 `BUILTIN\Administrators`, so a fixture created there is Administrators-owned;

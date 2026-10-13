@@ -88,9 +88,7 @@ function Invoke-NetworkProxyAssertions {
         $out = $envRun.Result.Stdout
         $ran = [bool]($out -match '(?im)^SystemRoot=')
         $identitylessProxyAvailable = $Script:Caps.BaseContainerSupportsIdentitylessLoopbackProxy
-        # PSEC 1.0-only hosts use the explicit identity-less proxy workaround.
-        # PSEC 1.1+ still requires the ingress support flag. A bare OS error
-        # is never a valid substitute for successful execution or rejection.
+        # A bare OS error is not successful execution or a policy rejection.
         $rejectedCleanly = Test-WasRejected $envRun
         Record-Result -Phase 'P8e' -Name 'identity-less proxy config either runs or is rejected cleanly (never a bare OS error)' `
             -Pass ($ran -or $rejectedCleanly) `
@@ -124,14 +122,14 @@ function Invoke-NetworkProxyAssertions {
             # can only mean the proxy endpoint was reachable, and the
             # assertion needs no external connectivity.
             $cfgVia = New-Config -Name 'net-proxy-via-endpoint' `
-                -CommandLine (Get-AnchorFetchCommand -Url 'http://mxc-proxy-probe.invalid/') `
+                -CommandLine (Get-LoopbackFetchCommand -Url 'http://mxc-proxy-probe.invalid/' -UseProxyEnv) `
                 -ReadWrite $fs.ReadWrite -ReadOnly $fs.ReadOnly `
                 -EgressDefault 'deny' -IngressDefault 'allow' -HostLoopback 'allow' `
                 -NetworkProxy $proxyUrl -TimeoutMs 25000
             $via = Invoke-NetRun -Name 'net-proxy-via-endpoint' -ConfigPath $cfgVia
             Record-Result -Phase 'P8e' -Name 'a proxied fetch reaches the configured proxy endpoint' `
-                -Pass ($via.Verdict -eq 'REACHED') `
-                -Detail ("verdict=$($via.Verdict); endpoint=127.0.0.1:$port; " +
+                -Pass (($via.Result.Stdout.Trim() -eq 'MXC-LOOPBACK-ANCHOR') -and ($via.Result.ExitCode -eq 0) -and -not $via.Result.TimedOut) `
+                -Detail ("exit=$($via.Result.ExitCode); stderr=$(Format-Snippet $via.Result.Stderr); endpoint=127.0.0.1:$port; " +
                          'target is unresolvable, so REACHED is attributable to the proxy alone')
         }
 
@@ -145,14 +143,14 @@ function Invoke-NetworkProxyAssertions {
                 -Detail 'the identity-less proxy shape does not start on this host; a NORUN cannot prove egress was blocked'
         } else {
             $cfgDirect = New-Config -Name 'net-proxy-direct-blocked' `
-                -CommandLine (Get-AnchorFetchCommand -IgnoreProxyEnv) `
+                -CommandLine (Get-LoopbackFetchCommand -Url $ExternalAnchorUrl) `
                 -ReadWrite $fs.ReadWrite -ReadOnly $fs.ReadOnly `
                 -EgressDefault 'deny' -IngressDefault 'allow' -HostLoopback 'allow' `
                 -NetworkProxy $proxyUrl -TimeoutMs 25000
             $direct = Invoke-NetRun -Name 'net-proxy-direct-blocked' -ConfigPath $cfgDirect
             Record-Result -Phase 'P8e' -Name 'direct egress blocked while runtime proxy is configured' `
-                -Pass ($direct.Verdict -eq 'BLOCKED') `
-                -Detail "verdict=$($direct.Verdict); WFP scopes egress to the proxy endpoint only"
+                -Pass ((-not $direct.Result.TimedOut) -and ($direct.Result.ExitCode -in @(7, 28)) -and ($direct.Result.Stderr -match 'curl: \((7|28)\)')) `
+                -Detail "exit=$($direct.Result.ExitCode); stderr=$(Format-Snippet $direct.Result.Stderr); WFP scopes egress to the proxy endpoint only"
         }
     } else {
         # "runtime proxy requests do not fall back because

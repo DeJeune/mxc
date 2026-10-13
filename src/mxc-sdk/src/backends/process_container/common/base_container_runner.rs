@@ -3185,7 +3185,12 @@ mod tests {
             host_loopback: NetworkAction::Allow,
         });
 
-        let bytes = BaseContainerRunner::build_process_security_environment_spec(&request);
+        let bytes = build_psec_v1_security_environment_spec(
+            &request,
+            SecurityEnvironmentVersion::V1_1,
+            true,
+            false,
+        );
         let spec = psec_layout::root_as_process_security_environment(&bytes).unwrap();
         let ingress = spec
             .network_policy()
@@ -3212,12 +3217,13 @@ mod tests {
     }
 
     #[test]
-    fn required_psec_contract_uses_v1_1_for_host_loopback() {
+    fn required_psec_contract_uses_v1_0_for_host_loopback_without_ingress_support() {
+        let _guard = crate::process_container_common::test_env::BcUsableGuard::set(false);
         assert_eq!(
             BaseContainerRunner::choose_min_required_psec_version_for_request(
                 &host_loopback_request()
             ),
-            SecurityEnvironmentVersion::V1_1
+            SecurityEnvironmentVersion::V1_0
         );
     }
 
