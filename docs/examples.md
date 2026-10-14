@@ -134,9 +134,10 @@ the development/testing configuration is:
 
 This identity-less host-loopback deployment restricts client egress to the
 configured proxy address and port, but does not verify which process owns that
-endpoint. It supports PSEC 1.0-only hosts and hosts with PSEC 1.1 or newer that
-advertise ingress support. PSEC 1.1 or newer without that flag rejects the
-request, even if the host also accepts PSEC 1.0 payloads. For production
+endpoint. It supports hosts that accept PSEC 1.0 or advertise native ingress
+support, including PSEC 1.1 hosts with ingress disabled that still accept
+PSEC 1.0. Capability-query failures are reported rather than treated as absent
+ingress support. For production
 ProcessContainer deployments, identify a packaged proxy through
 `processContainer.network.allowedProxyPeer` instead; see
 [proxy deployment choices](backends/process-container/networking.md#proxy-deployment-choices).

@@ -62,10 +62,13 @@ tests\scripts\run_processcontainer_network_proxy_test.ps1 -RequireTier base-cont
 
 When the host probe reports `baseContainerSupportsIdentitylessLoopbackProxy`,
 the proxy area requires workload launch and a successful proxied fetch on both
-PSEC 1.0-only hosts and hosts with PSEC 1.1 ingress support.
+hosts that accept PSEC 1.0 or advertise native ingress support.
 A clean policy rejection is a failure on these hosts.
 Older binaries that omit this probe fact do not enable the capability-specific
 assertions; the existing proxy assertions still apply.
+The area also verifies that the host can reach a second loopback endpoint and
+that the proxy-configured container cannot reach it directly. This literal-IP
+negative check requires a connection failure or curl timeout, not a DNS failure.
 
 The `NetworkDirectHostLoopback` area requires direct host-loopback access on
 BaseContainer with `hostLoopback: "allow"` and no runtime proxy, including

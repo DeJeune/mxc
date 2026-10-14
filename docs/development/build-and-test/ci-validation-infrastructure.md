@@ -174,6 +174,11 @@ in. Temporary until pwsh 7.7 leaves preview.
 without a runtime proxy, including older supported Windows hosts. Rejection
 or tier fallback fails the check; omitted and explicit deny are negative controls.
 
+The runtime proxy area verifies that the host can reach a second loopback
+listener, then requires direct container access to that listener to fail while
+the configured proxy remains reachable. The literal-IP check cannot pass on
+DNS-resolution failure.
+
 The suite's git workloads also restamp the ownership of the repo they build.
 The 1ES agent runs elevated, and an elevated token's *default owner* is
 `BUILTIN\Administrators`, so a fixture created there is Administrators-owned;

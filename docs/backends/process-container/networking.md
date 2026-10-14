@@ -116,7 +116,9 @@ PSEC rejects it alongside a proxy. Their ingress default still selects `privateN
 host-loopback setting selects both the `networkLoopback` capability and the `MXC-Loopback` peer rather than an
 identity-scoped proxy peer. The peer alone is insufficient: without the capability, the environment can be created
 but its client cannot reach the host proxy.
-Direct requests use the same capability and peer when native ingress support is unavailable.
+Direct requests always use the same capability and peer when `hostLoopback` is `"allow"`,
+including when the native ingress table is present. This keeps capability-based host-loopback
+access available independently of native ingress support.
 
 The public ingress policy remains required. `hostLoopback: "allow"` supports
 connections to host listeners both with an identity-less runtime proxy and
@@ -138,12 +140,13 @@ Backend discovery reports `identitylessLoopbackProxy` on the ProcessContainer
 `base-container` tier when the host supports an identity-less proxy on loopback.
 The Windows request probe also reports
 `probes.baseContainerSupportsIdentitylessLoopbackProxy`, including when called
-without a request. Support is available on PSEC 1.0-only hosts and on hosts with
-PSEC 1.1 or newer that advertise ingress support. A host that reports
+without a request. Support is available when the host accepts PSEC 1.0 or
+advertises native ingress support. This includes PSEC 1.1 hosts with native
+ingress disabled that still accept PSEC 1.0. A host that reports
 `baseContainerSupportsIngressHostLoopbackAllow` also supports an identity-less
-loopback proxy. PSEC 1.1 or newer without ingress support does not qualify,
-even if it also accepts PSEC 1.0 payloads. Version-query failures omit the
-capability, set the probe fact to `false`, and add a warning.
+loopback proxy. Ingress- or version-query failures omit the capability, set the
+probe fact to `false`, and add a warning. Execution also reports ingress-query
+failures rather than treating an unknown support state as a compatibility fallback.
 
 This does not grant general `ingressHostLoopbackAllow` support or report that the
 current request uses an identity-less proxy. The request must set

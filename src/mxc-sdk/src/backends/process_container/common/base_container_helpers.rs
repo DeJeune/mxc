@@ -39,10 +39,8 @@ pub(super) fn build_psec_v1_security_environment_spec(
     );
     let mut builder = flatbuffers::FlatBufferBuilder::with_capacity(1024);
     let mut capabilities = effective_capabilities(request, capture_network_decisions);
-    if unrestricted_host_loopback_allowed(&request.policy)
-        && (request.policy.network_proxy.is_enabled() || !supports_network_ingress)
-    {
-        // Without native ingress, loopback needs both the capability and peer.
+    if unrestricted_host_loopback_allowed(&request.policy) {
+        // Keep capability-based loopback available independently of native ingress support.
         ensure_capability(&mut capabilities, "networkLoopback");
     }
     let ui_restrictions = crate::process_container_common::job_object::to_job_object_uilimit_mask(
