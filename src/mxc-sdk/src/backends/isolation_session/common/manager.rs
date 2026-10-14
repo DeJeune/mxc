@@ -440,7 +440,7 @@ impl IsolationSessionManager {
             // the calling process exits. Interactive relays also install the Ctrl
             // handler, so they use the process-lifetime event prepared and reset by
             // `prepare_ctrl_handler_stop_event`; otherwise a handler thread that
-            // already read the raw  handle could signal its event after it was closed. 
+            // already read the raw handle could signal its event after it was closed.
             // Non-interactive relays do not install the handler and have a
             // per-exec owned event.
             let stdin_stop_event = if options.interactive {
