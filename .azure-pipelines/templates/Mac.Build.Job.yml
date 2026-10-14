@@ -51,7 +51,7 @@ jobs:
           configFile: $(configTomlPath)
         cacheOptions:
           enabled: true
-          enableTargetCache: true
+          enableTargetCache: false
         setupOptions:
           setupPython: true
           pythonArtifactFeeds: Dart/Mxc-Azure-Feed

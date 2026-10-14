@@ -5,6 +5,9 @@ parameters:
 - name: isOfficialBuild
   type: boolean
   default: false
+- name: poolName
+  type: string
+  default: Azure-Pipelines-1ESPT-ExDShared
 - name: matrix
   type: object
   default: {}
@@ -19,7 +22,7 @@ jobs:
     dependsOn: []
     timeoutInMinutes: 120
     pool:
-      name: Azure-Pipelines-1ESPT-ExDShared
+      name: ${{ parameters.poolName }}
       ${{ if eq(item.os, 'windows') }}:
         image: windows-latest
         os: windows
@@ -28,6 +31,8 @@ jobs:
         os: linux
 
     variables:
+      # Keep compiler output on the agent work disk, not the OS disk.
+      CARGO_TARGET_DIR: $(Pipeline.Workspace)/target
 
       # Triplet
       ${{ if and(eq(item.os, 'windows'), eq(item.arch, 'x64')) }}:
@@ -41,7 +46,6 @@ jobs:
 
       # Windows specific variables
       ${{ if eq(item.os, 'windows') }}:
-        CARGO_TARGET_DIR: c:/t/target
         artifactPrefix: wxc-binaries
         workingDirectory: $(Build.SourcesDirectory)/src
         # Explicit feature set (no --all-features): tier2_bfs must NOT ship
@@ -50,7 +54,7 @@ jobs:
           # Generate the C# P/Invoke source once. The dotnetsdk feature only
           # enables csbindgen; it does not alter the native runtime surface.
           cargoFeatures: hyperlight isolation_session microvm wslc dotnetsdk
-          dotnetTestSupportTargetDir: c:/t/dotnet-test-support
+          dotnetTestSupportTargetDir: $(Pipeline.Workspace)/dotnet-test-support
         ${{ else }}:
           cargoFeatures: hyperlight isolation_session microvm wslc
         signPattern: |
@@ -67,7 +71,6 @@ jobs:
 
       # Linux specific variables
       ${{ if eq(item.os, 'linux') }}:
-        CARGO_TARGET_DIR: /tmp/target
         artifactPrefix: lxc-binaries
         workingDirectory: $(Build.SourcesDirectory)/src/tools/lxc
         cargoFeatures: hyperlight
@@ -84,7 +87,7 @@ jobs:
       configTomlPath: $(Build.SourcesDirectory)/.cargo/config.toml
 
     # 1ES Rust virtual tasks read these settings (toolchain feed, registry
-    # auth, target-dir cache) from the job's templateContext. Official-only
+    # auth, tool cache) from the job's templateContext. Official-only
     # because Mxc-Azure-Feed needs System.AccessToken.
     ${{ if eq(parameters.isOfficialBuild, true) }}:
       templateContext:
@@ -100,7 +103,7 @@ jobs:
             configFile: $(configTomlPath)
           cacheOptions:
             enabled: true
-            enableTargetCache: true
+            enableTargetCache: false
 
     steps:
       - checkout: self

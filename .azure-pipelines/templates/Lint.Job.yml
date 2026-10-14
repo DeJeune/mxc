@@ -9,6 +9,9 @@ parameters:
 - name: isOfficialBuild
   type: boolean
   default: false
+- name: poolName
+  type: string
+  default: Azure-Pipelines-1ESPT-ExDShared
 - name: matrix
   type: object
   default:
@@ -42,7 +45,7 @@ jobs:
         vmImage: macOS-15-arm64
         os: macOS
       ${{ if ne(item.os, 'macos') }}:
-        name: Azure-Pipelines-1ESPT-ExDShared
+        name: ${{ parameters.poolName }}
         ${{ if eq(item.os, 'windows') }}:
           image: windows-latest
           os: windows
@@ -52,12 +55,10 @@ jobs:
 
     variables:
       ${{ if eq(item.os, 'windows') }}:
-        CARGO_TARGET_DIR: c:/t/target
+        CARGO_TARGET_DIR: $(Pipeline.Workspace)/target
         workingDirectory: src
       ${{ if eq(item.os, 'linux') }}:
-        CARGO_TARGET_DIR: /tmp/target
-        # LXC build job uses src/tools/lxc as cwd; mirror it so the cargo
-        # target-dir cache key matches and we benefit from any shared cache.
+        CARGO_TARGET_DIR: $(Pipeline.Workspace)/target
         workingDirectory: $(Build.SourcesDirectory)/src/tools/lxc
       ${{ if eq(item.os, 'macos') }}:
         CARGO_TARGET_DIR: $(Agent.TempDirectory)/target
