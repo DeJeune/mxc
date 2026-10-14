@@ -14,10 +14,6 @@ parameters:
     type: boolean
     default: false
 
-  - name: rustBuildPool
-    type: string
-    default: Azure-Pipelines-1ESPT-ExDShared
-
   - name: ESRPInfo
     type: object
     default:
@@ -42,7 +38,6 @@ stages:
     - template: Rust.Build.Job.yml
       parameters:
         isOfficialBuild: ${{ parameters.isOfficialBuild }}
-        poolName: ${{ parameters.rustBuildPool }}
         matrix:
           - name: windows_x64
             os: windows
@@ -127,7 +122,6 @@ stages:
   - template: Lint.Job.yml
     parameters:
       isOfficialBuild: ${{ parameters.isOfficialBuild }}
-      poolName: ${{ parameters.rustBuildPool }}
 
 - stage: Node_SDK_Unit_Tests
   displayName: 'Node SDK Unit Tests'

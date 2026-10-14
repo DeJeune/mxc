@@ -5,9 +5,6 @@ parameters:
 - name: isOfficialBuild
   type: boolean
   default: false
-- name: poolName
-  type: string
-  default: Azure-Pipelines-1ESPT-ExDShared
 - name: matrix
   type: object
   default: {}
@@ -22,7 +19,7 @@ jobs:
     dependsOn: []
     timeoutInMinutes: 120
     pool:
-      name: ${{ parameters.poolName }}
+      name: Azure-Pipelines-1ESPT-ExDShared
       ${{ if eq(item.os, 'windows') }}:
         image: windows-latest
         os: windows

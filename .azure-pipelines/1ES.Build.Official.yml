@@ -28,10 +28,6 @@ parameters:
     displayName: Enable debug output for SDK tests
     type: boolean
     default: false
-  - name: rustBuildPool
-    displayName: 1ES pool for Windows/Linux Rust build and lint jobs
-    type: string
-    default: Azure-Pipelines-1ESPT-ExDShared
 
 variables:
   # Variable group managed in Dart — see the pipeline's variable group list.
@@ -55,7 +51,6 @@ extends:
       parameters:
         isOfficialBuild: true
         debug: ${{ parameters.debug }}
-        rustBuildPool: ${{ parameters.rustBuildPool }}
         ESRPInfo:
           serviceName: $(serviceName)
           tenantId: $(tenantId)
