@@ -10,7 +10,9 @@
 //!   wxc-exec's local console, used to seed the agent's ConPTY size.
 
 use std::sync::atomic::{AtomicIsize, Ordering};
+use std::sync::OnceLock;
 
+use crate::mxc_common::process_util::OwnedHandle;
 use windows::Win32::Foundation::HANDLE;
 use windows::Win32::System::Console::{
     GetConsoleMode, GetConsoleScreenBufferInfo, GetStdHandle, SetConsoleCtrlHandler,
@@ -19,8 +21,8 @@ use windows::Win32::System::Console::{
     ENABLE_VIRTUAL_TERMINAL_INPUT, ENABLE_VIRTUAL_TERMINAL_PROCESSING, ENABLE_WINDOW_INPUT,
     STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
 };
-use windows::Win32::System::Threading::SetEvent;
-use windows_core::BOOL;
+use windows::Win32::System::Threading::{CreateEventW, ResetEvent, SetEvent};
+use windows_core::{BOOL, PCWSTR};
 
 // ── Local console raw-VT-mode RAII guard ──────────────────────────────────
 //
@@ -144,12 +146,12 @@ impl Drop for ConsoleModeRestorer {
 
 // ── Console Ctrl handler RAII guard ──────────────────────────────────────
 //
-// When wxc-exec runs interactively, the local console owns the keyboard. A
-// Ctrl-C from the user — or the user clicking the cmd.exe X button — fires
-// `CTRL_C_EVENT` / `CTRL_CLOSE_EVENT` on wxc-exec. The OS default for
-// `CTRL_CLOSE_EVENT` is to call `ExitProcess` on wxc-exec a short time
-// later, which kills the relay threads mid-write and drops the agent's
-// final output.
+// When the executor or in-process/attached SDK path runs interactively, the
+// local console owns the keyboard. A Ctrl-C from the user — or the user clicking
+// the cmd.exe X button — fires `CTRL_C_EVENT` / `CTRL_CLOSE_EVENT` on the
+// hosting process. The OS default for `CTRL_CLOSE_EVENT` is to call
+// `ExitProcess` a short time later, which kills the relay threads mid-write and
+// drops the agent's final output.
 //
 // `CtrlHandlerGuard` installs a process-wide handler for the relay
 // lifetime that signals the stdin relay's stop event on either event,
@@ -172,6 +174,51 @@ impl Drop for ConsoleModeRestorer {
 /// is `*mut c_void` and not `Send`/`Sync`; we marshal it via its raw
 /// integer payload.
 static STDIN_STOP_EVENT_RAW: AtomicIsize = AtomicIsize::new(0);
+
+struct ProcessStopEvent(OwnedHandle);
+
+impl ProcessStopEvent {
+    fn get(&self) -> HANDLE {
+        self.0.get()
+    }
+}
+
+// SAFETY: the owned HANDLE is an opaque kernel handle value. It is never
+// dereferenced by Rust, and Windows event handles may be signaled/reset from
+// any thread in the owning process.
+unsafe impl Send for ProcessStopEvent {}
+// SAFETY: shared access exposes only the duplicated raw HANDLE value; all
+// mutation is performed by thread-safe Win32 event operations.
+unsafe impl Sync for ProcessStopEvent {}
+
+/// Process-lifetime stdin stop event used by the console Ctrl handler.
+///
+/// The handler caches the raw value of this exact handle in
+/// `STDIN_STOP_EVENT_RAW`. Keeping one process-global event, rather than
+/// leaking one event per interactive exec, bounds handle use in long-lived
+/// in-process attached hosts while ensuring a late handler can only signal
+/// the same live idle event, never a closed or recycled handle.
+static STDIN_STOP_EVENT: OnceLock<ProcessStopEvent> = OnceLock::new();
+
+pub(super) fn prepare_ctrl_handler_stop_event() -> windows_core::Result<HANDLE> {
+    if STDIN_STOP_EVENT.get().is_none() {
+        let handle = unsafe { CreateEventW(None, true, false, PCWSTR::null())? };
+        if STDIN_STOP_EVENT
+            .set(ProcessStopEvent(OwnedHandle::new(handle)))
+            .is_err()
+        {
+            // Another thread won initialization; the losing OwnedHandle is
+            // dropped here, leaving the process-global event intact.
+        }
+    }
+    let event = STDIN_STOP_EVENT
+        .get()
+        .expect("process stop event is initialized before use");
+    unsafe {
+        ResetEvent(event.get())?;
+    }
+    Ok(event.get())
+}
 
 /// Process-wide console-ctrl handler. Win32 callback signature; cannot
 /// capture environment, so reads its target from `STDIN_STOP_EVENT_RAW`.
@@ -199,19 +246,20 @@ unsafe extern "system" fn ctrl_handler(ctrl_type: u32) -> BOOL {
 /// `CTRL_CLOSE_EVENT`, allowing the stdin relay to exit gracefully rather
 /// than being killed by the OS default `ExitProcess`.
 ///
-/// Only one guard is alive at a time in wxc-exec's lifecycle (calls into
-/// the manager are sequential per invocation). The static target handle
-/// is set at install and cleared at drop.
+/// Only one guard is alive at a time across the executor relay path and the
+/// in-process/attached SDK relay path. The static target handle is set at
+/// install and cleared at drop.
 pub(super) struct CtrlHandlerGuard {
     installed: bool,
 }
 
 impl CtrlHandlerGuard {
-    /// Install the handler. `stop_event` must outlive the guard — the
-    /// caller (`manager::create_process`) holds it in an `OwnedHandle`
-    /// that drops after this guard, satisfying the constraint by Drop
-    /// ordering. A failure to install is silently swallowed; the guard's
-    /// `Drop` becomes a no-op in that case.
+    /// Install the handler. `stop_event` must be the process-lifetime event
+    /// returned by [`prepare_ctrl_handler_stop_event`]; the executor and the
+    /// in-process/attached SDK caller both use that same live target so an
+    /// already-running OS ctrl-handler thread cannot race with per-exec handle
+    /// closure. A failure to install is silently swallowed; the guard's `Drop`
+    /// becomes a no-op in that case.
     pub(super) fn install(stop_event: HANDLE) -> Self {
         STDIN_STOP_EVENT_RAW.store(stop_event.0 as isize, Ordering::SeqCst);
         let installed = unsafe { SetConsoleCtrlHandler(Some(ctrl_handler), true) }.is_ok();
@@ -259,12 +307,11 @@ mod tests {
     use super::*;
     use std::sync::Mutex;
 
-    use windows::Win32::Foundation::{CloseHandle, WAIT_OBJECT_0};
+    use windows::Win32::Foundation::{HANDLE, WAIT_OBJECT_0};
     use windows::Win32::System::Console::{
         CTRL_BREAK_EVENT, CTRL_LOGOFF_EVENT, CTRL_SHUTDOWN_EVENT,
     };
-    use windows::Win32::System::Threading::{CreateEventW, ResetEvent, WaitForSingleObject};
-    use windows_core::PCWSTR;
+    use windows::Win32::System::Threading::{ResetEvent, SetEvent, WaitForSingleObject};
 
     /// All `CtrlHandlerGuard` / `ctrl_handler` tests must serialize against
     /// each other: they share `STDIN_STOP_EVENT_RAW` and the process-wide
@@ -302,7 +349,7 @@ mod tests {
         // a console attached) and that the static target is cleared on drop.
         let _lock = CTRL_HANDLER_TEST_LOCK.lock().unwrap();
 
-        let event = unsafe { CreateEventW(None, true, false, PCWSTR::null()).unwrap() };
+        let event = prepare_ctrl_handler_stop_event().unwrap();
 
         {
             let _guard = CtrlHandlerGuard::install(event);
@@ -313,10 +360,6 @@ mod tests {
 
         // After drop, the static must be cleared.
         assert_eq!(STDIN_STOP_EVENT_RAW.load(Ordering::SeqCst), 0);
-
-        unsafe {
-            let _ = CloseHandle(event);
-        }
     }
 
     #[test]
@@ -327,7 +370,7 @@ mod tests {
         // its default behavior (which would `ExitProcess` on close).
         let _lock = CTRL_HANDLER_TEST_LOCK.lock().unwrap();
 
-        let event = unsafe { CreateEventW(None, true, false, PCWSTR::null()).unwrap() };
+        let event = prepare_ctrl_handler_stop_event().unwrap();
         let _guard = CtrlHandlerGuard::install(event);
 
         for signal in [CTRL_C_EVENT, CTRL_CLOSE_EVENT] {
@@ -355,11 +398,34 @@ mod tests {
                 signal
             );
         }
-
         drop(_guard);
+    }
+
+    #[test]
+    fn test_ctrl_handler_target_survives_guard_teardown() {
+        // Simulates the race shape where the OS ctrl-handler thread has already
+        // read the raw handle while the main thread drops the guard. The handle
+        // is process-lifetime, so a late SetEvent still targets the same valid
+        // idle event rather than a closed/recycled per-exec handle.
+        let _lock = CTRL_HANDLER_TEST_LOCK.lock().unwrap();
+
+        let event = prepare_ctrl_handler_stop_event().unwrap();
+        let guard = CtrlHandlerGuard::install(event);
+        let raw = STDIN_STOP_EVENT_RAW.load(Ordering::SeqCst);
+        assert_ne!(raw, 0);
+
+        drop(guard);
+        assert_eq!(STDIN_STOP_EVENT_RAW.load(Ordering::SeqCst), 0);
+
         unsafe {
-            let _ = CloseHandle(event);
+            ResetEvent(event).unwrap();
+            SetEvent(HANDLE(raw as *mut core::ffi::c_void)).unwrap();
         }
+        let post = unsafe { WaitForSingleObject(event, 100) };
+        assert_eq!(
+            post, WAIT_OBJECT_0,
+            "late signal should still reach the process-lifetime stop event"
+        );
     }
 
     #[test]

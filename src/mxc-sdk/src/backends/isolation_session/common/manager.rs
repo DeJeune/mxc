@@ -27,7 +27,9 @@ use windows::Win32::System::Threading::{CreateEventW, SetEvent, WaitForSingleObj
 use windows::UI::WindowId;
 use windows_core::{HSTRING, PCWSTR};
 
-use super::console_mode::{get_local_console_size, ConsoleModeRestorer, CtrlHandlerGuard};
+use super::console_mode::{
+    get_local_console_size, prepare_ctrl_handler_stop_event, ConsoleModeRestorer, CtrlHandlerGuard,
+};
 use super::console_relay::{create_console_relay_thread, ConsoleRelayParams};
 use super::error::{
     activation_error, check_result, format_iso_error, lifecycle_err, op, transport_err,
@@ -418,16 +420,41 @@ impl IsolationSessionManager {
             let wxc_stdin = unsafe { GetStdHandle(STD_INPUT_HANDLE) }
                 .map_err(|e| lifecycle_err(format!("GetStdHandle(stdin) failed: {}", e)))?;
 
+            enum StdinStopEvent {
+                ProcessGlobal(HANDLE),
+                PerExec(OwnedHandle),
+            }
+
+            impl StdinStopEvent {
+                fn get(&self) -> HANDLE {
+                    match self {
+                        Self::ProcessGlobal(handle) => *handle,
+                        Self::PerExec(handle) => handle.get(),
+                    }
+                }
+            }
+
             // Manual-reset stop event for the stdin relay. Effective for a waitable
             // `h_read` (console = TTY mode); for pipe handles it has no effect on a
             // blocked `ReadFile`, so that relay misses its join and ends only when
-            // the calling process exits. Only `wxc-exec` reaches the non-TTY case.
-            let stdin_stop_event = unsafe {
-                CreateEventW(None, true, false, PCWSTR::null())
-                    .map_err(|e| lifecycle_err(format!("CreateEventW(stdin stop): {}", e)))?
+            // the calling process exits. Interactive relays also install the Ctrl
+            // handler, so they use the process-lifetime event prepared and reset by
+            // `prepare_ctrl_handler_stop_event`; otherwise a handler thread that
+            // already read the raw  handle could signal its event after it was closed. 
+            // Non-interactive relays do not install the handler and have a
+            // per-exec owned event.
+            let stdin_stop_event = if options.interactive {
+                StdinStopEvent::ProcessGlobal(
+                    prepare_ctrl_handler_stop_event()
+                        .map_err(|e| lifecycle_err(format!("prepare stdin stop event: {}", e)))?,
+                )
+            } else {
+                let handle = unsafe {
+                    CreateEventW(None, true, false, PCWSTR::null())
+                        .map_err(|e| lifecycle_err(format!("CreateEventW(stdin stop): {}", e)))?
+                };
+                StdinStopEvent::PerExec(OwnedHandle::new(handle))
             };
-            // Declared before `scope`, which holds a raw copy: it must drop last.
-            let stdin_stop_owned = OwnedHandle::new(stdin_stop_event);
 
             // Relay threads bridge the calling process's stdio to
             // `IsoSessionProcess`'s pipes: console-handle inheritance cannot cross
@@ -440,8 +467,9 @@ impl IsolationSessionManager {
             //     read their own duplicates, so `Close()` does not disturb them.
             //   - The calling process's std handles (`GetStdHandle`): OS-owned.
             //     We do NOT close them.
-            //   - Stop event for stdin relay (`CreateEventW`): RAII-closed via
-            //     `OwnedHandle`.
+            //   - Stop event for stdin relay: process-lifetime when interactive
+            //     because the Ctrl handler caches its raw value; otherwise
+            //     per-exec and RAII-closed via `OwnedHandle`.
             //   - Relay thread handles: RAII-closed via `OwnedHandle` after we
             //     `WaitForSingleObject` on each.
             //
@@ -454,7 +482,7 @@ impl IsolationSessionManager {
             let stderr_handle_val = started.stderr;
             let stdin_handle_val = started.stdin;
 
-            let mut scope = RelayScope::new(process, stdin_stop_owned.get());
+            let mut scope = RelayScope::new(process, stdin_stop_event.get());
 
             // In interactive mode, switch the calling process's console to raw VT
             // so only the agent's ConPTY echoes and renders; otherwise both do.
@@ -465,16 +493,17 @@ impl IsolationSessionManager {
                 None
             };
 
-            // Install a console Ctrl handler that signals `stdin_stop_owned`
+            // Install a console Ctrl handler that signals `stdin_stop_event`
             // on Ctrl-C or terminal-close events, so the relay loops drain
             // cleanly instead of being terminated by the OS default
             // `ExitProcess`. Interactive mode only — non-interactive mode
             // wants the default behavior so the parent can terminate
             // wxc-exec via Ctrl-C. Installed after the workload starts: the
-            // event is manual-reset and never cleared, so an earlier Ctrl-C
-            // would stop the stdin relay for the session's lifetime.
+            // process-global manual-reset event was reset at the start of this
+            // interactive exec, so a signal from a previous exec cannot leak
+            // forward into this relay.
             let _ctrl_guard = if options.interactive {
-                Some(CtrlHandlerGuard::install(stdin_stop_owned.get()))
+                Some(CtrlHandlerGuard::install(stdin_stop_event.get()))
             } else {
                 None
             };
@@ -536,7 +565,7 @@ impl IsolationSessionManager {
                     duplicate_handle(HANDLE(stdin_handle_val as *mut core::ffi::c_void))
                         .map_err(|e| lifecycle_err(format!("duplicate stdin handle: {}", e)))?;
                 // Shares the event object, so `signal_stop` still reaches the relay.
-                let stdin_h_stop = duplicate_handle(stdin_stop_owned.get())
+                let stdin_h_stop = duplicate_handle(stdin_stop_event.get())
                     .map_err(|e| lifecycle_err(format!("duplicate stdin stop event: {}", e)))?;
                 if options.interactive {
                     // Clone the WinRT process handle so the relay thread holds
