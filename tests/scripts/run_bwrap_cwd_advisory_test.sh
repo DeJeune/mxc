@@ -37,14 +37,21 @@ EOF
 for case in uncovered unrelated; do
     rc=0
     output=$("$LXC_EXEC" --experimental "$WORK_DIR/$case.json" 2>"$WORK_DIR/$case.stderr") || rc=$?
-    # Matched piecewise rather than as one literal line: the advisory is carried
-    # in a JSON warning envelope, so the quotes around the path are escaped.
+    # One warning envelope must carry the whole advisory, path included.
     if [ "$rc" -eq 0 ] \
-        || ! grep -Fq '{"warning":' "$WORK_DIR/$case.stderr" \
-        || ! grep -Fq 'Bubblewrap: process.cwd' "$WORK_DIR/$case.stderr" \
-        || ! grep -Fq "$CWD" "$WORK_DIR/$case.stderr" \
-        || ! grep -Fq 'filesystem.readonlyPaths' "$WORK_DIR/$case.stderr" \
+        || ! python3 - "$WORK_DIR/$case.stderr" "$CWD" <<'PY' \
         || ! grep -Eq '(^|[[:space:]])bwrap:' "$WORK_DIR/$case.stderr"; then
+import json, sys
+path, cwd = sys.argv[1], sys.argv[2]
+for line in open(path, encoding="utf-8"):
+    try:
+        message = json.loads(line)["warning"]["message"]
+    except (ValueError, KeyError, TypeError):
+        continue
+    if all(s in message for s in ("Bubblewrap: process.cwd", cwd, "filesystem.readonlyPaths")):
+        sys.exit(0)
+sys.exit(1)
+PY
         echo "$case cwd did not report the hint and Bubblewrap's original error: $output"
         cat "$WORK_DIR/$case.stderr"
         exit 1

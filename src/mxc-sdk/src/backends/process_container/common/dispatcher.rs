@@ -288,23 +288,25 @@ impl std::error::Error for DispatchError {}
 impl DispatchError {
     /// The wire code this dispatch failure is reported under.
     ///
-    /// A field the selected tier cannot represent is a refusal of the policy:
-    /// the message names the field, and a request that drops it runs. The rest
-    /// are the tier itself being unavailable -- none could be built, or a
-    /// required provider is absent -- so the policy was never judged, which is
-    /// the same distinction the [`RejectionReason::RunnerUnavailable`] audit
-    /// reason draws. A SID that could not be derived carries its own code, and
-    /// ACEs that could not be applied are a runtime fault.
+    /// A field the selected tier cannot represent, or an authored
+    /// `fallback.allowDaclMutation: false` the tier would have to override, is
+    /// a refusal of the policy: a changed request can run. The rest are the
+    /// tier itself being unavailable -- none could be built, or a required
+    /// provider is absent -- so the policy was never judged, which is the same
+    /// distinction the [`RejectionReason::RunnerUnavailable`] audit reason
+    /// draws. A SID that could not be derived carries its own code, and ACEs
+    /// that could not be applied are a runtime fault.
     ///
     /// [`RejectionReason::RunnerUnavailable`]: crate::mxc_common::audit::RejectionReason
     pub fn error_code(&self) -> MxcErrorCode {
         match self {
             DispatchError::Fallback(
-                FallbackError::EnumeratePathsUnsupported | FallbackError::IngressUnsupported,
+                FallbackError::EnumeratePathsUnsupported
+                | FallbackError::IngressUnsupported
+                | FallbackError::DaclFallbackDisabled,
             ) => MxcErrorCode::PolicyValidation,
             DispatchError::Fallback(
-                FallbackError::DaclFallbackDisabled
-                | FallbackError::WriteDacUnavailable { .. }
+                FallbackError::WriteDacUnavailable { .. }
                 | FallbackError::SystemRootUnresolved { .. },
             )
             | DispatchError::CaptureDenialsUnsupported { .. }
@@ -864,6 +866,7 @@ mod tests {
         for error in [
             FallbackError::EnumeratePathsUnsupported,
             FallbackError::IngressUnsupported,
+            FallbackError::DaclFallbackDisabled,
         ] {
             let dispatch = DispatchError::Fallback(error);
             assert_eq!(
@@ -880,7 +883,6 @@ mod tests {
         // No tier exists to judge the policy against, so reporting a rejection
         // would send the caller editing a config that was never the problem.
         for error in [
-            FallbackError::DaclFallbackDisabled,
             FallbackError::WriteDacUnavailable {
                 path: PathBuf::from("C:\\work"),
                 reason: "access denied".to_string(),

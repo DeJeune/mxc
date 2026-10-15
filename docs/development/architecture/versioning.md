@@ -715,19 +715,26 @@ classification drives both the wire code and the process exit code:
 | The runtime, during an accepted run | all other phases | `backend_error` | `-1` |
 
 A backend this build did not compile in reports `backend_unavailable`, since
-only a rebuilt executor can serve it. A backend belonging to another operating
-system reports `unsupported_containment`, since naming a supported backend
-succeeds. Within a backend, a field the selected tier cannot represent (for
-example `filesystem.enumeratePaths` or `network.ingress.hostLoopback` on an
-AppContainer fallback) is a `policy_validation` rejection naming that field,
-never a silent drop; but a tier that could not be built at all, or an absent
-denial-capture provider, is `backend_unavailable`, because the policy was
-accepted and never judged. An experimental backend named without the
-experimental opt-in is also `backend_unavailable`: the opt-in is an executor
-invocation mode rather than a policy field, so no change to the authored
-request reaches it. Earlier phase-specific codes (`config_parse`,
-`malformed_request`, `unsupported_phase`, `malformed_id`) are unchanged and
-also exit `1`.
+only a rebuilt executor can serve it. On the create-and-run path, a backend
+belonging to another operating system reports `unsupported_containment`, since
+naming a supported backend succeeds; the container lifecycle operations report
+such a backend as `backend_unavailable`. Within a backend, a field the selected
+tier cannot represent (for example `filesystem.enumeratePaths` or
+`network.ingress.hostLoopback` on an AppContainer fallback), or a fallback the
+request forbids (`fallback.allowDaclMutation: false` when only the DACL tier is
+usable), is a `policy_validation` rejection naming that field, never a silent
+drop; but a tier that could not be built at all, or an absent denial-capture
+provider, is `backend_unavailable`, because the policy was accepted and never
+judged. An experimental backend named without the experimental opt-in is also
+`backend_unavailable`: the opt-in is an executor invocation mode rather than a
+policy field, so no change to the authored request reaches it. Earlier
+phase-specific codes (`malformed_request`, `unsupported_containment`,
+`unsupported_phase`, `malformed_id`) are unchanged and also exit `1`.
+
+Envelope lines share stderr with the workload's own output, so a workload can
+print text that looks like an envelope. Treat stderr envelopes as diagnostics,
+not as an authenticated result; the exit code and a held `ScriptResponse` are
+authoritative.
 
 `ScriptResponse` carries an optional `warnings` array of diagnostic strings.
 Warnings are advisory and never change the exit code; they are omitted from the

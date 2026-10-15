@@ -115,7 +115,7 @@ to the snapshot between calls.
 
 | Aspect | Behaviour |
 |---|---|
-| Exit code | The script's: `sys.exit(N)`, `process.exit(N)` or `exit N` gives `N`, an uncaught exception gives `1`, a runner error gives `-1` with the reason in `error_message` |
+| Exit code | The script's: `sys.exit(N)`, `process.exit(N)` or `exit N` gives `N`, an uncaught exception gives `1`. A refused request gives `1` and a host or runtime fault gives `-1`, with the reason in `error_message` |
 | Timeout | `process.timeout` bounds the run; a guest that overruns is interrupted and the run reports `execution timed out` |
 | stdout / stderr | Inherited by the guest; `ScriptResponse.standard_out` stays empty, so capture at the process level |
 

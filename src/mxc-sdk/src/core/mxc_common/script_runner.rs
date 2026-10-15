@@ -102,8 +102,15 @@ pub fn handle_dry_run_exit(response: &ScriptResponse, logger: &mut Logger) -> ! 
 /// as `backend_unavailable`, rather than both being flattened into the generic
 /// `backend_error` every other failure uses.
 pub fn emit_backend_error_envelope(response: &ScriptResponse) {
+    if let Some(line) = backend_error_envelope_line(response) {
+        eprintln!("{line}");
+    }
+}
+
+/// The stderr line [`emit_backend_error_envelope`] writes, if any.
+fn backend_error_envelope_line(response: &ScriptResponse) -> Option<String> {
     if response.exit_code == 0 || response.error_message.is_empty() {
-        return;
+        return None;
     }
 
     let mut envelope = serde_json::json!({
@@ -116,9 +123,7 @@ pub fn emit_backend_error_envelope(response: &ScriptResponse) {
         envelope["error"]["extended_error"] =
             serde_json::Value::String(response.extended_error.clone());
     }
-    if let Ok(json) = serde_json::to_string(&envelope) {
-        eprintln!("{json}");
-    }
+    serde_json::to_string(&envelope).ok()
 }
 
 /// The stderr lines a run's warnings are emitted as, one JSON object each.
@@ -179,28 +184,49 @@ mod tests {
     fn error_envelope_is_noop_without_error() {
         use crate::mxc_common::models::ScriptResponse;
         // exit 0 => no-op; non-zero but empty message (clean sandbox exit) => no-op.
-        super::emit_backend_error_envelope(&ScriptResponse {
+        assert!(super::backend_error_envelope_line(&ScriptResponse {
             exit_code: 0,
             error_message: "ignored on success".to_string(),
             ..Default::default()
-        });
-        super::emit_backend_error_envelope(&ScriptResponse {
+        })
+        .is_none());
+        assert!(super::backend_error_envelope_line(&ScriptResponse {
             exit_code: 1,
             error_message: String::new(),
             ..Default::default()
-        });
+        })
+        .is_none());
     }
 
     #[test]
-    fn error_envelope_emits_on_infra_failure() {
+    fn error_envelope_carries_the_code_for_each_failure_kind() {
         use crate::mxc_common::models::ScriptResponse;
-        // Exercises the serialization branch (writes to stderr); must not panic.
-        super::emit_backend_error_envelope(&ScriptResponse {
-            exit_code: 1,
-            error_message: "backend unavailable".to_string(),
+        let cases = [
+            (ScriptResponse::rejected("refused"), "policy_validation"),
+            (
+                ScriptResponse::unavailable("missing"),
+                "backend_unavailable",
+            ),
+            (ScriptResponse::error("broke"), "backend_error"),
+        ];
+        for (response, code) in cases {
+            let line = super::backend_error_envelope_line(&response).expect(code);
+            let parsed: serde_json::Value = serde_json::from_str(&line).unwrap();
+            assert_eq!(parsed["error"]["code"], code, "{line}");
+            assert_eq!(parsed["error"]["message"], response.error_message);
+        }
+    }
+
+    #[test]
+    fn error_envelope_includes_extended_error_when_present() {
+        use crate::mxc_common::models::ScriptResponse;
+        let line = super::backend_error_envelope_line(&ScriptResponse {
             extended_error: "WIN32_ERROR(1920)".to_string(),
-            ..Default::default()
-        });
+            ..ScriptResponse::unavailable("backend unavailable")
+        })
+        .unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(parsed["error"]["extended_error"], "WIN32_ERROR(1920)");
     }
 
     #[test]

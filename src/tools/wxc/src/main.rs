@@ -18,7 +18,9 @@ use mxc_sdk::mxc_common::error::WxcError;
 use mxc_sdk::mxc_common::logger::{Logger, Mode};
 use mxc_sdk::mxc_common::models::{ContainmentBackend, ExecutionRequest, ScriptResponse};
 use mxc_sdk::mxc_common::mxc_error::{MxcError, MxcErrorCode};
-use mxc_sdk::mxc_common::script_runner::{emit_mxc_error_exit, handle_dry_run_exit, ScriptRunner};
+use mxc_sdk::mxc_common::script_runner::{
+    emit_mxc_error_exit, emit_warning_envelopes, handle_dry_run_exit, ScriptRunner,
+};
 use mxc_sdk::mxc_common::state_aware_dispatch::{resolve_backend, DispatchOutcome};
 use mxc_sdk::mxc_common::state_aware_request::{MxcRequest, ParsedStateAwareRequest, Phase};
 use mxc_sdk::mxc_common::telemetry;
@@ -349,7 +351,7 @@ fn logger_for_cli(cli: &Cli) -> Logger {
 
     if let Some(ref log_path) = cli.log_file {
         if let Err(error) = logger.enable_file_sink(std::path::Path::new(log_path)) {
-            eprintln!("Warning: could not open log file '{log_path}': {error}");
+            emit_warning_envelopes(&[format!("could not open log file '{log_path}': {error}")]);
         }
     }
 
@@ -1032,19 +1034,23 @@ fn main() {
     match mxc_sdk::mxc_common::filesystem_dacl::recover_orphaned_state() {
         Ok(report) => {
             if report.files_processed > 0 || !report.errors.is_empty() {
-                eprintln!(
+                let mut warnings = vec![format!(
                     "DACL recovery: {} file(s), {} ACE(s) restored, {} pruned (missing), {} error(s)",
                     report.files_processed,
                     report.aces_restored,
                     report.aces_pruned_missing,
                     report.errors.len()
+                )];
+                warnings.extend(
+                    report
+                        .errors
+                        .iter()
+                        .map(|e| format!("DACL recovery error: {e}")),
                 );
-                for e in &report.errors {
-                    eprintln!("  {e}");
-                }
+                emit_warning_envelopes(&warnings);
             }
         }
-        Err(e) => eprintln!("DACL recovery failed: {e}"),
+        Err(e) => emit_warning_envelopes(&[format!("DACL recovery failed: {e}")]),
     }
 
     // --probe is a detection-only fast path used by SDK
@@ -1439,9 +1445,10 @@ fn main() {
         audit_context = Some(context);
         logger.log("WARNING: --audit enabled - AppContainer restrictions will NOT be enforced\n");
         if injected && cli.audit_verbose {
-            eprintln!(
-                "[mxc] permissiveLearningMode injected via --audit - AppContainer restrictions are NOT enforced"
-            );
+            emit_warning_envelopes(&[
+                "permissiveLearningMode injected via --audit - AppContainer restrictions are NOT enforced"
+                    .to_string(),
+            ]);
         }
     }
 
@@ -1582,6 +1589,7 @@ fn main() {
                 "",
             );
             eprint!("{}", logger.get_buffer());
+            emit_warning_envelopes(&logger.take_warnings());
             telemetry::emit_early_exit_with_kind(
                 telemetry_active,
                 &request.containment,
@@ -1658,7 +1666,7 @@ fn main() {
     // reads them from one structured place rather than scraping stderr.
     // Emitted before the dry-run branch below, which exits the process.
     response.extend_warnings(logger.take_warnings());
-    mxc_sdk::mxc_common::script_runner::emit_warning_envelopes(response.warnings());
+    emit_warning_envelopes(response.warnings());
 
     #[cfg(target_os = "windows")]
     if let Err(error) = mxc_sdk::mxc_engine::emit_verbose_telemetry(

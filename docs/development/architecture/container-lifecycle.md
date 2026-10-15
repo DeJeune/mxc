@@ -574,9 +574,9 @@ diagnostic. The rejection is recorded through the same `ConfigRejected` audit pa
 Diagnostics are never duplicated to stdout, and lifecycle stderr is not gated on
 `--debug`.
 
-Without `--operation`, `wxc-exec` accepts only one-shot requests. Input-source and
-pre-parse failures on that path retain the legacy primary diagnostic on stderr and do
-not emit a lifecycle envelope. Raw SDK and FFI lifecycle calls do not use this CLI
+Without `--operation`, `wxc-exec` accepts only create-and-run requests. Input-source
+and pre-parse failures on that path emit a typed `{error}` envelope on stderr rather
+than the lifecycle envelope on stdout. Raw SDK and FFI lifecycle calls do not use this CLI
 stream protocol; they return their status and error data through their binding result
 surfaces.
 

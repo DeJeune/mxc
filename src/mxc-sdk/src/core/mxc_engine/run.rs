@@ -193,13 +193,24 @@ pub fn resolve_runner_for_audit(
 /// Convenience over [`resolve_runner`] for callers without external guard /
 /// signal machinery: it runs the resolved runner and drops it — then, on
 /// Windows, the DACL guard — in the correct order before returning the
-/// [`ScriptResponse`].
+/// [`ScriptResponse`]. Warnings the logger recorded are moved onto the
+/// response; nothing is written to the terminal.
 pub fn run(request: &ExecutionRequest, logger: &mut Logger) -> Result<ScriptResponse, Error> {
-    let mut resolved = resolve_runner(request, logger)?;
-    let response = resolved.runner.run(request, logger);
-    // `resolved` drops here: `runner` first (releasing child handles), then —
-    // on Windows — `dacl_manager` (restoring host ACEs).
-    Ok(response)
+    let resolved = resolve_runner(request, logger)?;
+    Ok(run_resolved(resolved, request, logger))
+}
+
+fn run_resolved(
+    mut resolved: ResolvedRunner,
+    request: &ExecutionRequest,
+    logger: &mut Logger,
+) -> ScriptResponse {
+    let mut response = resolved.runner.run(request, logger);
+    // `runner` drops first (releasing child handles), then — on Windows —
+    // `dacl_manager` (restoring host ACEs).
+    drop(resolved);
+    response.extend_warnings(logger.take_warnings());
+    response
 }
 
 // ---------------------------------------------------------------------------
@@ -231,7 +242,7 @@ fn resolve_runner_inner_windows(
             ) {
                 Ok(dispatched) => {
                     for w in &dispatched.warnings {
-                        let _ = writeln!(logger, "warning: {w}");
+                        logger.warning_line(w);
                     }
                     let _ = writeln!(
                         logger,
@@ -246,15 +257,14 @@ fn resolve_runner_inner_windows(
                     })
                 }
                 Err(e) => {
-                    // Surface any retained-entry DACL warnings through the
-                    // logger so the caller's buffer flush still reports them.
+                    // Retain DACL warnings so a failed dispatch still reports them.
                     if let crate::process_container_common::dispatcher::DispatchError::Dacl {
                         warnings,
                         ..
                     } = &e
                     {
                         for w in warnings {
-                            let _ = writeln!(logger, "dacl warning: {w}");
+                            logger.warning_line(w);
                         }
                     }
                     Err(e.to_mxc_error())
@@ -311,11 +321,9 @@ fn resolve_runner_inner_windows(
                 if ws.idle_timeout_ms != default.idle_timeout_ms
                     || ws.daemon_pipe_name != default.daemon_pipe_name
                 {
-                    let _ = writeln!(
-                        logger,
-                        "warning: windowsSandbox.idleTimeoutMs and daemonPipeName \
-                         are ignored by the one-shot backend; each invocation launches and tears \
-                         down a fresh VM"
+                    logger.warning_line(
+                        "windowsSandbox.idleTimeoutMs and daemonPipeName are ignored by the \
+                         one-shot backend; each invocation launches and tears down a fresh VM",
                     );
                 }
             }
@@ -607,5 +615,68 @@ mod tests {
             .expect("WSLC selection must not require runtime experimental authorization");
 
         assert!(!logger.get_buffer().contains("experimental"));
+    }
+
+    fn resolve_error(request: &ExecutionRequest) -> Error {
+        let mut logger = Logger::new(Mode::Buffer);
+        match resolve_runner(request, &mut logger) {
+            Ok(_) => panic!("{:?} must not resolve", request.containment),
+            Err(error) => error,
+        }
+    }
+
+    #[test]
+    fn a_policy_no_tier_can_enforce_is_a_policy_validation_error() {
+        let _guard = crate::process_container_common::test_env::BcUsableGuard::set(false);
+        let mut request = ExecutionRequest {
+            containment: ContainmentBackend::ProcessContainer,
+            ..Default::default()
+        };
+        request.policy.enumerate_paths = vec!["C:\\tools".to_string()];
+
+        let error = resolve_error(&request);
+
+        assert_eq!(error.code, crate::ErrorCode::PolicyValidation, "{error}");
+    }
+
+    #[cfg(not(feature = "microvm"))]
+    #[test]
+    fn a_backend_not_compiled_in_is_unavailable() {
+        let request = ExecutionRequest {
+            containment: ContainmentBackend::MicroVm,
+            experimental_enabled: true,
+            ..Default::default()
+        };
+
+        let error = resolve_error(&request);
+
+        assert_eq!(error.code, crate::ErrorCode::BackendUnavailable, "{error}");
+    }
+}
+
+#[cfg(test)]
+mod run_tests {
+    use super::*;
+    use crate::mxc_common::logger::Mode;
+
+    struct WarningRunner;
+
+    impl ScriptRunner for WarningRunner {
+        fn execute(&mut self, _request: &ExecutionRequest, logger: &mut Logger) -> ScriptResponse {
+            logger.warning_line("advisory");
+            ScriptResponse::default()
+        }
+    }
+
+    #[test]
+    fn run_moves_logger_warnings_onto_the_response() {
+        let mut logger = Logger::new(Mode::Buffer);
+        let response = run_resolved(
+            ResolvedRunner::without_guard(Box::new(WarningRunner)),
+            &ExecutionRequest::default(),
+            &mut logger,
+        );
+        assert_eq!(response.warnings(), ["advisory"]);
+        assert!(logger.warnings().is_empty());
     }
 }

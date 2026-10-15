@@ -29,6 +29,7 @@ use crate::mxc_common::sandbox_process::{
 #[cfg(target_os = "linux")]
 use crate::mxc_pty::{LivePty, PtySize as UnixPtySize};
 
+use crate::lxc_common::availability::LxcTooling;
 use crate::lxc_common::filesystem_mounts;
 use crate::lxc_common::lxc_bindings::{ContainerFirewall, LxcContainer, StartNetwork};
 use crate::lxc_common::network_ingress::IngressManager;
@@ -487,10 +488,18 @@ impl LxcScriptRunner {
             return Err(ScriptResponse::rejected(&msg));
         }
 
-        // Probed per run rather than through the cached discovery answer: a
-        // host that gained the LXC tooling after an earlier probe is usable now.
-        if !crate::lxc_common::availability::is_lxc_available_uncached() {
-            return Err(ScriptResponse::unavailable(LXC_TOOLING_UNAVAILABLE));
+        match crate::lxc_common::availability::lxc_tooling_for_execution() {
+            LxcTooling::Available => {}
+            LxcTooling::Unavailable => {
+                return Err(ScriptResponse::unavailable(LXC_TOOLING_UNAVAILABLE));
+            }
+            LxcTooling::ProbeFailed => {
+                return Err(response_with_phase(
+                    FailurePhase::LaunchFailed,
+                    "LXC: probing the LXC tooling (`lxc-ls --version`) timed out or \
+                     could not run; retry once the host is responsive",
+                ));
+            }
         }
 
         if self.destroy_on_exit {

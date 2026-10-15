@@ -297,7 +297,7 @@ fn spawn_process_container(
     match spawn_with_fallback(request, logger, StdioMode::Pipes, capture_factory) {
         Ok(dispatched) => {
             for w in &dispatched.warnings {
-                let _ = writeln!(logger, "warning: {w}");
+                logger.warning_line(w);
             }
             let _ = writeln!(
                 logger,
@@ -307,12 +307,10 @@ fn spawn_process_container(
             Ok(dispatched.process)
         }
         Err(SpawnDispatchError::Dispatch(e)) => {
-            // Surface any retained-entry DACL warnings through the logger so the
-            // caller's buffer flush still reports them — mirroring the
-            // run-to-completion `resolve_runner_inner`.
+            // Retain DACL warnings so a failed dispatch still reports them.
             if let DispatchError::Dacl { warnings, .. } = &e {
                 for w in warnings {
-                    let _ = writeln!(logger, "dacl warning: {w}");
+                    logger.warning_line(w);
                 }
             }
             Err(e.to_mxc_error())
@@ -328,7 +326,7 @@ fn spawn_process_container(
             // before its separate spawn attempt, so a spawn failure never loses
             // them there either.
             for w in &warnings {
-                let _ = writeln!(logger, "warning: {w}");
+                logger.warning_line(w);
             }
             let _ = writeln!(logger, "selected isolation tier: {}", tier.as_str());
             Err(map_spawn_error(*response))

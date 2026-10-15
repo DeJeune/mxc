@@ -152,12 +152,16 @@ fn run_seatbelt(request: &ExecutionRequest, logger: &mut Logger) -> ! {
     let response = match mxc_sdk::mxc_engine::run(request, logger) {
         Ok(response) => response,
         Err(e) => {
+            emit_warning_envelopes(logger.warnings());
             eprint!("{}", logger.get_buffer());
             emit_mxc_error_exit(&e.into_mxc_error());
         }
     };
     let run_elapsed = run_start.elapsed();
     let _ = writeln!(logger, "Runner completed in {}ms", run_elapsed.as_millis());
+
+    // Emitted before the dry-run branch below, which exits the process.
+    emit_warning_envelopes(response.warnings());
 
     if request.dry_run {
         handle_dry_run_exit(&response, logger);

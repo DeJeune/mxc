@@ -57,6 +57,16 @@ fn response_with_phase(phase: FailurePhase, message: &str) -> ScriptResponse {
     }
 }
 
+/// A host lookup failure is a launch fault, not a refusal of the policy.
+fn proxy_resolve_failure_response(error: proxy_network::ProxyResolveError) -> ScriptResponse {
+    match error {
+        proxy_network::ProxyResolveError::Rejected(message) => ScriptResponse::rejected(&message),
+        proxy_network::ProxyResolveError::Lookup(message) => {
+            response_with_phase(FailurePhase::LaunchFailed, &message)
+        }
+    }
+}
+
 /// Bubblewrap sandbox runner. Uses only shared `ContainerPolicy` fields —
 /// no backend-specific config struct required.
 #[derive(Default)]
@@ -469,7 +479,7 @@ impl BubblewrapScriptRunner {
             })?;
             Some(
                 proxy_network::SandboxProxy::resolve(address)
-                    .map_err(|error| ScriptResponse::rejected(&error))?,
+                    .map_err(proxy_resolve_failure_response)?,
             )
         } else {
             None
@@ -2176,6 +2186,26 @@ mod tests {
             );
             assert_eq!(error.exit_code, -1, "input={detail}; output={error:?}");
         }
+    }
+
+    #[test]
+    fn a_failed_proxy_lookup_is_a_launch_fault_not_a_refusal() {
+        use crate::mxc_common::mxc_error::MxcErrorCode;
+        use proxy_network::ProxyResolveError;
+
+        let lookup =
+            proxy_resolve_failure_response(ProxyResolveError::Lookup("dns down".to_string()));
+        assert_eq!(lookup.failure_phase, FailurePhase::LaunchFailed);
+        assert_eq!(
+            lookup.failure_phase.error_code(),
+            MxcErrorCode::BackendError
+        );
+        assert_eq!(lookup.exit_code, -1);
+
+        let refused =
+            proxy_resolve_failure_response(ProxyResolveError::Rejected("ipv6".to_string()));
+        assert_eq!(refused.failure_phase, FailurePhase::Rejected);
+        assert_eq!(refused.exit_code, 1);
     }
 
     #[test]

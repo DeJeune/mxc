@@ -328,7 +328,7 @@ fn main() {
     let _ = writeln!(logger, "Runner completed in {}ms", run_elapsed.as_millis());
 
     // Emitted before the dry-run branch below, which exits the process.
-    emit_warnings(&logger);
+    emit_warning_envelopes(response.warnings());
 
     if cli.dry_run {
         handle_dry_run_exit(&response, &mut logger);

@@ -59,7 +59,16 @@ impl MxcErrorCode {
     pub fn exit_code(self) -> i32 {
         match self {
             Self::BackendUnavailable | Self::BackendError => -1,
-            _ => 1,
+            Self::MalformedRequest
+            | Self::UnsupportedContainment
+            | Self::UnsupportedPhase
+            | Self::MalformedId
+            | Self::StaleId
+            | Self::NotProvisioned
+            | Self::NotStarted
+            | Self::AlreadyStarted
+            | Self::AlreadyStopped
+            | Self::PolicyValidation => 1,
         }
     }
 }
@@ -344,6 +353,27 @@ mod tests {
             assert_eq!(json, Value::String(wire.to_string()));
             let parsed: MxcErrorCode = serde_json::from_value(json).unwrap();
             assert_eq!(parsed, code);
+        }
+    }
+
+    #[test]
+    fn only_host_and_runtime_faults_exit_minus_one() {
+        let cases = [
+            (MxcErrorCode::MalformedRequest, 1),
+            (MxcErrorCode::UnsupportedContainment, 1),
+            (MxcErrorCode::UnsupportedPhase, 1),
+            (MxcErrorCode::BackendUnavailable, -1),
+            (MxcErrorCode::MalformedId, 1),
+            (MxcErrorCode::StaleId, 1),
+            (MxcErrorCode::NotProvisioned, 1),
+            (MxcErrorCode::NotStarted, 1),
+            (MxcErrorCode::AlreadyStarted, 1),
+            (MxcErrorCode::AlreadyStopped, 1),
+            (MxcErrorCode::PolicyValidation, 1),
+            (MxcErrorCode::BackendError, -1),
+        ];
+        for (code, exit) in cases {
+            assert_eq!(code.exit_code(), exit, "{code}");
         }
     }
 

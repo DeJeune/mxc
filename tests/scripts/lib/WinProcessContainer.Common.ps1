@@ -946,10 +946,11 @@ function Test-WasRejected {
     if ($both -match '"reason"\s*:\s*"runner_unavailable"') { return $false }
 
     # Positive evidence. Every code below blames the request, so each one is a
-    # refusal; this mirrors the exit-1 set in MxcErrorCode::exit_code. The two
-    # text banners cover the paths that still print prose. Requiring one of
-    # these means an unexplained non-zero exit is NOT counted as a rejection.
-    $rejectionCodes = 'config_parse|policy_validation|malformed_request|' +
+    # refusal and exits 1 per MxcErrorCode::exit_code (lifecycle-state codes
+    # are omitted because one-shot runs cannot produce them). The two text
+    # banners cover the paths that still print prose. Requiring one of these
+    # means an unexplained non-zero exit is NOT counted as a rejection.
+    $rejectionCodes = 'policy_validation|malformed_request|' +
                       'unsupported_containment|unsupported_phase|malformed_id'
     return [bool]($both -match '(?im)^\s*Request error\s*$' -or
                   $both -match '(?i)Configuration parse error' -or
