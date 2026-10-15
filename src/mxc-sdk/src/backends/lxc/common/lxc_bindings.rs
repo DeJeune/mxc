@@ -135,156 +135,32 @@ pub enum ContainerFirewall {
     Absent,
 }
 
-/// Two networking capabilities LXC cares about are CAP_NET_ADMIN and CAP_NET_RAW.
-/// CAP_NET_ADMIN allows a process to change the networking rules
-/// CAP_NET_RAW allows a process to use RAW and PACKET sockets and those allow a process to bypass
-///    a network chain.
-/// Remove both capabilities here. (Technically CAP_NET_RAW is not removed.  More details inside)
+/// Drop Network capabilities for sandboxing purposes.
 #[cfg(target_os = "linux")]
 fn confine_network_capabilities(command: &mut std::process::Command) {
     use std::os::unix::process::CommandExt;
 
-    // `libc` does not export this; the value is from linux/capability.h.
+    // `libc` does not export these; the values are from linux/capability.h.
     const CAP_NET_ADMIN: libc::c_ulong = 12;
+    const CAP_NET_RAW: libc::c_ulong = 13;
 
     // SAFETY: `pre_exec` runs between fork and exec, where only
-    // async-signal-safe work is permitted. `prctl` and `seccomp` are bare
-    // syscalls, the filter lives on the stack, and this closure allocates
-    // nothing and captures nothing.
+    // async-signal-safe work is permitted.  `prctl` is a bare syscall, and this
+    // closure allocates nothing and captures nothing.
     unsafe {
-        // Take away CAP_NET_ADMIN.
         command.pre_exec(|| {
+            // Drop CAP_NET_ADMIN and CAP_NET_RAW from the bounding set.
             if libc::prctl(libc::PR_CAPBSET_DROP, CAP_NET_ADMIN, 0, 0, 0) != 0 {
                 return Err(std::io::Error::last_os_error());
             }
 
-            // Refuse AF_PACKET communication.
-            refuse_packet_sockets()
+            if libc::prctl(libc::PR_CAPBSET_DROP, CAP_NET_RAW, 0, 0, 0) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+
+            Ok(())
         });
     }
-}
-
-/// Removing CAP_NET_RAW prevents a process from using RAW and PACKET sockets.  However, ICMP is also denied.
-/// LXC needs to allow ICMP and prevent programs from using sockets to
-/// bypass the network guards.  The solution is to give the kernel a custom filter to refuse
-/// any socket that carries AF_PACKET.  LXC utilizes seccomp.
-/// see https://docs.kernel.org/userspace-api/seccomp_filter.html and
-/// https://man7.org/linux/man-pages/man2/seccomp.2.html
-#[cfg(target_os = "linux")]
-fn refuse_packet_sockets() -> std::io::Result<()> {
-    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
-    compile_error!("LXC only understands seccomp system calls for x86_64 and arm64.");
-
-    // Use raw SecComp calls instead of the libseccomp crate.
-    // Using the libseccomp crate pulls in a dependency to the c libseccomp library.
-    // Use raw called here.
-
-    // https://docs.kernel.org/networking/filter.html for more information on filtering sockets
-    // Filtering sockets requires assembling a small filter program with assembly like syntax.
-    // The below code is to consolidate some commands into easy to understand words.
-
-    // https://github.com/torvalds/linux/blob/master/include/uapi/linux/bpf_common.h
-    // Common BPF words
-    const LOAD_WORD: u16 = (libc::BPF_LD | libc::BPF_W | libc::BPF_ABS) as u16;
-    const JUMP_IF_EQUAL: u16 = (libc::BPF_JMP | libc::BPF_JEQ | libc::BPF_K) as u16;
-    const JUMP_IF_AT_LEAST: u16 = (libc::BPF_JMP | libc::BPF_JGE | libc::BPF_K) as u16;
-    const BITWISE_AND: u16 = (libc::BPF_ALU | libc::BPF_AND | libc::BPF_K) as u16;
-    const RETURN: u16 = (libc::BPF_RET | libc::BPF_K) as u16;
-
-    // https://github.com/torvalds/linux/blob/master/include/uapi/linux/seccomp.h
-    // Keys of the information needed during the filter.
-    const SYSCALL_NUMBER: u32 = 0;
-    const ARCHITECTURE: u32 = 4;
-    const FIRST_ARGUMENT: u32 = 16;
-    const SECOND_ARGUMENT: u32 = 24;
-
-    const REFUSE_WITH_EPERM: u32 = libc::SECCOMP_RET_ERRNO | (libc::EPERM as u32);
-
-    // ENOSYS is the errno from a kernel built without io_uring.  The refusal
-    // borrows it to read as absence rather than denial.
-    const REFUSE_WITH_ENOSYS: u32 = libc::SECCOMP_RET_ERRNO | (libc::ENOSYS as u32);
-
-    const NO_FLAGS: libc::c_ulong = 0;
-
-    // numbers come from
-    // https://github.com/torvalds/linux/blob/master/include/uapi/linux/audit.h
-    // To test the ABI the filter needs to know the endianness and arch.
-    const _64BIT_ABI_LITTLE_ENDIANNESS: u32 = 0x8000_0000 | 0x4000_0000;
-
-    // Also from https://github.com/torvalds/linux/blob/master/include/uapi/linux/audit.h
-    #[cfg(target_arch = "x86_64")]
-    const NATIVE_ARCHITECTURE: u32 = _64BIT_ABI_LITTLE_ENDIANNESS | libc::EM_X86_64 as u32;
-    #[cfg(target_arch = "aarch64")]
-    const NATIVE_ARCHITECTURE: u32 = _64BIT_ABI_LITTLE_ENDIANNESS | libc::EM_AARCH64 as u32;
-
-    // Filter only works for x64 and arm64 ABI's.
-    // Used to filter out a 32 bit process under the "Filters" section.
-    // check https://man7.org/linux/man-pages/man2/seccomp.2.html
-    const USES_X32_ABI_FLAG: u32 = 0x4000_0000;
-
-    const SOCKET_SYSCALL: u32 = libc::SYS_socket as u32;
-
-    // A ring can create a socket on its own, and the request never reaches the
-    // socket syscall this filter reads.  Refusing all three entry points leaves
-    // no ring to submit that request to.
-    const IO_URING_SETUP_SYSCALL: u32 = libc::SYS_io_uring_setup as u32;
-    const IO_URING_ENTER_SYSCALL: u32 = libc::SYS_io_uring_enter as u32;
-    const IO_URING_REGISTER_SYSCALL: u32 = libc::SYS_io_uring_register as u32;
-
-    // `libc` marks SOCK_PACKET deprecated, and this crate builds warnings as
-    // errors, so naming it here is the only way to compare against it.  The
-    // value is from linux/net.h and matches what `libc` defines.
-    const SOCK_PACKET: u32 = 10;
-
-    // A caller may fold SOCK_CLOEXEC or SOCK_NONBLOCK into the socket type, and
-    // the kernel masks them off before reading it, so the filter masks them off
-    // too.
-    const SOCKET_TYPE_MASK: u32 = 0xF;
-
-    // Make the filter
-    #[rustfmt::skip]
-    let mut program = [
-        libc::sock_filter { code: LOAD_WORD,        jt:  0, jf:  0, k: ARCHITECTURE },
-        libc::sock_filter { code: JUMP_IF_EQUAL,    jt:  0, jf: 15, k: NATIVE_ARCHITECTURE }, // test ABI
-        libc::sock_filter { code: LOAD_WORD,        jt:  0, jf:  0, k: SYSCALL_NUMBER },
-        libc::sock_filter { code: JUMP_IF_AT_LEAST, jt: 13, jf:  0, k: USES_X32_ABI_FLAG }, // Test 32 bit
-        libc::sock_filter { code: JUMP_IF_EQUAL,    jt: 11, jf:  0, k: IO_URING_SETUP_SYSCALL }, // leave no ring to ask with
-        libc::sock_filter { code: JUMP_IF_EQUAL,    jt: 10, jf:  0, k: IO_URING_ENTER_SYSCALL },
-        libc::sock_filter { code: JUMP_IF_EQUAL,    jt:  9, jf:  0, k: IO_URING_REGISTER_SYSCALL },
-        libc::sock_filter { code: JUMP_IF_EQUAL,    jt:  0, jf:  6, k: SOCKET_SYSCALL }, // Only process a socket syscall
-        libc::sock_filter { code: LOAD_WORD,        jt:  0, jf:  0, k: FIRST_ARGUMENT },
-        libc::sock_filter { code: JUMP_IF_EQUAL,    jt:  5, jf:  0, k: libc::AF_PACKET as u32 }, // return error if using AF_PACKET
-        libc::sock_filter { code: JUMP_IF_EQUAL,    jt:  4, jf:  0, k: libc::AF_XDP as u32 }, // AF_XDP reaches the wire the same way
-        libc::sock_filter { code: LOAD_WORD,        jt:  0, jf:  0, k: SECOND_ARGUMENT },
-        libc::sock_filter { code: BITWISE_AND,      jt:  0, jf:  0, k: SOCKET_TYPE_MASK }, // drop SOCK_CLOEXEC and SOCK_NONBLOCK
-        libc::sock_filter { code: JUMP_IF_EQUAL,    jt:  1, jf:  0, k: SOCK_PACKET }, // the kernel turns this one into AF_PACKET
-        libc::sock_filter { code: RETURN,           jt:  0, jf:  0, k: libc::SECCOMP_RET_ALLOW },
-        libc::sock_filter { code: RETURN,           jt:  0, jf:  0, k: REFUSE_WITH_EPERM },
-        libc::sock_filter { code: RETURN,           jt:  0, jf:  0, k: REFUSE_WITH_ENOSYS },
-        libc::sock_filter { code: RETURN,           jt:  0, jf:  0, k: libc::SECCOMP_RET_KILL_PROCESS },
-    ];
-
-    // Make the struct
-    let header = libc::sock_fprog {
-        len: program.len() as libc::c_ushort,
-        filter: program.as_mut_ptr(),
-    };
-
-    // Make the sys call
-    let taken = unsafe {
-        libc::syscall(
-            libc::SYS_seccomp,
-            libc::SECCOMP_SET_MODE_FILTER as libc::c_ulong,
-            NO_FLAGS,
-            &header as *const libc::sock_fprog,
-        )
-    };
-
-    if taken != 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-
-    Ok(())
 }
 
 /// A `/etc/hosts` helper emits one `mxc:` diagnostic line, so this is far above
@@ -671,7 +547,7 @@ impl LxcContainer {
         env: &[String],
         force_clear_env: bool,
         timeout: Option<std::time::Duration>,
-        firewall: ContainerFirewall,
+        _firewall: ContainerFirewall,
     ) -> Result<(i32, String, String), String> {
         use crate::mxc_pty::{run_with_pty, PtyOptions, PtyOutcome, Signal};
 
@@ -687,9 +563,7 @@ impl LxcContainer {
             force_clear_env,
         ));
 
-        if firewall == ContainerFirewall::Installed {
-            confine_network_capabilities(&mut cmd);
-        }
+        confine_network_capabilities(&mut cmd);
 
         let options = PtyOptions {
             unblock_signals: UNBLOCK,
@@ -733,7 +607,7 @@ impl LxcContainer {
         env: &[String],
         force_clear_env: bool,
         timeout: Option<std::time::Duration>,
-        firewall: ContainerFirewall,
+        _firewall: ContainerFirewall,
     ) -> Result<(i32, String, String), String> {
         use crate::mxc_common::interruptible_reader::wrap_pipe;
         use crate::mxc_common::sandbox_process::{wait_with_timeout, StreamCloser, WaitError};
@@ -752,9 +626,7 @@ impl LxcContainer {
 
         unblock_fatal_signals(&mut cmd);
 
-        if firewall == ContainerFirewall::Installed {
-            confine_network_capabilities(&mut cmd);
-        }
+        confine_network_capabilities(&mut cmd);
 
         let mut child = cmd
             .spawn()
@@ -918,7 +790,7 @@ impl LxcContainer {
         working_directory: &str,
         env: &[String],
         force_clear_env: bool,
-        firewall: ContainerFirewall,
+        _firewall: ContainerFirewall,
     ) -> std::process::Command {
         let mut cmd = self.lxc_command("lxc-attach");
         cmd.args(build_attach_args_with_env_control(
@@ -927,9 +799,7 @@ impl LxcContainer {
             command,
             force_clear_env,
         ));
-        if firewall == ContainerFirewall::Installed {
-            confine_network_capabilities(&mut cmd);
-        }
+        confine_network_capabilities(&mut cmd);
         cmd
     }
 
@@ -1609,284 +1479,6 @@ mod tests {
         assert!(
             unconfined.status().is_ok(),
             "a run with no chains to protect must spawn without any privilege"
-        );
-    }
-
-    /// The probe child got the descriptor it asked for.
-    #[cfg(target_os = "linux")]
-    const ATTEMPT_ALLOWED: i32 = 10;
-
-    /// The probe child was refused with EPERM, which is what the filter returns
-    /// for a socket that reaches the wire below the chains.
-    #[cfg(target_os = "linux")]
-    const ATTEMPT_REFUSED_EPERM: i32 = 11;
-
-    /// The probe child was refused with ENOSYS, which is what the filter
-    /// returns for io_uring.
-    #[cfg(target_os = "linux")]
-    const ATTEMPT_REFUSED_ENOSYS: i32 = 12;
-
-    /// The probe child was refused, but for some other reason.
-    #[cfg(target_os = "linux")]
-    const ATTEMPT_REFUSED_OTHER: i32 = 13;
-
-    /// What the probe child asks the kernel for.
-    #[cfg(target_os = "linux")]
-    #[derive(Clone, Copy, Debug)]
-    enum Attempt {
-        /// The socket the filter exists to stop.
-        PacketSocket,
-        /// The same socket under a family the filter permits, which the kernel
-        /// swaps over once seccomp has read it.
-        LegacyPacketSocket,
-        /// That spelling with a flag folded into the socket type.
-        LegacyPacketSocketWithFlags,
-        /// Another family that reaches the wire below the chains.
-        ExpressDataPathSocket,
-        /// A ring, which creates any of the above without a socket syscall.
-        IoUringRing,
-        /// What an `icmp` egress allow needs.
-        RawIcmpSocket,
-        /// What every ordinary workload needs.
-        TcpSocket,
-    }
-
-    /// Fork a child that optionally installs the packet-socket filter, makes
-    /// one request of the kernel, and reports which answer it got.  The child
-    /// leaves through `_exit` and never reaches `exec`, so the attempt runs in
-    /// the same post-fork context that confines a real workload.  Reporting
-    /// through the exit code keeps a refusal distinct from a child that never
-    /// ran: a missing or unspawnable program cannot forge one of these numbers.
-    #[cfg(target_os = "linux")]
-    fn probe_socket(attempt: Attempt, install_filter: bool) -> i32 {
-        use std::os::unix::process::CommandExt;
-
-        // `libc` marks SOCK_PACKET deprecated, and this crate builds warnings as
-        // errors, so naming it here is the only way to probe with it.  Both
-        // values match what `libc` defines.
-        const AF_XDP: libc::c_int = libc::AF_XDP;
-        const SOCK_PACKET: libc::c_int = 10;
-
-        let mut command = std::process::Command::new("/bin/true");
-
-        // SAFETY: `pre_exec` runs between fork and exec, where only
-        // async-signal-safe work is permitted.  This closure makes bare
-        // syscalls, allocates nothing, and leaves through `_exit`, which skips
-        // the atexit handlers the parent still owns.
-        unsafe {
-            command.pre_exec(move || {
-                // Seccomp wants this or CAP_SYS_ADMIN.  Production is root and
-                // gets it from the capability; setting it here lets the probe
-                // report the filter's own verdict at any privilege level.
-                libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0);
-
-                if install_filter {
-                    refuse_packet_sockets()?;
-                }
-
-                let descriptor = match attempt {
-                    Attempt::PacketSocket => libc::socket(libc::AF_PACKET, libc::SOCK_RAW, 0),
-                    Attempt::LegacyPacketSocket => libc::socket(libc::PF_INET, SOCK_PACKET, 0),
-                    Attempt::LegacyPacketSocketWithFlags => {
-                        libc::socket(libc::PF_INET, SOCK_PACKET | libc::SOCK_CLOEXEC, 0)
-                    }
-                    Attempt::ExpressDataPathSocket => libc::socket(AF_XDP, libc::SOCK_RAW, 0),
-                    Attempt::IoUringRing => {
-                        // The kernel writes a fixed-size struct back through
-                        // this buffer, which is larger than the struct is.
-                        let mut parameters = [0u8; 256];
-                        libc::syscall(
-                            libc::SYS_io_uring_setup,
-                            1 as libc::c_ulong,
-                            parameters.as_mut_ptr(),
-                        ) as libc::c_int
-                    }
-                    Attempt::RawIcmpSocket => {
-                        libc::socket(libc::AF_INET, libc::SOCK_RAW, libc::IPPROTO_ICMP)
-                    }
-                    Attempt::TcpSocket => libc::socket(libc::AF_INET, libc::SOCK_STREAM, 0),
-                };
-
-                if descriptor >= 0 {
-                    libc::close(descriptor);
-                    libc::_exit(ATTEMPT_ALLOWED);
-                }
-
-                match std::io::Error::last_os_error().raw_os_error() {
-                    Some(libc::EPERM) => libc::_exit(ATTEMPT_REFUSED_EPERM),
-                    Some(libc::ENOSYS) => libc::_exit(ATTEMPT_REFUSED_ENOSYS),
-                    _ => libc::_exit(ATTEMPT_REFUSED_OTHER),
-                }
-            });
-        }
-
-        command
-            .status()
-            .expect("the probe child must fork")
-            .code()
-            .expect("the probe child reports through its exit code, never a signal")
-    }
-
-    // `Seccomp: 2` in `/proc/self/status` says a filter is attached, not that it
-    // Reports whether the filter is what refuses `attempt` on this runner,
-    // skipping or failing when the question cannot be settled here.
-    //
-    // The kernel refuses a packet socket with EPERM to a caller lacking
-    // CAP_NET_RAW, which is the errno the filter returns.  Asserting the
-    // refusal on its own therefore passes under an unprivileged runner with the
-    // filter having done nothing, and would keep passing if the filter were
-    // deleted.  Reading the unfiltered answer first is what separates the two,
-    // and it has to happen in the same test: a control standing alone passes
-    // under that runner too.
-    #[cfg(target_os = "linux")]
-    fn the_filter_is_what_refuses(attempt: Attempt, refusal: i32) -> bool {
-        let unfiltered = probe_socket(attempt, false);
-
-        if unfiltered != refusal {
-            return true;
-        }
-
-        let reason = format!(
-            "{attempt:?} is already refused ({unfiltered}) with no filter installed, \
-             so a refusal under the filter would prove nothing — run as a caller \
-             holding CAP_NET_RAW on a kernel offering the route"
-        );
-
-        // A lane provisioned for this suite reports a skip as success, so the
-        // gate would go green having tested nothing.
-        if std::env::var("MXC_LXC_TESTS_REQUIRE_EXECUTION").is_ok_and(|value| value != "0") {
-            panic!("strict mode: {reason}");
-        }
-
-        println!("SKIPPED: {reason}");
-        false
-    }
-
-    // refuses anything: a filter permitting every syscall reports the same
-    // number.  These open the sockets the filter exists to stop and read the
-    // kernel's answer.
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn the_filter_refuses_a_packet_socket_with_eperm() {
-        if !the_filter_is_what_refuses(Attempt::PacketSocket, ATTEMPT_REFUSED_EPERM) {
-            return;
-        }
-
-        assert_eq!(
-            probe_socket(Attempt::PacketSocket, true),
-            ATTEMPT_REFUSED_EPERM,
-            "a workload under the filter must not reach AF_PACKET, which writes \
-             frames below the chains confining it"
-        );
-    }
-
-    // `socket(PF_INET, SOCK_PACKET, ...)` names a family the filter permits and
-    // hands back a packet socket anyway, because the kernel swaps the family
-    // over after seccomp has read it.  Reading the socket type catches it.
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn the_filter_refuses_a_legacy_packet_socket_with_eperm() {
-        if !the_filter_is_what_refuses(Attempt::LegacyPacketSocket, ATTEMPT_REFUSED_EPERM) {
-            return;
-        }
-
-        assert_eq!(
-            probe_socket(Attempt::LegacyPacketSocket, true),
-            ATTEMPT_REFUSED_EPERM,
-            "SOCK_PACKET reaches AF_PACKET under a family the filter allows"
-        );
-    }
-
-    // The kernel masks the flags off the socket type before reading it, so a
-    // filter comparing the type whole is passed by adding one.
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn the_filter_refuses_a_legacy_packet_socket_carrying_a_flag() {
-        if !the_filter_is_what_refuses(Attempt::LegacyPacketSocketWithFlags, ATTEMPT_REFUSED_EPERM)
-        {
-            return;
-        }
-
-        assert_eq!(
-            probe_socket(Attempt::LegacyPacketSocketWithFlags, true),
-            ATTEMPT_REFUSED_EPERM,
-            "SOCK_CLOEXEC must not carry a packet socket past the type check"
-        );
-    }
-
-    // A kernel built without XDP sockets answers EAFNOSUPPORT rather than
-    // handing back a descriptor, which is a different answer from the filter's
-    // and settles this as well as an open route would.
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn the_filter_refuses_an_express_data_path_socket_with_eperm() {
-        if !the_filter_is_what_refuses(Attempt::ExpressDataPathSocket, ATTEMPT_REFUSED_EPERM) {
-            return;
-        }
-
-        assert_eq!(
-            probe_socket(Attempt::ExpressDataPathSocket, true),
-            ATTEMPT_REFUSED_EPERM,
-            "AF_XDP transmits on the interface below the chains, as AF_PACKET does"
-        );
-    }
-
-    // A ring creates a socket on its own, and that request is not a socket
-    // syscall, so no family check can see it.  Refusing the ring is what closes
-    // the route.  A kernel offering no io_uring answers ENOSYS by itself, which
-    // the check above rules out.
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn the_filter_refuses_an_io_uring_ring() {
-        if !the_filter_is_what_refuses(Attempt::IoUringRing, ATTEMPT_REFUSED_ENOSYS) {
-            return;
-        }
-
-        assert_eq!(
-            probe_socket(Attempt::IoUringRing, true),
-            ATTEMPT_REFUSED_ENOSYS,
-            "a ring opens AF_PACKET without issuing the syscall this filter reads"
-        );
-    }
-
-    // CAP_NET_RAW stays so that an `icmp` egress allow has the raw socket it
-    // needs, and the filter is what makes keeping it safe.  A runner that
-    // cannot open the socket unfiltered cannot show the filter left it open,
-    // so it reports a skip rather than a pass.
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn the_filter_leaves_a_raw_icmp_socket_alone() {
-        let unfiltered = probe_socket(Attempt::RawIcmpSocket, false);
-
-        if unfiltered != ATTEMPT_ALLOWED {
-            let reason = format!(
-                "raw ICMP answers {unfiltered} with no filter installed, so this \
-                 runner cannot show the filter leaves it open — run as a caller \
-                 holding CAP_NET_RAW"
-            );
-
-            if std::env::var("MXC_LXC_TESTS_REQUIRE_EXECUTION").is_ok_and(|value| value != "0") {
-                panic!("strict mode: {reason}");
-            }
-
-            println!("SKIPPED: {reason}");
-            return;
-        }
-
-        assert_eq!(
-            probe_socket(Attempt::RawIcmpSocket, true),
-            ATTEMPT_ALLOWED,
-            "the filter closed raw ICMP, which an `icmp` egress allow depends on"
-        );
-    }
-
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn the_filter_leaves_an_ordinary_socket_alone() {
-        assert_eq!(
-            probe_socket(Attempt::TcpSocket, true),
-            ATTEMPT_ALLOWED,
-            "a confined workload still has to reach the network it is allowed"
         );
     }
 

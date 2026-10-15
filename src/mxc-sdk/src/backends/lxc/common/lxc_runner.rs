@@ -616,12 +616,23 @@ impl LxcScriptRunner {
             }
         };
 
-        let firewall = container_firewall(
-            fw_manager.rules_applied(),
-            ingress_manager
+        // figure out if a firewall needs to be installed.
+        let is_firewall_installed = if fw_manager.rules_applied()
+            || ingress_manager
                 .as_ref()
-                .is_some_and(|mgr| mgr.rules_applied()),
-        );
+                .is_some_and(|mgr| mgr.rules_applied())
+        {
+            ContainerFirewall::Installed
+        } else {
+            ContainerFirewall::Absent
+        };
+
+        // Dropping CAP_NET_RAW also removed raw ICMP.  Widen the container's
+        // ping_group_range so unprivileged ping still works.
+        if let Err(e) = fw_manager.allow_ping_sockets(logger) {
+            self.release_after_failure(&container, container_created, logger);
+            return Err(ScriptResponse::error(&e));
+        }
 
         // A reused container can carry a pin left by an older run.
         let stale_pin_error = Self::clear_stale_hosts_pin(container_created, |command| {
@@ -632,7 +643,7 @@ impl LxcScriptRunner {
                     &[],
                     true,
                     Some(HOSTS_COMMAND_TIMEOUT),
-                    firewall,
+                    is_firewall_installed,
                 )
                 .map_err(|e| e.to_string())
         });
@@ -659,7 +670,7 @@ impl LxcScriptRunner {
             ingress_manager,
             container,
             container_created,
-            firewall,
+            firewall: is_firewall_installed,
             released: false,
             force_stopped: false,
             stop_failed: false,
@@ -1553,15 +1564,6 @@ fn launch_failure_message(reason: &str, cleanup_failures: &[String]) -> String {
     )
 }
 
-/// Whether the workload must be kept away from chains in its own namespace.
-fn container_firewall(egress_applied: bool, ingress_applied: bool) -> ContainerFirewall {
-    if egress_applied || ingress_applied {
-        ContainerFirewall::Installed
-    } else {
-        ContainerFirewall::Absent
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2131,28 +2133,6 @@ mod tests {
             egress_hook_point(None, false),
             Some(EgressHookPoint::Unhooked)
         ));
-    }
-
-    #[test]
-    fn either_installed_chain_confines_the_workload() {
-        for (egress, ingress) in [(true, false), (false, true), (true, true)] {
-            assert_eq!(
-                container_firewall(egress, ingress),
-                ContainerFirewall::Installed,
-                "egress={egress} ingress={ingress} leaves a chain the workload could flush"
-            );
-        }
-    }
-
-    #[test]
-    fn a_policy_that_installs_no_chain_leaves_the_workload_unconfined() {
-        // Confining takes CAP_SETPCAP to drop a capability, which an
-        // unprivileged caller lacks.
-        assert_eq!(
-            container_firewall(false, false),
-            ContainerFirewall::Absent,
-            "a run with no firewall must not be confined"
-        );
     }
 
     /// `process.env` resolution, which schema 0.9 gave a default block.
