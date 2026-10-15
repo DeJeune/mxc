@@ -468,11 +468,23 @@ async fn release_undelivered_sandbox(session: &SessionHandle, sandbox_id: &str) 
 /// The id exists only here, so giving up leaks a WSL2 utility VM and the store
 /// slot it holds.
 async fn release_undelivered_session(session: &SessionHandle, session_id: &str) {
+    retry_undelivered_release(session_id, |config| session.deprovision_session(config)).await;
+}
+
+/// Retry a deprovision until it lands or the attempts run out.
+///
+/// `deprovision` is a parameter so the transient and terminal paths can be
+/// driven without a live session.
+async fn retry_undelivered_release<F, Fut>(session_id: &str, mut deprovision: F)
+where
+    F: FnMut(DeprovisionSessionConfig) -> Fut,
+    Fut: std::future::Future<Output = Result<(), WorkerError>>,
+{
     for attempt in 1..=UNDELIVERED_RELEASE_ATTEMPTS {
         let config = DeprovisionSessionConfig {
             session_id: session_id.to_string(),
         };
-        match session.deprovision_session(config).await {
+        match deprovision(config).await {
             Ok(()) => {
                 eprintln!(
                     "[wslc-daemon] released session {session_id}: its reply never \
@@ -1392,6 +1404,65 @@ mod tests {
 
         assert!(outcome.is_err(), "a failed write must not report success");
         assert_eq!(released.into_inner(), vec!["wslc:abc".to_string()]);
+    }
+
+    /// The session arm of the same path: this reply mints the only id that
+    /// names a live VM, so a write that fails must release it.
+    #[tokio::test]
+    async fn an_undelivered_session_reply_releases_that_session() {
+        let released = std::cell::RefCell::new(Vec::new());
+        let resp = DaemonResponse::SessionProvisioned {
+            session_id: "wslcsess:abc".to_string(),
+        };
+
+        let outcome = deliver_minted_reply(&mut BrokenPipe, &resp, |id| {
+            released.borrow_mut().push(id);
+            std::future::ready(())
+        })
+        .await;
+
+        assert!(outcome.is_err(), "a failed write must not report success");
+        assert_eq!(released.into_inner(), vec!["wslcsess:abc".to_string()]);
+    }
+
+    /// A deprovision that fails once must not strand the VM.
+    #[tokio::test(start_paused = true)]
+    async fn an_undelivered_release_retries_a_transient_failure() {
+        let attempts = std::cell::Cell::new(0);
+
+        retry_undelivered_release("wslcsess:abc", |_| {
+            attempts.set(attempts.get() + 1);
+            std::future::ready(if attempts.get() < 2 {
+                Err(WorkerError::Backend(anyhow::anyhow!("busy")))
+            } else {
+                Ok(())
+            })
+        })
+        .await;
+
+        assert_eq!(
+            attempts.get(),
+            2,
+            "a transient failure must be retried, and a success must stop the loop"
+        );
+    }
+
+    /// Every attempt failing must give up rather than retry forever.
+    #[tokio::test(start_paused = true)]
+    async fn an_undelivered_release_gives_up_after_its_attempts() {
+        let attempts = std::cell::Cell::new(0);
+
+        retry_undelivered_release("wslcsess:abc", |_| {
+            attempts.set(attempts.get() + 1);
+            std::future::ready(Err(WorkerError::Backend(anyhow::anyhow!("gone"))))
+        })
+        .await;
+
+        assert_eq!(
+            attempts.get(),
+            UNDELIVERED_RELEASE_ATTEMPTS,
+            "a terminal failure must stop at the attempt bound"
+        );
     }
 
     #[tokio::test]

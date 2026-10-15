@@ -91,9 +91,8 @@ pub struct HostCapacity {
 
 /// Read what this host has installed.
 fn host_capacity() -> Option<HostCapacity> {
-    use windows::Win32::System::SystemInformation::{
-        GetSystemInfo, GlobalMemoryStatusEx, MEMORYSTATUSEX, SYSTEM_INFO,
-    };
+    use windows::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
+    use windows::Win32::System::Threading::{GetActiveProcessorCount, ALL_PROCESSOR_GROUPS};
 
     let mut status = MEMORYSTATUSEX {
         dwLength: std::mem::size_of::<MEMORYSTATUSEX>() as u32,
@@ -104,17 +103,15 @@ fn host_capacity() -> Option<HostCapacity> {
     // the API requires.
     unsafe { GlobalMemoryStatusEx(&mut status) }.ok()?;
 
-    let mut info = SYSTEM_INFO::default();
-
-    // SAFETY: `info` is a valid, writable `SYSTEM_INFO`.
-    unsafe { GetSystemInfo(&mut info) };
-
+    // Every processor group, not just the caller's: `GetSystemInfo` reports one
+    // group and caps at 64, so a host with more would refuse a size it can run.
     // A job object narrowing what mxc may run on does not narrow what the
-    // hypervisor can give a VM, so this counts the machine's processors rather
-    // than the ones this process may use.
+    // hypervisor can give a VM either.
+    let logical_cpus = unsafe { GetActiveProcessorCount(ALL_PROCESSOR_GROUPS) };
+
     Some(HostCapacity {
         total_memory_mb: status.ullTotalPhys / (1024 * 1024),
-        logical_cpus: info.dwNumberOfProcessors,
+        logical_cpus,
     })
 }
 
@@ -1025,6 +1022,19 @@ pub(crate) unsafe fn list_stored_images(
     Ok(stored)
 }
 
+/// The flags a lifecycle container is created with.
+///
+/// GPU is set on the session *and* the container; a session sized for a GPU
+/// whose containers lack the flag gets no passthrough and reports nothing.
+/// Auto-remove stays one-shot-only, since a lifecycle sandbox outlives its runs.
+fn container_flags(gpu: bool) -> WslcContainerFlags {
+    if gpu {
+        WslcContainerFlags::WSLC_CONTAINER_FLAG_ENABLE_GPU
+    } else {
+        WslcContainerFlags::WSLC_CONTAINER_FLAG_NONE
+    }
+}
+
 /// Create a daemon-owned container with `keepalive` as its init process, so it
 /// stays alive across repeated `exec` calls. The caller keeps `keepalive`
 /// stationary until this returns (the SDK reads its buffers at
@@ -1040,17 +1050,17 @@ pub unsafe fn create_daemon_container(
     mounts: &[VolumeMount],
     port_mappings: &[PortMapping],
     net_mode: WslcContainerNetworkingMode,
+    gpu: bool,
     keepalive: &mut ProcessSettings,
     logger: &mut Logger,
 ) -> Result<WslcContainerGuard, ScriptResponse> {
-    // The container flags (auto-remove / gpu / privileged) are one-shot-only.
     let mut container_settings = ContainerSettings::build(
         sdk,
         image,
         mounts,
         port_mappings,
         net_mode,
-        WslcContainerFlags::WSLC_CONTAINER_FLAG_NONE,
+        container_flags(gpu),
         logger,
     )?;
 
@@ -1589,6 +1599,20 @@ mod tests {
     #[test]
     fn absent_sizing_is_allowed() {
         assert!(sizing_fits_host(SessionSizing::default(), TEST_HOST).is_ok());
+    }
+
+    /// A session sized for a GPU whose containers lack the flag gets no
+    /// passthrough and reports nothing, so the two halves must agree.
+    #[test]
+    fn a_gpu_session_creates_gpu_containers() {
+        assert_eq!(
+            container_flags(true),
+            WslcContainerFlags::WSLC_CONTAINER_FLAG_ENABLE_GPU
+        );
+        assert_eq!(
+            container_flags(false),
+            WslcContainerFlags::WSLC_CONTAINER_FLAG_NONE
+        );
     }
 
     #[test]
