@@ -60,10 +60,10 @@ built tree, which is the fastest way to iterate on one area:
 tests\scripts\run_processcontainer_network_proxy_test.ps1 -RequireTier base-container
 ```
 
-When the host probe reports `baseContainerSupportsIdentitylessLoopbackProxy`,
-the proxy area requires workload launch and a successful proxied fetch on both
-hosts that accept PSEC 1.0 or advertise native ingress support.
-A clean policy rejection is a failure on these hosts.
+When the host probe reports
+`baseContainerSupportsIdentitylessLoopbackProxy` as `true`, the proxy test
+must start the workload and reach the configured proxy. Rejecting the request
+counts as a failure.
 Older binaries that omit this probe fact do not enable the capability-specific
 assertions; the existing proxy assertions still apply.
 The area also verifies that the host can reach a second loopback endpoint and

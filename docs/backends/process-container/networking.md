@@ -140,13 +140,7 @@ Backend discovery reports `identitylessLoopbackProxy` on the ProcessContainer
 `base-container` tier when the host supports an identity-less proxy on loopback.
 The Windows request probe also reports
 `probes.baseContainerSupportsIdentitylessLoopbackProxy`, including when called
-without a request. Support is available when the host accepts PSEC 1.0 or
-advertises native ingress support. This includes PSEC 1.1 hosts with native
-ingress disabled that still accept PSEC 1.0. A host that reports
-`baseContainerSupportsIngressHostLoopbackAllow` also supports an identity-less
-loopback proxy. Ingress- or version-query failures omit the capability, set the
-probe fact to `false`, and add a warning. Execution also reports ingress-query
-failures rather than treating an unknown support state as a compatibility fallback.
+without a request.
 
 This does not grant general `ingressHostLoopbackAllow` support or report that the
 current request uses an identity-less proxy. The request must set
