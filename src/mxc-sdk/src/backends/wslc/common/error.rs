@@ -11,10 +11,8 @@
 //! the message. Each variant here attributes the failure to a lifecycle phase
 //! instead.
 //!
-//! `Display` reproduces the pre-existing message verbatim and
-//! [`WslcError::into_response`] fills the same fields `ScriptResponse::error`
-//! did, so the text a user sees is unchanged; `failure_phase` is the only
-//! addition.
+//! `Display` reproduces the pre-existing message verbatim, so the text a user
+//! sees is unchanged.
 
 use std::fmt;
 
@@ -68,18 +66,9 @@ impl WslcError {
         }
     }
 
-    /// Render as a [`ScriptResponse`], preserving the exact message text the
-    /// untyped construction produced.
+    /// Render as a [`ScriptResponse`] carrying the message verbatim.
     pub(crate) fn into_response(self) -> ScriptResponse {
-        let failure_phase = self.failure_phase();
-        let msg = self.to_string();
-        ScriptResponse {
-            exit_code: failure_phase.failure_exit_code(),
-            standard_err: msg.clone(),
-            error_message: msg,
-            failure_phase,
-            ..Default::default()
-        }
+        ScriptResponse::failed(self.failure_phase(), &self.to_string())
     }
 }
 
@@ -161,15 +150,11 @@ mod tests {
     }
 
     #[test]
-    fn response_matches_the_untyped_shape_apart_from_the_phase() {
+    fn response_carries_the_message_and_the_phase() {
         let typed = WslcError::Host("bring-up failed".to_string()).into_response();
-        let untyped = ScriptResponse::error("bring-up failed");
 
-        assert_eq!(typed.exit_code, untyped.exit_code);
-        assert_eq!(typed.standard_err, untyped.standard_err);
-        assert_eq!(typed.error_message, untyped.error_message);
-        // The untyped helper left this at the default, which is the bug.
-        assert_eq!(untyped.failure_phase, FailurePhase::None);
+        assert_eq!(typed.exit_code, -1);
+        assert_eq!(typed.error_message, "bring-up failed");
         assert_eq!(typed.failure_phase, FailurePhase::LaunchFailed);
     }
 

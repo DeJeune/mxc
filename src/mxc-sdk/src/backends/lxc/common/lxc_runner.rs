@@ -40,18 +40,6 @@ use crate::lxc_common::signal_cleanup;
 
 const HOSTS_PIN_MARKER: &str = "#mxc-proxy-pin";
 
-/// A runtime fault, tagged with the phase of the run it broke in.
-///
-/// A refused request and an unusable host have their own constructors on
-/// [`ScriptResponse`]; this covers the faults that stay `backend_error` and
-/// only say *where* the run came apart.
-fn response_with_phase(phase: FailurePhase, message: &str) -> ScriptResponse {
-    ScriptResponse {
-        failure_phase: phase,
-        ..ScriptResponse::error(message)
-    }
-}
-
 /// `PATH` for the contained child, from schema 0.9.
 ///
 /// The script runs with `lxc-attach` in clear-env mode, which supplies a small
@@ -214,7 +202,7 @@ impl LxcScriptRunner {
             return self.claim_generated_name();
         }
         ContainerNameClaim::acquire(&self.container_id).ok_or_else(|| {
-            response_with_phase(
+            ScriptResponse::failed(
                 FailurePhase::LaunchFailed,
                 &format!(
                     "LXC: container '{}' is already in use by a run in this process. LXC reads a \
@@ -235,7 +223,7 @@ impl LxcScriptRunner {
                 return Ok(claim);
             }
         }
-        Err(response_with_phase(
+        Err(ScriptResponse::failed(
             FailurePhase::LaunchFailed,
             "LXC: could not find a free container name for this run; every generated name was \
              already in use by another run in this process. Retry, or set containerId to a name \
@@ -407,7 +395,7 @@ impl LxcScriptRunner {
         let release = self.release_kind(container_created);
         Self::report_release_failure(release, release_container(release), logger);
 
-        Some(response_with_phase(
+        Some(ScriptResponse::failed(
             FailurePhase::PostLaunchFailed,
             &format!(
                 "Container did not receive an IPv4 address within {:.0}s; \
@@ -437,7 +425,7 @@ impl LxcScriptRunner {
         let release = self.release_kind(container_created);
         Self::report_release_failure(release, release_container(release), logger);
 
-        Err(response_with_phase(
+        Err(ScriptResponse::failed(
             FailurePhase::PostLaunchFailed,
             "Failed to discover the container init PID; cannot enter the container \
              network namespace to enforce the requested firewall. Aborting rather \
@@ -494,7 +482,7 @@ impl LxcScriptRunner {
                 return Err(ScriptResponse::unavailable(LXC_TOOLING_UNAVAILABLE));
             }
             LxcTooling::ProbeFailed => {
-                return Err(response_with_phase(
+                return Err(ScriptResponse::failed(
                     FailurePhase::LaunchFailed,
                     "LXC: probing the LXC tooling (`lxc-ls --version`) timed out or \
                      could not run; retry once the host is responsive",
@@ -528,7 +516,7 @@ impl LxcScriptRunner {
         if !container.is_defined() {
             let _ = writeln!(logger, "Creating LXC container...");
             if let Err(e) = container.create(&self.config.distribution, &self.config.release) {
-                return Err(response_with_phase(
+                return Err(ScriptResponse::failed(
                     FailurePhase::LaunchFailed,
                     &format!("Failed to create container: {}", e),
                 ));
@@ -545,7 +533,7 @@ impl LxcScriptRunner {
             if self.destroy_on_exit || container_created {
                 let _ = container.destroy();
             }
-            return Err(response_with_phase(
+            return Err(ScriptResponse::failed(
                 FailurePhase::LaunchFailed,
                 &format!("Failed to configure filesystem: {}", e),
             ));
@@ -562,7 +550,7 @@ impl LxcScriptRunner {
                 if self.destroy_on_exit || container_created {
                     let _ = container.destroy();
                 }
-                return Err(response_with_phase(
+                return Err(ScriptResponse::failed(
                     FailurePhase::LaunchFailed,
                     &format!(
                         "Failed to stop a container left running by an earlier run: {}. \
@@ -590,7 +578,7 @@ impl LxcScriptRunner {
             if self.destroy_on_exit || container_created {
                 let _ = container.destroy();
             }
-            return Err(response_with_phase(
+            return Err(ScriptResponse::failed(
                 FailurePhase::LaunchFailed,
                 &format!("Failed to start container: {}", e),
             ));
@@ -650,7 +638,7 @@ impl LxcScriptRunner {
             Ok(managers) => managers,
             Err(e) => {
                 self.release_after_failure(&container, container_created, logger);
-                return Err(response_with_phase(FailurePhase::PostLaunchFailed, &e));
+                return Err(ScriptResponse::failed(FailurePhase::PostLaunchFailed, &e));
             }
         };
 
@@ -676,7 +664,7 @@ impl LxcScriptRunner {
         });
         if let Err(reason) = stale_pin_error {
             self.release_after_failure(&container, container_created, logger);
-            return Err(response_with_phase(
+            return Err(ScriptResponse::failed(
                 FailurePhase::PostLaunchFailed,
                 &format!(
                     "Failed to clear a stale network proxy pin from the container's \
@@ -1142,7 +1130,7 @@ impl LxcScriptRunner {
             Ok(launched) => launched,
             Err(e) => {
                 let cleanup = self.abandon_prepared(&mut prepared, logger);
-                return Err(response_with_phase(
+                return Err(ScriptResponse::failed(
                     FailurePhase::LaunchFailed,
                     &launch_failure_message(&format!("Execution failed: {}", e), &cleanup),
                 ));
@@ -1172,7 +1160,7 @@ impl LxcScriptRunner {
                 let cleanup = self.abandon_prepared(&mut prepared, logger);
 
                 let error = out_result.err().or(err_result.err());
-                return Err(response_with_phase(
+                return Err(ScriptResponse::failed(
                     FailurePhase::PostLaunchFailed,
                     &launch_failure_message(
                         &format!(

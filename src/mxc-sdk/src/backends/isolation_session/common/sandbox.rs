@@ -92,10 +92,7 @@ fn launch_failure_response(error: &MxcError) -> ScriptResponse {
     match error.code {
         MxcErrorCode::BackendUnavailable => ScriptResponse::unavailable(&error.message),
         MxcErrorCode::PolicyValidation => ScriptResponse::rejected(&error.message),
-        _ => ScriptResponse {
-            failure_phase: FailurePhase::LaunchFailed,
-            ..ScriptResponse::error(&error.message)
-        },
+        _ => ScriptResponse::failed(FailurePhase::LaunchFailed, &error.message),
     }
 }
 

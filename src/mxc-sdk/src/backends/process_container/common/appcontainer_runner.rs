@@ -93,10 +93,7 @@ const BFSCFG_MISSING_MSG: &str =
 
 /// A failure while bringing the sandbox up, before the child could run.
 fn launch_failed(message: &str) -> ScriptResponse {
-    ScriptResponse {
-        failure_phase: FailurePhase::LaunchFailed,
-        ..ScriptResponse::error(message)
-    }
+    ScriptResponse::failed(FailurePhase::LaunchFailed, message)
 }
 
 /// Attribute a BFS configuration failure: an absent `bfscfg.exe` is a host that
@@ -1795,10 +1792,9 @@ impl SandboxBackend for AppContainerScriptRunner {
             false,
         )?;
         if request.policy.capture_denials.is_some() && self.guarded_capture_factory.is_none() {
-            return Err(ScriptResponse {
-                failure_phase: FailurePhase::BackendUnavailable,
-                ..ScriptResponse::error(CAPTURE_DENIALS_FALLBACK_UNSUPPORTED_MSG)
-            });
+            return Err(ScriptResponse::unavailable(
+                CAPTURE_DENIALS_FALLBACK_UNSUPPORTED_MSG,
+            ));
         }
         if !request.policy.denied_paths.is_empty()
             && self.filesystem_mode != FilesystemMode::Dacl

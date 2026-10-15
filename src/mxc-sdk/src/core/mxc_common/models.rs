@@ -1319,12 +1319,7 @@ impl ScriptResponse {
     /// copying it would print the message bare and then again inside the JSON
     /// envelope.
     pub fn rejected(msg: &str) -> Self {
-        ScriptResponse {
-            exit_code: FailurePhase::Rejected.failure_exit_code(),
-            error_message: msg.to_string(),
-            failure_phase: FailurePhase::Rejected,
-            ..Default::default()
-        }
+        Self::failed(FailurePhase::Rejected, msg)
     }
 
     /// Create a response for a backend this host cannot provide.
@@ -1334,10 +1329,18 @@ impl ScriptResponse {
     /// [`ScriptResponse::rejected`] nothing ran, so the message is left to the
     /// envelope rather than copied into `standard_err`.
     pub fn unavailable(msg: &str) -> Self {
+        Self::failed(FailurePhase::BackendUnavailable, msg)
+    }
+
+    /// Create a response for a failure attributed to `phase`.
+    ///
+    /// The exit code follows the phase, and the message is left to the error
+    /// envelope rather than copied into `standard_err`.
+    pub fn failed(phase: FailurePhase, msg: &str) -> Self {
         ScriptResponse {
-            exit_code: FailurePhase::BackendUnavailable.failure_exit_code(),
+            exit_code: phase.failure_exit_code(),
             error_message: msg.to_string(),
-            failure_phase: FailurePhase::BackendUnavailable,
+            failure_phase: phase,
             ..Default::default()
         }
     }
@@ -1455,6 +1458,16 @@ mod tests {
         // The envelope carries the message; duplicating it into standard_err
         // would print it twice, unseparated, ahead of the JSON.
         assert!(rejected.standard_err.is_empty());
+    }
+
+    #[test]
+    fn a_phased_failure_takes_its_exit_code_from_the_phase() {
+        let launch = ScriptResponse::failed(FailurePhase::LaunchFailed, "spawn failed");
+
+        assert_eq!(launch.exit_code, -1);
+        assert_eq!(launch.failure_phase, FailurePhase::LaunchFailed);
+        assert_eq!(launch.error_message, "spawn failed");
+        assert!(launch.standard_err.is_empty());
     }
 
     #[test]

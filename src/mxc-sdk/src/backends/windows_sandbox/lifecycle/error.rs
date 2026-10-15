@@ -59,12 +59,9 @@ impl OneShotError {
         };
 
         ScriptResponse {
-            exit_code: failure_phase.failure_exit_code(),
             standard_err: summary.to_string(),
-            error_message: summary.to_string(),
             extended_error: detail,
-            failure_phase,
-            ..Default::default()
+            ..ScriptResponse::failed(failure_phase, summary)
         }
     }
 

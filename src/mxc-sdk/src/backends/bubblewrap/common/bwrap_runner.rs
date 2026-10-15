@@ -45,24 +45,12 @@ use crate::bwrap_common::{
 
 const DNS_PORT: u16 = 53;
 
-/// A runtime fault, tagged with the phase of the run it broke in.
-///
-/// A refused request and an unusable host have their own constructors on
-/// [`ScriptResponse`]; this covers the faults that stay `backend_error` and
-/// only say *where* the run came apart.
-fn response_with_phase(phase: FailurePhase, message: &str) -> ScriptResponse {
-    ScriptResponse {
-        failure_phase: phase,
-        ..ScriptResponse::error(message)
-    }
-}
-
 /// A host lookup failure is a launch fault, not a refusal of the policy.
 fn proxy_resolve_failure_response(error: proxy_network::ProxyResolveError) -> ScriptResponse {
     match error {
         proxy_network::ProxyResolveError::Rejected(message) => ScriptResponse::rejected(&message),
         proxy_network::ProxyResolveError::Lookup(message) => {
-            response_with_phase(FailurePhase::LaunchFailed, &message)
+            ScriptResponse::failed(FailurePhase::LaunchFailed, &message)
         }
     }
 }
@@ -508,7 +496,7 @@ impl BubblewrapScriptRunner {
                 ) {
                     Ok(network) => Some(network),
                     Err(error) => {
-                        return Err(response_with_phase(FailurePhase::LaunchFailed, &error))
+                        return Err(ScriptResponse::failed(FailurePhase::LaunchFailed, &error))
                     }
                 }
             }
@@ -539,7 +527,7 @@ impl BubblewrapScriptRunner {
                         Some(network)
                     }
                     Err(error) => {
-                        return Err(response_with_phase(FailurePhase::LaunchFailed, &error))
+                        return Err(ScriptResponse::failed(FailurePhase::LaunchFailed, &error))
                     }
                 }
             }
@@ -560,7 +548,7 @@ impl BubblewrapScriptRunner {
                 Ok(startup) => Some(startup),
                 Err(error) => {
                     stop_proxy_network(&mut proxy_network, logger);
-                    return Err(response_with_phase(FailurePhase::LaunchFailed, &error));
+                    return Err(ScriptResponse::failed(FailurePhase::LaunchFailed, &error));
                 }
             },
             None => None,
@@ -604,7 +592,7 @@ impl BubblewrapScriptRunner {
                 Ok(pty) => Some(pty),
                 Err(error) => {
                     stop_proxy_network(&mut proxy_network, logger);
-                    return Err(response_with_phase(
+                    return Err(ScriptResponse::failed(
                         FailurePhase::LaunchFailed,
                         &format!("Bubblewrap: failed to allocate PTY: {error}"),
                     ));
@@ -627,7 +615,7 @@ impl BubblewrapScriptRunner {
             Ok(process) => process,
             Err(error) => {
                 stop_proxy_network(&mut proxy_network, logger);
-                return Err(response_with_phase(
+                return Err(ScriptResponse::failed(
                     FailurePhase::LaunchFailed,
                     &format!("Bubblewrap: failed to spawn bwrap: {}", error),
                 ));
@@ -653,7 +641,10 @@ impl BubblewrapScriptRunner {
                 let _ = child.kill();
                 let _ = child.wait();
                 stop_proxy_network(&mut proxy_network, logger);
-                return Err(response_with_phase(FailurePhase::PostLaunchFailed, &error));
+                return Err(ScriptResponse::failed(
+                    FailurePhase::PostLaunchFailed,
+                    &error,
+                ));
             }
         }
 
@@ -676,7 +667,7 @@ impl BubblewrapScriptRunner {
                     let _ = child.wait();
                     stop_proxy_network(&mut proxy_network, logger);
                     let error = out_result.err().or(err_result.err());
-                    return Err(response_with_phase(
+                    return Err(ScriptResponse::failed(
                         FailurePhase::PostLaunchFailed,
                         &format!(
                             "Bubblewrap: failed to wrap stdio pipes: {}",

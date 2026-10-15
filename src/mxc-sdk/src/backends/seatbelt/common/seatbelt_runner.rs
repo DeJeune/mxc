@@ -1094,12 +1094,7 @@ fn rejected_response(message: String) -> ScriptResponse {
 /// A fault while bringing the sandboxed child up, after the request was
 /// accepted.
 fn launch_failed_response(message: String) -> ScriptResponse {
-    ScriptResponse {
-        exit_code: FailurePhase::LaunchFailed.failure_exit_code(),
-        error_message: message,
-        failure_phase: FailurePhase::LaunchFailed,
-        ..Default::default()
-    }
+    ScriptResponse::failed(FailurePhase::LaunchFailed, &message)
 }
 
 /// The optional run timeout — `None` when `scriptTimeout` is 0 (wait forever).

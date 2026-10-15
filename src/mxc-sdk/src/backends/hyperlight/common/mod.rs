@@ -184,13 +184,7 @@ impl RunnerError {
     }
 
     fn to_response(&self) -> ScriptResponse {
-        let failure_phase = self.failure_phase();
-        ScriptResponse {
-            exit_code: failure_phase.failure_exit_code(),
-            error_message: self.to_string(),
-            failure_phase,
-            ..Default::default()
-        }
+        ScriptResponse::failed(self.failure_phase(), &self.to_string())
     }
 }
 
