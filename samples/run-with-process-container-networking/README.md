@@ -1,120 +1,77 @@
-# ProcessContainer networking
+# ProcessContainer runtime proxy
 
 > **Audience:** MXC consumers
 
-Runnable Node samples for Windows ProcessContainer networking using
-`@microsoft/mxc-sdk/v1`. The SDK selects the request contract; these samples
-do not author executor JSON or select a schema version.
+Runs an HTTPS client through an existing loopback proxy using the public V1
+SDK. Each language has a standalone program:
 
-The requests are in [`node/src/requests.ts`](node/src/requests.ts).
-[`node/src/main.ts`](node/src/main.ts) probes the request, streams workload
-output, reports warnings, and returns the workload exit code (124 on timeout).
-The samples require a prepared Windows host with the BaseContainer tier,
-Windows PowerShell, and `curl.exe`. See [networking prerequisites](../../docs/backends/process-container/networking.md#windows-update-prerequisites)
-for the required KBs and runtime capabilities. Run these workloads on a test VM.
-Stage native MXC binaries built from the same revision as the SDK; rebuilding
-the TypeScript SDK alone does not refresh `mxc_ffi.dll`.
+| Rust | .NET | Node |
+|---|---|---|
+| [`rust/src/main.rs`](rust/src/main.rs) | [`dotnet/Program.cs`](dotnet/Program.cs) | [`node/src/main.ts`](node/src/main.ts) |
 
-## Build
-
-From this sample's `node` directory:
-
-```powershell
-npm --prefix ..\..\..\sdk\node install
-npm --prefix ..\..\..\sdk\node run build
-npm install
-npm run build
-```
-
-`npm test` checks request construction without launching a container or
-contacting a proxy.
+Requires a prepared Windows ProcessContainer host with BaseContainer proxy
+support and `curl.exe`. See [networking prerequisites](../../docs/backends/process-container/networking.md#windows-update-prerequisites)
+for KBs and runtime capabilities. Stage native binaries built from the same
+revision as the SDK. Run these workloads on a test VM.
 
 ## Runtime proxy
 
-Start your own HTTP CONNECT proxy on `127.0.0.1:8080` before running the
-sample and keep it alive until the client exits. It must allow HTTPS access
-to `www.example.com`. The samples do not implement or start a proxy.
+Start your own HTTP CONNECT proxy on `127.0.0.1:8080` and keep it alive until
+the sample exits. It must allow HTTPS access to `www.example.com`; the sample
+does not implement or start a proxy.
 
-For a packaged proxy, supply its exact installed Package Family Name:
+For a packaged proxy, set its exact installed Package Family Name:
 
 ```powershell
 $env:MXC_PROXY_PEER = Get-AppxPackage -Name Contoso.AgentProxy |
   Select-Object -ExpandProperty PackageFamilyName
-node dist\main.js runtime-proxy
 ```
 
 For an unpackaged AppContainer proxy, set `MXC_PROXY_PEER` to its profile name.
-The sample sets `containment.config.network.allowedProxyPeer` and denies
-general host loopback. See the [proxy manifest](../../docs/backends/process-container/examples/proxy-package.md)
+The request denies general host loopback and authorizes the named peer.
+See the [proxy manifest](../../docs/backends/process-container/examples/proxy-package.md)
 for packaging and firewall requirements.
 
-For an ordinary unpackaged host proxy, omit the identity:
+For an ordinary unpackaged host proxy, unset `MXC_PROXY_PEER`:
 
 ```powershell
 Remove-Item Env:MXC_PROXY_PEER -ErrorAction SilentlyContinue
-node dist\main.js runtime-proxy
 ```
 
-This uses the weaker development/testing compatibility path with
-`hostLoopback: 'allow'`. It is not the strict bidirectional loopback guarantee;
-see the [runtime proxy inbound limitation](../../docs/backends/process-container/networking.md#discovering-identity-less-loopback-proxy-support).
-Both runtime-proxy forms deny direct egress and set
-`network.runtimeConfig.networkProxy`. MXC supplies the proxy environment
-variables automatically. No direct egress allow rules are added.
+This selects the development/testing compatibility path with
+`hostLoopback: allow`, not the strict bidirectional loopback guarantee.
+See the [runtime proxy inbound limitation](../../docs/backends/process-container/networking.md#discovering-identity-less-loopback-proxy-support).
+Both forms deny direct egress. MXC supplies the proxy environment variables
+automatically.
 
-## Cooperative proxy
+## Run
 
-This is direct egress, not MXC runtime proxy mode. The sample sets
-`HTTP_PROXY`, `HTTPS_PROXY`, and their lowercase forms while inheriting the
-backend's normal environment. Only the selected IPv4 address and TCP port
-8080 are permitted.
+From the corresponding language directory:
 
-```powershell
-$env:MXC_PROXY_IP = '127.0.0.1'
-node dist\main.js cooperative-proxy
+```text
+# Rust
+cargo run
+
+# .NET
+dotnet run
+
+# Node
+npm --prefix ../../../sdk/node install
+npm --prefix ../../../sdk/node run build
+npm install
+npm start
 ```
 
-For a public proxy, replace `MXC_PROXY_IP` with its reachable public IPv4
-address. The proxy must listen on port 8080. Public proxy mode denies host
-loopback; local proxy mode allows it and also permits unsolicited
-host-loopback connections to container listeners. There are no ingress
-source-CIDR or port rules to narrow that grant.
+Expected stdout contains the HTTPS response body. SDK errors, warnings,
+workload exit codes, and timeouts are reported.
 
-## Container loopback server and client
+## Other networking samples
 
-In one terminal, start a one-request HTTP listener on `127.0.0.1:8081` with
-outbound traffic denied:
+| Scenario | Sample |
+|---|---|
+| Cooperative local or public proxy | [Run with cooperative proxy](../run-with-cooperative-proxy/README.md) |
+| Container loopback listener | [Run with loopback server](../run-with-loopback-server/README.md) |
+| Container loopback client | [Run with loopback client](../run-with-loopback-client/README.md) |
+| Direct public IP egress | [Run with public egress](../run-with-public-egress/README.md) |
 
-```powershell
-node dist\main.js loopback-server
-```
-
-Wait for `LISTENING=http://127.0.0.1:8081/`, then run the client in another
-terminal within 60 seconds:
-
-```powershell
-node dist\main.js loopback-client
-```
-
-The client permits only `127.0.0.1:8081` over TCP and prints `OK`.
-The server exits after responding. To demonstrate a server that also permits
-unrestricted outbound traffic, use `loopback-server-egress-allow` instead.
-Both server forms and the client explicitly allow bidirectional host
-loopback. Other reachable host-loopback processes can connect to the listener;
-the policy cannot restrict inbound clients by identity, address, or port.
-
-## Direct public egress
-
-Supply a real HTTPS destination and one of its public IPv4 addresses:
-
-```powershell
-$env:MXC_DESTINATION_HOST = 'www.example.com'
-$env:MXC_DESTINATION_IP = '<permitted-public-ipv4>'
-node dist\main.js public-egress
-```
-
-The sample allows only that IP on TCP port 443, denies host loopback, and
-disables curl proxying. Curl's `--resolve` pins the connection to the selected
-address while preserving the hostname for TLS verification. This is an IP
-egress rule, not DNS-name filtering. Replace the placeholder; documentation
-addresses such as `203.0.113.10` are not routable test destinations.
+Each sample includes Rust, .NET, and Node implementations.

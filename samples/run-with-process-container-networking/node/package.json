@@ -5,8 +5,7 @@
   "type": "module",
   "scripts": {
     "build": "tsc",
-    "start": "npm run build && node dist/main.js",
-    "test": "npm run build && node --test dist/requests.test.js"
+    "start": "npm run build && node dist/main.js"
   },
   "engines": {
     "node": ">=24.21.0"

@@ -175,7 +175,7 @@ out. The same listener succeeds under a non-proxy PSEC ingress policy. The proxy
 complete implementation of the shared bidirectional `hostLoopback: "allow"` contract.
 
 The [ProcessContainer networking samples](../../../samples/run-with-process-container-networking/README.md)
-use the public Node V1 SDK for identity-scoped and identity-less runtime proxies,
+use the public Rust, .NET, and Node V1 SDKs for identity-scoped and identity-less runtime proxies,
 cooperative local or public proxies, loopback listeners and clients, and direct
 public egress. Runtime proxy mode supports one local loopback endpoint; use
 direct egress rules for public proxies or multiple endpoints.
