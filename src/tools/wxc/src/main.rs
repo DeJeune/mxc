@@ -72,6 +72,7 @@ struct Cli {
             "setup_wslc",
             "image",
             "storage_path",
+            "wslc_daemon_slots",
             "probe",
             "force_reclaim"
         ]
@@ -124,9 +125,11 @@ struct Cli {
     setup_wslc: bool,
 
     /// Image reference to pre-pull (e.g. `alpine:latest`,
-    /// `ghcr.io/owner/image:tag`). Required with `--setup-wslc`.
+    /// `ghcr.io/owner/image:tag`). Repeat to pull several images, which fills
+    /// each store in one session rather than one per image. Required with
+    /// `--setup-wslc`.
     #[arg(long = "image", requires = "setup_wslc")]
-    image: Option<String>,
+    image: Vec<String>,
 
     /// Optional WSLC storage path. When omitted the runner default is used
     /// (`%TEMP%\mxc-wslc-sessions`). Pass the same value here that your
@@ -134,6 +137,19 @@ struct Cli {
     /// the runner will not find the pulled image. Requires `--setup-wslc`.
     #[arg(long = "storage-path", requires = "setup_wslc")]
     storage_path: Option<String>,
+
+    /// Also warm the first N container-lifecycle store slots, which the
+    /// lifecycle daemon leases from and `--storage-path` does not reach.
+    /// Defaults to 0 so warming a create-and-run cache stays one pull per
+    /// image; each slot warmed adds a pull and a multi-GiB store.
+    /// Requires `--setup-wslc`.
+    #[arg(
+        long = "wslc-daemon-slots",
+        value_name = "N",
+        value_parser = clap::value_parser!(u16).range(0..=64),
+        requires = "setup_wslc"
+    )]
+    wslc_daemon_slots: Option<u16>,
 
     /// Run the fallback detector and emit JSON, without spawning a sandbox.
     #[arg(long)]
@@ -157,6 +173,7 @@ struct Cli {
             "setup_wslc",
             "image",
             "storage_path",
+            "wslc_daemon_slots",
             "probe",
             "force_reclaim",
             "operation",
@@ -1195,13 +1212,16 @@ fn main() {
     if cli.setup_wslc {
         #[cfg(feature = "wslc")]
         {
-            let image = match cli.image.as_deref() {
-                Some(s) if !s.is_empty() => s,
-                _ => {
-                    eprintln!("Error: --setup-wslc requires --image <name>");
-                    process::exit(1);
-                }
-            };
+            let images: Vec<&str> = cli
+                .image
+                .iter()
+                .map(String::as_str)
+                .filter(|name| !name.is_empty())
+                .collect();
+            if images.is_empty() {
+                eprintln!("Error: --setup-wslc requires --image <name>");
+                process::exit(1);
+            }
             let mut logger = Logger::new(if cli.debug {
                 Mode::Console
             } else {
@@ -1213,8 +1233,9 @@ fn main() {
             // `init_and_load_sdk`.
             let result = unsafe {
                 mxc_sdk::wslc_common::image::setup_pull_image(
-                    image,
+                    &images,
                     cli.storage_path.as_deref(),
+                    cli.wslc_daemon_slots.unwrap_or(0) as usize,
                     &mut logger,
                 )
             };

@@ -124,13 +124,24 @@ if (-not $ConfigDir) {
 
 # ---------------- Image pre-pull preflight ----------------
 
+# The daemon leases its store from the slot pool, not from
+# %TEMP%\mxc-wslc-sessions, and the fixtures below provision with the isolated
+# posture, which refuses a registry pull. Slot 0 is the one a daemon holding a
+# single session leases, so that is the store these images have to be in.
 if (-not $SkipSetup) {
     $SetupScript = Join-Path $RepoRoot "scripts\setup-wslc.ps1"
     if (Test-Path $SetupScript) {
         Write-Host "Pre-pulling WSLc images (pass -SkipSetup to skip)..." -ForegroundColor Cyan
-        & $SetupScript -WxcExecPath $WxcExec -Image @("alpine:latest", "python:3.12-alpine") -Force
+        & $SetupScript -WxcExecPath $WxcExec -Image @("alpine:latest", "python:3.12-alpine") -DaemonSlots 1 -Force
         if ($LASTEXITCODE -ne 0) {
-            Write-Host "WARN: setup-wslc.ps1 reported failures; continuing anyway." -ForegroundColor Yellow
+            # Continuing would leave slot 0 cold, and the isolated fixtures
+            # cannot pull, so every later provision fails for a reason that
+            # looks nothing like this preflight.
+            Write-Host "ERROR: setup-wslc.ps1 failed to warm daemon store slot 0." -ForegroundColor Red
+            Write-Host "  The lifecycle fixtures provision with the isolated posture, which refuses a" -ForegroundColor Yellow
+            Write-Host "  registry pull, so a cold slot fails every provision rather than pulling." -ForegroundColor Yellow
+            Write-Host "  Resolve the setup failure above, or pass -SkipSetup if slot 0 is already warm." -ForegroundColor Yellow
+            exit 1
         }
         Write-Host ""
     } else {
@@ -1856,6 +1867,42 @@ try {
     }
     if ($null -ne $script:ccSandboxB -and -not $ccBDeprovisionedOk) {
         try { $null = Invoke-StateAware -ConfigFile 'wslc_state_aware_deprovision.json' -SandboxId $script:ccSandboxB } catch { }
+    }
+}
+
+# ---------------- Lifecycle S: store isolation from create-and-run ----------------
+
+# A store's VHDX admits one live session, and the daemon used to default to the
+# create-and-run store, so this combination is what failed. Must stay ahead of
+# test H, which drives the daemon to exit.
+Run-StateAwareTest "S: create-and-run execution succeeds while a sandbox is live" {
+    $script:storeSandbox = Provision-Sandbox
+    Assert-True ($null -ne $script:storeSandbox) "provisioned a sandbox to hold the daemon's store"
+    if ($null -eq $script:storeSandbox) { return }
+
+    try {
+        Assert-True (Test-DaemonRunning) "the daemon is live and holding its store slot"
+
+        $oneShotConfig = Join-Path $RepoRoot "tests\examples\wslc_hello_world.json"
+        if (-not (Test-Path $oneShotConfig)) {
+            Assert-True $false "create-and-run fixture not found at $oneShotConfig"
+            return
+        }
+
+        $prevPref = $ErrorActionPreference
+        $ErrorActionPreference = "Continue"
+        $output = & $WxcExec --config $oneShotConfig 2>&1 | Out-String
+        $exitCode = $LASTEXITCODE
+        $ErrorActionPreference = $prevPref
+
+        Assert-True ($exitCode -eq 0) "create-and-run run exits 0 while a sandbox is provisioned"
+        Assert-True ($output -notmatch '0x80070020') `
+            "create-and-run run reports no sharing violation (got: $($output.Trim()))"
+        Assert-True ($output -match 'Hello from WSL Container') `
+            "create-and-run run produced its own output"
+    } finally {
+        $null = Invoke-StateAware -ConfigFile 'wslc_state_aware_deprovision.json' `
+            -SandboxId $script:storeSandbox
     }
 }
 

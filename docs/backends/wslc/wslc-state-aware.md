@@ -55,6 +55,7 @@ waits for the run, because deleting the container would free a handle the run is
 | Lifecycle backend | `src/mxc-sdk/src/backends/wslc/common/state_aware.rs` (`WslcStateAwareRunner`) | Translates runtime `WslcProvisionConfig` and shared policy fields into daemon protocol frames; implements `StatefulSandboxBackend` (`ID_PREFIX`/`BACKEND_KEY` = `wslc`). |
 | Policy support checks | `src/mxc-sdk/src/backends/wslc/common/policy.rs` | Per-phase validation of which policy fields are enforced or rejected. |
 | Daemon client | `src/mxc-sdk/src/backends/wslc/common/daemon_client.rs` | Discovers / spawns the daemon, connects the control pipe, sends `DaemonRequest` frames, reads responses; typed `DaemonError`. |
+| Store slot pool | `src/mxc-sdk/src/backends/wslc/common/store_slots.rs` | Owns the daemon's image stores: slot paths and leasing. See [Image store](#image-store). |
 | Daemon | `src/mxc-sdk/src/bin/wslc_daemon/` (`wxc-wslc-daemon.exe`) | Long-lived host process holding `WslcSession` / `WslcContainer`; worker thread drives the SDK; idle-timeout watchdog tears the session down when unused. |
 | Engine routing | `src/mxc-sdk/src/core/mxc_engine/state_aware.rs` | Selects the WSLc lifecycle backend (Windows + `wslc` feature). |
 | Prefix registration | `src/mxc-sdk/src/tools/mxc_common/state_aware_dispatch.rs` (`backend_from_prefix`) | Maps the `wslc:` id prefix back to the WSLc backend for post-provision phases. |
@@ -99,8 +100,10 @@ The field requires development contract `1.1.0-alpha`. Requests declaring
 `0.9.0-alpha` cannot include it and must select `1.1.0-alpha` explicitly.
 The daemon shares one session (VM) but creates a separate container for each
 provision, so a mapping applies only to the container that declared it, unlike
-the session-wide `cpuCount` / `memoryMb` / `gpu` / `storagePath` knobs that
-remain available only for create-and-run execution.
+the session-wide `cpuCount` / `memoryMb` / `gpu` knobs that
+remain available only for create-and-run execution. `storagePath` is not among them either way:
+the daemon leases its store from the slot pool rather than taking a caller-named
+path (see [Image store](#image-store)).
 
 The create-and-run `wslc.portMappings` list and `wslc.provision.portMappings` share
 one duplicate check, so two entries claiming the same `windowsPort` are
@@ -129,6 +132,80 @@ as `--container-id`; the dispatcher derives the backend from the `wslc:` prefix 
 | exec | `WslcCreateContainerProcess` in the warm container; stream stdout/stderr and return the process exit code. Stdin is unavailable because the WSLc SDK exposes no process-input API. A timeout or caller cancellation SIGKILLs the **process**, not the container. |
 | stop | `WslcStopContainer`. |
 | deprovision | `WslcDeleteContainer`; release the session + SDK when the last container is gone (daemon may then exit / idle-time out). |
+
+## Image store
+
+A WSLc store is a host directory handed to `WslcCreateSession`; the SDK creates
+`storage.vhdx` inside it and mounts that VHDX into the session's WSL2 utility
+VM, where it holds the session's pulled images. A warmed store runs to a couple
+of GiB.
+
+The daemon leases its store from a pool rather than taking a caller-named path:
+
+```text
+%LOCALAPPDATA%\mxc\wslc-store-slots\slot-0, slot-1, …
+```
+
+`%TEMP%\mxc\wslc-store-slots` is used instead when `%LOCALAPPDATA%` is
+unresolvable. A session leases the lowest free slot when it boots and returns it
+when it is released, so a daemon holding one session always runs on `slot-0`.
+Create-and-run execution keeps its own default of `%TEMP%\mxc-wslc-sessions` and
+never touches the pool.
+
+Both the daemon and the command that warms the pool resolve these variables from
+their own environment, so warm the pool as the user the daemon runs as. A
+refusal names the directory it needs filled, so a warm that reports success
+against a different directory has filled the wrong store.
+
+Separating the two is what lets both surfaces run at once. A store's VHDX admits
+one live session, so while the daemon held `%TEMP%\mxc-wslc-sessions` every
+create-and-run WSLc execution on the same host failed with
+`WslcListSessionImages failed: HRESULT 0x80070020` until the daemon idled out.
+
+The pool does not cap how many sessions a host may run, and a slot count would
+be the wrong control for that: a session carries its own cpu and memory, so the
+same count can mean very different host load. Admission belongs with the work
+that lets a caller request a second session.
+
+### Slot contents and disk
+
+A returned slot keeps its images — that is the point of leasing rather than
+minting. A slot that has never been leased holds nothing at all, and an uncached
+image under the isolated posture is refused before the VM is reached, so a cold
+slot fails a provision outright rather than pulling. Warm the pool with either:
+
+```powershell
+.\scripts\setup-wslc.ps1 -Image alpine:latest -DaemonSlots 1
+wxc-exec.exe --setup-wslc --image alpine:latest --wslc-daemon-slots 1
+```
+
+Both default to 0 and warm slots from 0 up, so `1` is what a daemon holding one
+session needs. Each store is opened once and filled with every image given, so
+pass them all to one invocation. See
+[the getting-started guide](wsl-container-getting-started.md#how-warming-works)
+for how warming works, and
+[Step 3](wsl-container-getting-started.md#step-3--container-images-optional-pre-pull)
+for the create-and-run store, which these do not replace.
+
+A slot directory is created when it is first leased, so an unused index costs
+nothing. Slots are identified by index and never repurposed, so nothing
+accumulates beyond the number of sessions the host has actually run at once.
+Reclaim the disk by deleting the pool directory while no daemon is running.
+
+### Store exclusivity
+
+The SDK does not report a store conflict at create time: `WslcCreateSession`
+against a store another live session holds returns a healthy-looking handle, and
+the violation appears only on first use. The daemon therefore probes the store
+itself immediately after create (`WslcListSessionImages`) and treats a failure
+as a *create* failure, so a conflict can never mint a sandbox id that dies at an
+arbitrary later phase.
+
+Lease tracking covers one process, so two sessions inside one daemon can never
+be handed the same slot. A holder outside that bookkeeping — typically a daemon
+from a previous build still inside its idle window — fails the provision with an
+error naming the slot, rather than relocating the session onto a cold slot and
+reporting a missing image instead.
 
 ### exec output semantics
 
@@ -303,7 +380,7 @@ it can observe idle-teardown within seconds.
 ## Testing
 
 `tests/scripts/run_wslc_state_aware_tests.ps1` is the multi-invocation E2E harness (requires a WSL2
-host that can reach a registry or already has the image cached, and `wxc-wslc-daemon.exe` staged next to `wxc-exec.exe`). It exercises
+host that can reach a registry or already has the image cached in daemon store slot 0, and `wxc-wslc-daemon.exe` staged next to `wxc-exec.exe`). It exercises
 core lifecycle, warm-reuse (a marker written by one `exec` is read back by a separate `exec`
 process — only possible if the container stayed warm), filesystem volumes, bridged networking +
 proxy, validation rejections, exec concurrency, and idle teardown. Fixtures live in

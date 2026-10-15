@@ -56,6 +56,10 @@ use crate::wslc_common::wslc_bindings::*;
 // Shared error helper
 // ---------------------------------------------------------------------------
 
+/// `ERROR_SHARING_VIOLATION`, which the SDK reports when a call reaches a store
+/// whose VHDX another live session already has mounted.
+const E_SHARING_VIOLATION: HRESULT = 0x8007_0020_u32 as HRESULT;
+
 /// Build a `ScriptResponse` error from an HRESULT failure with an optional
 /// SDK-provided message. Thin wrapper over [`WslcError::Sdk`], which owns the
 /// message formatting and the `LaunchFailed` phase attribution.
@@ -729,13 +733,106 @@ pub unsafe fn create_daemon_session(
         let msg = err_msg.to_string_lossy();
         return Err(sdk_error("WslcCreateSession failed", hr, &msg));
     }
-    let _ = writeln!(logger, "[WSLC][daemon] Session created");
 
-    Ok(WslcSessionGuard::from_raw(
+    let guard = WslcSessionGuard::from_raw(
         session,
         sdk.terminate_session_fn(),
         sdk.release_session_fn(),
-    ))
+    );
+    validate_store_access(sdk, guard.as_raw(), storage_path)?;
+
+    let _ = writeln!(
+        logger,
+        "[WSLC][daemon] Session created on store {storage_path}"
+    );
+
+    Ok(guard)
+}
+
+/// Confirm a session just created can reach the store it was given.
+///
+/// A store's VHDX admits one live session, and the SDK does not report a
+/// conflict at create time: `WslcCreateSession` against a held store returns a
+/// healthy-looking handle, and the violation appears on first use as
+/// `HRESULT 0x80070020`. Probing here turns that into a create failure, so a
+/// caller never mints a sandbox id against a session that would die at an
+/// arbitrary later phase.
+///
+/// # Safety
+/// `sdk` must hold valid function pointers and `session` must be a live handle.
+pub unsafe fn validate_store_access(
+    sdk: &WslcSdk,
+    session: WslcSession,
+    storage_path: &str,
+) -> Result<(), ScriptResponse> {
+    list_stored_images(sdk, session)
+        .map(|_| ())
+        .map_err(|hr| store_access_failure(hr, storage_path))
+}
+
+/// Render a failed store probe, telling a sharing violation apart from any
+/// other reason the store could not be read.
+fn store_access_failure(hr: HRESULT, storage_path: &str) -> ScriptResponse {
+    if hr == E_SHARING_VIOLATION {
+        sdk_error(
+            "WSLc store unavailable",
+            hr,
+            &format!(
+                "the image store at {storage_path} is already held by another live session. \
+                 A running wxc-wslc-daemon.exe releases it after its idle timeout; a \
+                 create-and-run execution releases it when the run ends"
+            ),
+        )
+    } else {
+        sdk_error(
+            "WslcListSessionImages failed",
+            hr,
+            &format!("could not read the image store at {storage_path}"),
+        )
+    }
+}
+
+/// One entry of a session's image store.
+pub(crate) struct StoredImage {
+    pub(crate) name: String,
+    pub(crate) sha256: [u8; 32],
+}
+
+/// Read a session's image store, preserving the `HRESULT` so a caller can tell
+/// a sharing violation from any other failure.
+///
+/// # Safety
+/// `sdk` must hold valid function pointers and `session` must be a live handle.
+pub(crate) unsafe fn list_stored_images(
+    sdk: &WslcSdk,
+    session: WslcSession,
+) -> Result<Vec<StoredImage>, HRESULT> {
+    let mut images: *mut WslcImageInfo = ptr::null_mut();
+    let mut count: u32 = 0;
+    let hr = sdk.WslcListSessionImages(session, &mut images, &mut count);
+    if hr != S_OK {
+        return Err(hr);
+    }
+    if images.is_null() {
+        return Ok(Vec::new());
+    }
+
+    let mut stored = Vec::with_capacity(count as usize);
+    for info in std::slice::from_raw_parts(images, count as usize) {
+        // `info.name` is a fixed-size, possibly-unterminated C buffer; read up
+        // to the first NUL, or the whole buffer if there is none.
+        let bytes = std::slice::from_raw_parts(info.name.as_ptr().cast::<u8>(), info.name.len());
+        let end = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
+        if let Ok(name) = std::str::from_utf8(&bytes[..end]) {
+            stored.push(StoredImage {
+                name: name.to_string(),
+                sha256: info.sha256,
+            });
+        }
+    }
+    windows::Win32::System::Com::CoTaskMemFree(Some(images as *const c_void));
+
+    Ok(stored)
 }
 
 /// Create a daemon-owned container with `keepalive` as its init process, so it
@@ -1219,6 +1316,44 @@ pub unsafe fn delete_daemon_container(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::mxc_common::models::FailurePhase;
+
+    #[test]
+    fn a_held_store_is_reported_as_held_rather_than_as_a_failed_call() {
+        let resp = store_access_failure(E_SHARING_VIOLATION, r"C:\slots\slot-0");
+
+        assert!(
+            resp.error_message
+                .contains("already held by another live session"),
+            "a sharing violation is the one store failure a caller can wait out: {}",
+            resp.error_message
+        );
+        assert!(resp.error_message.contains(r"C:\slots\slot-0"));
+        assert!(resp.error_message.contains("idle timeout"));
+        assert!(resp.error_message.contains("80070020"));
+    }
+
+    #[test]
+    fn any_other_store_failure_keeps_the_call_that_produced_it() {
+        let resp = store_access_failure(-2147467259, r"C:\slots\slot-0");
+
+        assert!(
+            resp.error_message.contains("WslcListSessionImages failed"),
+            "an unrecognised failure must not be attributed to another holder: {}",
+            resp.error_message
+        );
+        assert!(!resp.error_message.contains("already held"));
+        assert!(resp.error_message.contains(r"C:\slots\slot-0"));
+    }
+
+    #[test]
+    fn a_store_failure_is_attributed_to_bring_up() {
+        assert_eq!(
+            store_access_failure(E_SHARING_VIOLATION, "store").failure_phase,
+            FailurePhase::LaunchFailed,
+            "a held store frees up on its own, so this must not read as a rejection"
+        );
+    }
 
     #[test]
     fn cstr_bytes_nul_terminates_a_plain_value() {
