@@ -246,11 +246,6 @@ extern "C" {
 /// from inside the sandbox.
 const DEFAULT_SHELL: &str = "/bin/sh";
 
-/// Apple's sandbox launcher, used verbatim by the `open` launch path's helper
-/// script and treated as the backend's availability marker: a macOS install
-/// without it cannot provide Seatbelt at all.
-const SANDBOX_EXEC: &str = "/usr/bin/sandbox-exec";
-
 /// Markers bracketing the generated profile in the log stream, so a reader can
 /// slice it out. The `Seatbelt: ` prefix cannot collide with profile content:
 /// rules start with `(` and profile comments with `;;`.
@@ -333,10 +328,7 @@ impl SandboxBackend for SeatbeltScriptRunner {
             LaunchMethod::Exec => {
                 spawn_exec(&profile, request, gui_access, stdio, logger, proxy_address)
             }
-            LaunchMethod::Open => {
-                ensure_sandbox_exec_present()?;
-                spawn_open(&profile, request, stdio, logger, proxy_address)
-            }
+            LaunchMethod::Open => spawn_open(&profile, request, stdio, logger, proxy_address),
         }
     }
 }
@@ -1110,24 +1102,6 @@ fn launch_failed_response(message: String) -> ScriptResponse {
     }
 }
 
-/// Guards the `Open` launch path, which shells out to Apple's sandbox CLI, so
-/// a host missing it is reported as an unavailable backend rather than as a
-/// failed launch. `Exec` applies the profile through `sandbox_init` and does
-/// not need the CLI.
-fn ensure_sandbox_exec_present() -> Result<(), ScriptResponse> {
-    ensure_sandbox_exec_at(Path::new(SANDBOX_EXEC))
-}
-
-fn ensure_sandbox_exec_at(path: &Path) -> Result<(), ScriptResponse> {
-    if path.is_file() {
-        return Ok(());
-    }
-    Err(ScriptResponse::unavailable(&format!(
-        "Seatbelt is unavailable on this host: {} is missing",
-        path.display()
-    )))
-}
-
 /// The optional run timeout — `None` when `scriptTimeout` is 0 (wait forever).
 fn timeout_from(request: &ExecutionRequest) -> Option<Duration> {
     if request.script_timeout == 0 {
@@ -1248,7 +1222,7 @@ fn build_helper_script(
          cd '{cwd}' || {{ echo 'mxc: cannot enter working directory {cwd}' >&2; exit 1; }}\n\
          PWD='{cwd}'\n\
          export PWD\n\
-         exec {SANDBOX_EXEC} -f '{profile}' /bin/sh -c 'clear; {script}'\n",
+         exec /usr/bin/sandbox-exec -f '{profile}' /bin/sh -c 'clear; {script}'\n",
         profile = escape_single_quoted(profile_path),
         script = escape_single_quoted(script_code),
     )
@@ -1406,24 +1380,6 @@ mod tests {
         assert!(error.error_message.contains("caller-owned PTY"));
         assert_eq!(error.failure_phase, FailurePhase::Rejected);
         assert_eq!(error.exit_code, FailurePhase::Rejected.failure_exit_code());
-    }
-
-    #[test]
-    fn a_host_without_sandbox_exec_blames_the_host() {
-        let response = ensure_sandbox_exec_at(Path::new("/nonexistent/sandbox-exec"))
-            .expect_err("a missing sandbox-exec must be reported");
-        assert_eq!(response.failure_phase, FailurePhase::BackendUnavailable);
-        assert_eq!(
-            response.failure_phase.error_code(),
-            crate::mxc_common::mxc_error::MxcErrorCode::BackendUnavailable
-        );
-        assert_eq!(response.exit_code, -1);
-        assert!(response.error_message.contains("sandbox-exec"));
-    }
-
-    #[test]
-    fn the_sandbox_exec_check_passes_on_a_stock_macos_host() {
-        assert!(ensure_sandbox_exec_present().is_ok());
     }
 
     #[test]
