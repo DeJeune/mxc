@@ -26,6 +26,10 @@ IsolationSession-only. Seatbelt PTY rejects `guiAccess` and legacy
 caller explicit input, output, resize, and process ownership instead of
 attaching the workload to the host process's global console streams.
 
+Read the terminal output concurrently rather than only after `wait`. On macOS
+a workload cannot exit while its terminal output is still unread, so a caller
+that waits first without reading can block indefinitely.
+
 ## Discovery and validation
 
 | Operation | Use it to |

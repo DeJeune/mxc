@@ -24,6 +24,10 @@ rejects `guiAccess` and legacy `launchMethod: "open"`.
 Terminal handles give the caller explicit input, output, resize, and process
 ownership; there is no separate attached-console launch API or API accepting ["MXC request JSON"](../../../schema.md#mxc-request-json).
 
+Read the terminal output concurrently rather than only after waiting. On macOS
+a workload cannot exit while its terminal output is still unread, so a caller
+that waits first without reading can block indefinitely.
+
 ## Discovery and validation
 
 | Operation | Use it to |
