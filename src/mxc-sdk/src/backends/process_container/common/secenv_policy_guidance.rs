@@ -4,7 +4,9 @@
 //! Caller-owned revisions expressed in MXC request terms, not native capabilities.
 
 use crate::mxc_common::models::{CaptureDenialsMode, ContainerPolicy, NetworkAction};
-use crate::process_container_common::network_policy_helpers::network_policy_owns_capability;
+use crate::process_container_common::network_policy_helpers::{
+    capture_requests_internet_capability, network_policy_owns_capability,
+};
 
 use super::{RawPolicyDetail, ACTIONABLE, KNOWN_FLAGS, RESOURCE_COMPLETE, RESOURCE_UNAVAILABLE};
 
@@ -12,6 +14,7 @@ pub(super) fn request_guidance(
     detail: &RawPolicyDetail,
     resource: Option<&str>,
     policy: &ContainerPolicy,
+    capture_network_decisions: bool,
 ) -> Option<String> {
     if detail.flags & ACTIONABLE == 0 || detail.flags & !KNOWN_FLAGS != 0 {
         return None;
@@ -27,7 +30,7 @@ pub(super) fn request_guidance(
             if detail.flags & RESOURCE_COMPLETE == 0 || detail.flags & RESOURCE_UNAVAILABLE != 0 {
                 return None;
             }
-            capability_guidance(resource?, policy)
+            capability_guidance(resource?, policy, capture_network_decisions)
         }
         (2, 2 | 3, 2, 1, 1)
             if detail.requested_value <= 2
@@ -89,7 +92,11 @@ pub(super) fn request_guidance(
     }
 }
 
-fn capability_guidance(capability: &str, policy: &ContainerPolicy) -> Option<String> {
+fn capability_guidance(
+    capability: &str,
+    policy: &ContainerPolicy,
+    capture_network_decisions: bool,
+) -> Option<String> {
     let explicit = policy.capabilities.iter().any(|entry| {
         !network_policy_owns_capability(policy, entry)
             && entry
@@ -99,6 +106,13 @@ fn capability_guidance(capability: &str, policy: &ContainerPolicy) -> Option<Str
     let mut sources = Vec::new();
     let mut changes = Vec::new();
     if capability.eq_ignore_ascii_case("internetClient") {
+        if capture_requests_internet_capability(policy, capture_network_decisions) {
+            sources.push("processContainer.captureDenials (network-decision capture)");
+            changes.push(
+                "omit processContainer.captureDenials; recording network decisions requires \
+                 this capability even with network.egress.default='deny' and mode='block'",
+            );
+        }
         if let Some(egress) = &policy.network_egress {
             if egress.default == NetworkAction::Allow {
                 sources.push("network.egress.default='allow'");
@@ -221,7 +235,7 @@ mod tests {
     }
 
     fn guidance(resource: &str, policy: &ContainerPolicy) -> String {
-        request_guidance(&capability(), Some(resource), policy).unwrap()
+        request_guidance(&capability(), Some(resource), policy, false).unwrap()
     }
 
     #[test]
@@ -253,6 +267,58 @@ mod tests {
             assert!(!message.contains("remove the matching entry"));
             assert!(message.contains("synthesized"));
             assert!(message.contains("IT policy forbids"));
+        }
+    }
+
+    #[test]
+    fn network_capture_guidance_uses_actual_trace_sources_and_excludes_proxy_mode() {
+        for mode in [CaptureDenialsMode::Block, CaptureDenialsMode::Allow] {
+            let mut policy = ContainerPolicy {
+                capture_denials: Some(CaptureDenialsConfig {
+                    mode,
+                    ..Default::default()
+                }),
+                network_egress: Some(NetworkEgressPolicy::default()),
+                ..Default::default()
+            };
+            let message =
+                request_guidance(&capability(), Some("internetclient"), &policy, true).unwrap();
+            assert!(message.contains("processContainer.captureDenials (network-decision capture)"));
+            assert!(message.contains("omit processContainer.captureDenials"));
+            assert!(message.contains("even with network.egress.default='deny' and mode='block'"));
+            assert!(!message.contains("network.egress.allow"));
+            assert!(!message.contains("remove the matching entry"));
+            assert!(
+                request_guidance(&capability(), Some("internetclient"), &policy, false).is_none()
+            );
+            policy.network_proxy = ProxyConfig {
+                address: Some(ProxyAddress::new("127.0.0.1".into(), 8080)),
+            };
+            assert!(
+                request_guidance(&capability(), Some("internetclient"), &policy, true).is_none()
+            );
+        }
+    }
+
+    #[test]
+    fn network_capture_and_authored_egress_sources_must_all_be_narrowed() {
+        let policy = ContainerPolicy {
+            capture_denials: Some(Default::default()),
+            network_egress: Some(NetworkEgressPolicy {
+                default: NetworkAction::Allow,
+                allow: vec![NetworkRule::default()],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let message =
+            request_guidance(&capability(), Some("internetclient"), &policy, true).unwrap();
+        for source in [
+            "omit processContainer.captureDenials",
+            "set network.egress.default='deny'",
+            "remove the network.egress.allow rules",
+        ] {
+            assert!(message.contains(source), "{message}");
         }
     }
 
@@ -308,7 +374,7 @@ mod tests {
             };
             let mut detail = capability();
             detail.failure_class = class;
-            let message = request_guidance(&detail, Some(resource), &policy).unwrap();
+            let message = request_guidance(&detail, Some(resource), &policy, false).unwrap();
             assert!(
                 message.contains("remove the matching entry from processContainer.capabilities")
             );
@@ -329,7 +395,7 @@ mod tests {
             ..Default::default()
         };
         for resource in ["internetclient", "internetclientserver", "networkloopback"] {
-            assert!(request_guidance(&capability(), Some(resource), &policy).is_none());
+            assert!(request_guidance(&capability(), Some(resource), &policy, false).is_none());
         }
     }
 
@@ -374,6 +440,7 @@ mod tests {
             &capability(),
             Some("permissivelearningmode"),
             &ContainerPolicy::default(),
+            false,
         )
         .is_none());
     }
@@ -400,6 +467,7 @@ mod tests {
                 &detail,
                 Some("C:\\work\\sensitive"),
                 &ContainerPolicy::default(),
+                false,
             )
             .unwrap();
             assert!(message.contains(field));
@@ -424,7 +492,7 @@ mod tests {
             required_value: 1024,
             ..Default::default()
         };
-        let message = request_guidance(&detail, None, &ContainerPolicy::default()).unwrap();
+        let message = request_guidance(&detail, None, &ContainerPolicy::default(), false).unwrap();
         assert!(message.contains("from 1100 to at most 1024"));
         assert!(message.contains("filesystem.readwritePaths"));
         assert!(message.contains("filesystem.readonlyPaths"));
@@ -485,9 +553,9 @@ mod tests {
                 ..capability()
             },
         ] {
-            assert!(request_guidance(&detail, Some("internetclient"), &policy).is_none());
+            assert!(request_guidance(&detail, Some("internetclient"), &policy, false).is_none());
         }
-        assert!(request_guidance(&capability(), None, &policy).is_none());
-        assert!(request_guidance(&capability(), Some("unrelated"), &policy).is_none());
+        assert!(request_guidance(&capability(), None, &policy, false).is_none());
+        assert!(request_guidance(&capability(), Some("unrelated"), &policy, false).is_none());
     }
 }

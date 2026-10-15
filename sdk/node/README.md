@@ -36,8 +36,10 @@ creation error; successful creation and non-policy failures are not queried.
 
 Recognized details also identify the MXC request settings that supplied the
 permission, such as `network.egress.allow`, `network.ingress.hostLoopback`,
-`processContainer.capabilities`, or denial-capture mode. Use the corresponding
-V1 request properties to deliberately narrow the request; removing an explicit
+`processContainer.capabilities`, or denial capture. Network-decision capture can
+request `internetClient` even with deny-default egress and capture mode `block`.
+Use the corresponding V1 request properties to deliberately narrow the request;
+removing an explicit
 capability does not remove one synthesized by another setting. See the
 [backend guidance](../../docs/development/guides/process-container-adding-os-features.md#guidance-in-mxc-request-terms).
 

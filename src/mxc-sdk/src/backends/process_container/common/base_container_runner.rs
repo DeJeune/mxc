@@ -227,6 +227,7 @@ trait CaptureSessionFactory: Send + Sync {
         sandbox_specification: &[u8],
         flags: u32,
         policy: &ContainerPolicy,
+        capture_network_decisions: bool,
     ) -> Result<Box<dyn CaptureSessionOps>, CreationError>;
 }
 
@@ -244,9 +245,14 @@ impl CaptureSessionFactory for RealCaptureSessionFactory {
         sandbox_specification: &[u8],
         flags: u32,
         policy: &ContainerPolicy,
+        capture_network_decisions: bool,
     ) -> Result<Box<dyn CaptureSessionOps>, CreationError> {
-        let environment =
-            secenv::create_with_diagnostics(sandbox_specification, flags, Some(policy))?;
+        let environment = secenv::create_with_diagnostics(
+            sandbox_specification,
+            flags,
+            Some(policy),
+            capture_network_decisions,
+        )?;
         CaptureSession::begin_with_environment(environment)
             .map(|session| Box::new(session) as Box<dyn CaptureSessionOps>)
             .map_err(Into::into)
@@ -320,7 +326,7 @@ impl BaseContainerRunner {
         request: &ExecutionRequest,
         version: SecurityEnvironmentVersion,
         supports_network_ingress: bool,
-    ) -> Result<Vec<u8>, ScriptResponse> {
+    ) -> Result<(Vec<u8>, bool), ScriptResponse> {
         let capture_network_decisions = match request.policy.capture_denials.as_ref() {
             Some(_) => self
                 .capture_factory
@@ -333,10 +339,13 @@ impl BaseContainerRunner {
                 .includes_network(),
             None => false,
         };
-        Ok(build_psec_v1_security_environment_spec(
-            request,
-            version,
-            supports_network_ingress,
+        Ok((
+            build_psec_v1_security_environment_spec(
+                request,
+                version,
+                supports_network_ingress,
+                capture_network_decisions,
+            ),
             capture_network_decisions,
         ))
     }
@@ -591,7 +600,7 @@ impl BaseContainerRunner {
 
         let supports_network_ingress = psec_version >= SecurityEnvironmentVersion::V1_1
             && secenv::query_support(SecurityEnvironmentSupport::NetworkIngress);
-        let process_security_environment_spec = self
+        let (process_security_environment_spec, capture_network_decisions) = self
             .build_capture_aware_security_environment_spec(
                 request,
                 psec_version,
@@ -834,6 +843,7 @@ impl BaseContainerRunner {
                     psec_spec,
                     PROCESS_SECURITY_ENVIRONMENT_FLAG_NONE,
                     &request.policy,
+                    capture_network_decisions,
                 ) {
                     Ok(session) => {
                         let _ = writeln!(
@@ -871,6 +881,7 @@ impl BaseContainerRunner {
                     psec_spec,
                     PROCESS_SECURITY_ENVIRONMENT_FLAG_NONE,
                     Some(&request.policy),
+                    capture_network_decisions,
                 );
                 match result {
                     Ok(environment) => {
@@ -2311,6 +2322,7 @@ mod tests {
             _sandbox_specification: &[u8],
             _flags: u32,
             _policy: &ContainerPolicy,
+            _capture_network_decisions: bool,
         ) -> Result<Box<dyn CaptureSessionOps>, CreationError> {
             self.begin_calls.fetch_add(1, Ordering::SeqCst);
             if let Some((function, code)) = self.begin_error {
@@ -2346,6 +2358,7 @@ mod tests {
                     version >= SecurityEnvironmentVersion::V1_1,
                 )
                 .unwrap()
+                .0
         }
     }
 
@@ -2747,6 +2760,7 @@ mod tests {
             &[],
             PROCESS_SECURITY_ENVIRONMENT_FLAG_NONE,
             &ContainerPolicy::default(),
+            false,
         ) {
             Ok(_) => panic!("fake begin must fail"),
             Err(error) => error,
@@ -2776,6 +2790,7 @@ mod tests {
                 &[],
                 PROCESS_SECURITY_ENVIRONMENT_FLAG_NONE,
                 &ContainerPolicy::default(),
+                false,
             )
             .expect("fake begin");
 
@@ -3051,7 +3066,7 @@ mod tests {
                 finish_calls: Arc::new(AtomicUsize::new(0)),
             });
             let runner = BaseContainerRunner::with_capture_factory(factory);
-            let bytes = runner
+            let (bytes, capture_network_decisions) = runner
                 .build_capture_aware_security_environment_spec(
                     &request,
                     SecurityEnvironmentVersion::V1_0,
@@ -3061,6 +3076,10 @@ mod tests {
             let spec = psec_layout::root_as_process_security_environment(&bytes).unwrap();
 
             assert_eq!(spec.capabilities(), expected_capabilities);
+            assert_eq!(
+                capture_network_decisions,
+                capture_enabled && trace_sources.includes_network()
+            );
             let egress = spec.network_policy().unwrap().egress().unwrap();
             assert_eq!(egress.default_action(), psec_layout::FilterAction::deny);
             assert!(egress.allow().is_none());

@@ -630,8 +630,15 @@ impl SecurityEnvironmentApi {
         specification: &[u8],
         flags: u32,
         policy: Option<&ContainerPolicy>,
+        capture_network_decisions: bool,
     ) -> Result<ProcessSecurityEnvironment, CreationError> {
-        self.create_internal(specification, flags, self.get_last_policy_result, policy)
+        self.create_internal(
+            specification,
+            flags,
+            self.get_last_policy_result,
+            policy,
+            capture_network_decisions,
+        )
     }
 
     /// Create a process security environment from a PSEC FlatBuffer
@@ -644,7 +651,7 @@ impl SecurityEnvironmentApi {
         sandbox_specification: &[u8],
         flags: u32,
     ) -> Result<ProcessSecurityEnvironment, LearningModeError> {
-        self.create_internal(sandbox_specification, flags, None, None)
+        self.create_internal(sandbox_specification, flags, None, None, false)
             .map_err(|error| error.cause)
     }
 
@@ -654,6 +661,7 @@ impl SecurityEnvironmentApi {
         flags: u32,
         get_last_policy_result: Option<PfnGetLastProcessSecurityEnvironmentPolicyResult>,
         policy: Option<&ContainerPolicy>,
+        capture_network_decisions: bool,
     ) -> Result<ProcessSecurityEnvironment, CreationError> {
         let mut env = HANDLE(ptr::null_mut());
         let spec_len = u32::try_from(sandbox_specification.len()).map_err(|_| {
@@ -688,7 +696,11 @@ impl SecurityEnvironmentApi {
                 if let Some(get_result) = get_last_policy_result {
                     // The snapshot belongs to this native thread. Retrieve it before
                     // logging, callbacks, another CPSE call, or environment cleanup.
-                    error.diagnostic = Some(policy_failure_diagnostic(get_result, policy));
+                    error.diagnostic = Some(policy_failure_diagnostic(
+                        get_result,
+                        policy,
+                        capture_network_decisions,
+                    ));
                 }
             }
             return Err(error);
@@ -705,6 +717,7 @@ impl SecurityEnvironmentApi {
 fn policy_failure_diagnostic(
     get_result: PfnGetLastProcessSecurityEnvironmentPolicyResult,
     policy: Option<&ContainerPolicy>,
+    capture_network_decisions: bool,
 ) -> String {
     let mut details = vec![RawPolicyDetail::default(); MAX_DETAILS];
     let mut storage = vec![0u16; MAX_RESOURCE_CHARS];
@@ -726,7 +739,7 @@ fn policy_failure_diagnostic(
         };
         return format!("Creation-policy diagnostics unavailable: {reason}{error}.");
     }
-    result.diagnostic(&details, &storage, policy)
+    result.diagnostic(&details, &storage, policy, capture_network_decisions)
 }
 
 /// Whether the process security-environment API supports `capability`.
@@ -767,8 +780,14 @@ pub(crate) fn create_with_diagnostics(
     specification: &[u8],
     flags: u32,
     policy: Option<&ContainerPolicy>,
+    capture_network_decisions: bool,
 ) -> Result<ProcessSecurityEnvironment, CreationError> {
-    SecurityEnvironmentApi::load()?.create_with_diagnostics(specification, flags, policy)
+    SecurityEnvironmentApi::load()?.create_with_diagnostics(
+        specification,
+        flags,
+        policy,
+        capture_network_decisions,
+    )
 }
 
 fn query_supported_minor_version_with(

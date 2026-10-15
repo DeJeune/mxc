@@ -31,6 +31,8 @@ not a stable parsing API. See the
 Recognized details also explain which MXC configuration settings requested the
 permission. Use their corresponding typed V1 request properties to narrow the
 call, including network or capture settings that synthesize capabilities.
+Direct-mode network-decision capture can request `internetClient` even with
+deny-default egress and capture mode `block`.
 Unknown/incomplete details do not become guessed edits; filesystem suggestions
 preserve deny/read-only exceptions. See
 [request guidance](../../docs/development/guides/process-container-adding-os-features.md#guidance-in-mxc-request-terms).

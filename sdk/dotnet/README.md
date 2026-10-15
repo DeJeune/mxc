@@ -27,7 +27,9 @@ is not a supported parsing contract. See
 [detailed policy errors](../../docs/development/guides/process-container-adding-os-features.md#detailed-policy-errors).
 
 Recognized details name the MXC configuration settings that supplied the
-permission, including synthesized network capabilities and permissive capture.
+permission, including synthesized network capabilities and capture. Direct-mode
+network-decision capture can request `internetClient` even with deny-default
+egress and capture mode `block`.
 Revise the corresponding typed V1 request properties rather than only removing
 a capability-list entry. Unknown or incomplete details do not supply guessed
 edits. See

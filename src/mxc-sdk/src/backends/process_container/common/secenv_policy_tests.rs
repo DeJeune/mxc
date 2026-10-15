@@ -256,7 +256,7 @@ fn reports_each_action_from_the_failed_creation_on_the_same_thread() {
     let api = reset();
     let specification = b"unchanged PSEC specification";
     let error = api
-        .create_with_diagnostics(specification, 7, None)
+        .create_with_diagnostics(specification, 7, None, false)
         .unwrap_err();
     let message = error.message(false);
     assert!(message.starts_with("failed to create the process security environment:"));
@@ -285,7 +285,9 @@ fn getter_export_is_optional_and_legacy_denial_text_is_unchanged_when_absent() {
         b"GetLastProcessSecurityEnvironmentPolicyResult"
     );
     api.get_last_policy_result = None;
-    let error = api.create_with_diagnostics(b"spec", 0, None).unwrap_err();
+    let error = api
+        .create_with_diagnostics(b"spec", 0, None, false)
+        .unwrap_err();
     assert_eq!(calls(), ["create"]);
     for capture in [false, true] {
         assert_eq!(
@@ -304,7 +306,9 @@ fn diagnostic_retrieval_never_requires_a_support_query() {
             state.support = support;
             state.support_result = E_FAIL;
         });
-        let error = api.create_with_diagnostics(b"spec", 0, None).unwrap_err();
+        let error = api
+            .create_with_diagnostics(b"spec", 0, None, false)
+            .unwrap_err();
         assert!(error.message(false).contains("blocked (1)"));
         assert_eq!(calls(), ["create", "get_policy_result"]);
     }
@@ -313,7 +317,9 @@ fn diagnostic_retrieval_never_requires_a_support_query() {
 #[test]
 fn retrieval_supplies_the_exact_native_v1_header_and_maximum_capacities() {
     let api = reset();
-    let error = api.create_with_diagnostics(b"spec", 0, None).unwrap_err();
+    let error = api
+        .create_with_diagnostics(b"spec", 0, None, false)
+        .unwrap_err();
     assert!(
         matches!(error.cause, LearningModeError::HResultCall { code, .. } if code == POLICY_DENIED.0)
     );
@@ -335,7 +341,9 @@ fn successful_creation_does_not_retrieve_a_policy_snapshot() {
         state.creation_handle = true;
         state.retrieval_result = E_FAIL;
     });
-    let environment = api.create_with_diagnostics(b"spec", 0, None).unwrap();
+    let environment = api
+        .create_with_diagnostics(b"spec", 0, None, false)
+        .unwrap();
     assert_eq!(calls(), ["create"]);
     STATE.with(|state| assert!(state.borrow().snapshot.is_none()));
     assert_eq!(closes(), 0);
@@ -358,7 +366,9 @@ fn non_policy_failures_never_read_a_snapshot_or_change_the_original_error() {
             state.snapshot = Some((1, 2));
             state.creation_result = status;
         });
-        let error = api.create_with_diagnostics(b"spec", 0, None).unwrap_err();
+        let error = api
+            .create_with_diagnostics(b"spec", 0, None, false)
+            .unwrap_err();
         let expected = if status.is_ok() { E_UNEXPECTED } else { status };
         assert!(matches!(error.cause, LearningModeError::HResultCall {
             function: "CreateProcessSecurityEnvironment", code,
@@ -375,7 +385,9 @@ fn retrieval_failures_cannot_mask_the_original_policy_denial_or_trigger_a_retry(
     for status in [NO_SNAPSHOT, SHORT_BUFFER, E_FAIL, E_NOTIMPL, E_INVALIDARG] {
         let api = reset();
         STATE.with(|state| state.borrow_mut().retrieval_result = status);
-        let error = api.create_with_diagnostics(b"spec", 0, None).unwrap_err();
+        let error = api
+            .create_with_diagnostics(b"spec", 0, None, false)
+            .unwrap_err();
         let message = error.message(true);
         assert!(matches!(error.cause, LearningModeError::HResultCall {
             function: "CreateProcessSecurityEnvironment", code,
@@ -396,7 +408,9 @@ fn retrieval_failures_cannot_mask_the_original_policy_denial_or_trigger_a_retry(
 fn best_effort_snapshot_absence_is_explicit_without_inventing_a_verdict() {
     let api = reset();
     STATE.with(|state| state.borrow_mut().capture_snapshot = false);
-    let error = api.create_with_diagnostics(b"spec", 0, None).unwrap_err();
+    let error = api
+        .create_with_diagnostics(b"spec", 0, None, false)
+        .unwrap_err();
     assert!(error
         .message(false)
         .contains("No cached policy diagnostic is available."));
@@ -415,7 +429,9 @@ fn blocked_and_evaluation_failed_use_the_refusal_only_contract() {
             state.outcome = outcome;
             state.details_count = 0;
         });
-        let error = api.create_with_diagnostics(b"spec", 0, None).unwrap_err();
+        let error = api
+            .create_with_diagnostics(b"spec", 0, None, false)
+            .unwrap_err();
         let message = error.message(false);
         assert!(message.contains(&format!(
             "Windows creation-policy outcome: {name} ({outcome})."
@@ -435,7 +451,9 @@ fn malformed_retrieval_does_not_change_the_denial_or_retry_creation() {
             state.invalid_header = header;
             state.invalid_pool = !header;
         });
-        let error = api.create_with_diagnostics(b"spec", 0, None).unwrap_err();
+        let error = api
+            .create_with_diagnostics(b"spec", 0, None, false)
+            .unwrap_err();
         let message = error.message(false);
         assert!(message.contains("0x800704EC"));
         assert!(message.contains("diagnostics unavailable"));
@@ -448,7 +466,9 @@ fn malformed_retrieval_does_not_change_the_denial_or_retry_creation() {
 fn refusal_snapshot_is_copied_before_unexpected_handle_cleanup() {
     let api = reset();
     STATE.with(|state| state.borrow_mut().creation_handle = true);
-    let error = api.create_with_diagnostics(b"spec", 0, None).unwrap_err();
+    let error = api
+        .create_with_diagnostics(b"spec", 0, None, false)
+        .unwrap_err();
     assert!(error.message(false).contains("Resource 2: \"C:\\\\two\""));
     assert_eq!(calls(), ["create", "get_policy_result", "close"]);
     assert_eq!(closes(), 1);
@@ -463,7 +483,9 @@ fn failed_non_policy_creation_closes_unexpected_handles_without_retrieval() {
         state.creation_result = E_FAIL;
         state.creation_handle = true;
     });
-    let error = api.create_with_diagnostics(b"spec", 0, None).unwrap_err();
+    let error = api
+        .create_with_diagnostics(b"spec", 0, None, false)
+        .unwrap_err();
     assert!(matches!(error.cause, LearningModeError::HResultCall { code, .. } if code == E_FAIL.0));
     assert_eq!(calls(), ["create", "close"]);
     assert_eq!(closes(), 1);
@@ -473,7 +495,9 @@ fn failed_non_policy_creation_closes_unexpected_handles_without_retrieval() {
 fn successful_hresult_without_an_environment_is_not_a_policy_refusal() {
     let api = reset();
     STATE.with(|state| state.borrow_mut().creation_result = S_OK);
-    let error = api.create_with_diagnostics(b"spec", 0, None).unwrap_err();
+    let error = api
+        .create_with_diagnostics(b"spec", 0, None, false)
+        .unwrap_err();
     assert!(
         matches!(error.cause, LearningModeError::HResultCall { code, .. } if code == E_UNEXPECTED.0)
     );
@@ -484,13 +508,18 @@ fn successful_hresult_without_an_environment_is_not_a_policy_refusal() {
 #[test]
 fn retrieved_text_is_owned_before_another_creation_clears_the_snapshot() {
     let api = reset();
-    let error = api.create_with_diagnostics(b"denied", 0, None).unwrap_err();
+    let error = api
+        .create_with_diagnostics(b"denied", 0, None, false)
+        .unwrap_err();
     STATE.with(|state| {
         let mut state = state.borrow_mut();
         state.creation_result = S_OK;
         state.creation_handle = true;
     });
-    drop(api.create_with_diagnostics(b"allowed", 0, None).unwrap());
+    drop(
+        api.create_with_diagnostics(b"allowed", 0, None, false)
+            .unwrap(),
+    );
     assert!(error.message(false).contains("Resource 1: \"C:\\\\one\""));
     assert_eq!(calls(), ["create", "get_policy_result", "create", "close"]);
 }
@@ -515,7 +544,7 @@ fn request_guidance_is_owned_and_does_not_mutate_the_request() {
     };
     let original = serde_json::to_value(&policy).unwrap();
     let error = api
-        .create_with_diagnostics(b"unchanged spec", 0, Some(&policy))
+        .create_with_diagnostics(b"unchanged spec", 0, Some(&policy), false)
         .unwrap_err();
     assert_eq!(serde_json::to_value(&policy).unwrap(), original);
     policy.network_egress = None;
@@ -528,16 +557,55 @@ fn request_guidance_is_owned_and_does_not_mutate_the_request() {
 }
 
 #[test]
+fn network_capture_provenance_reaches_owned_creation_errors_without_retry() {
+    use crate::mxc_common::models::{ContainerPolicy, NetworkEgressPolicy};
+
+    for capture_network_decisions in [false, true] {
+        let api = reset();
+        STATE.with(|state| {
+            let mut state = state.borrow_mut();
+            state.capability = Some("internetclient".into());
+            state.details_count = 1;
+            state.creation_handle = true;
+        });
+        let mut policy = ContainerPolicy {
+            capture_denials: Some(Default::default()),
+            network_egress: Some(NetworkEgressPolicy::default()),
+            ..Default::default()
+        };
+        let original = serde_json::to_value(&policy).unwrap();
+        let error = api
+            .create_with_diagnostics(
+                b"unchanged spec",
+                0,
+                Some(&policy),
+                capture_network_decisions,
+            )
+            .unwrap_err();
+        assert_eq!(serde_json::to_value(&policy).unwrap(), original);
+        policy.capture_denials = None;
+        let message = error.message(true);
+        assert_eq!(
+            message.contains("processContainer.captureDenials (network-decision capture)"),
+            capture_network_decisions
+        );
+        assert!(message.contains("0x800704EC"));
+        assert_eq!(calls(), ["create", "get_policy_result", "close"]);
+        assert_eq!(closes(), 1);
+    }
+}
+
+#[test]
 fn snapshots_are_thread_local_and_retrieval_does_not_consume_them() {
     let api = reset();
     api.create(b"main refusal", 0).unwrap_err();
     std::thread::spawn(move || {
-        assert!(policy_failure_diagnostic(get_policy_result, None)
+        assert!(policy_failure_diagnostic(get_policy_result, None, false)
             .contains("No cached policy diagnostic"));
         let api = reset();
         STATE.with(|state| state.borrow_mut().outcome = 2);
         let error = api
-            .create_with_diagnostics(b"worker refusal", 0, None)
+            .create_with_diagnostics(b"worker refusal", 0, None, false)
             .unwrap_err();
         assert!(error.message(false).contains("evaluationFailed (2)"));
         STATE
@@ -545,8 +613,8 @@ fn snapshots_are_thread_local_and_retrieval_does_not_consume_them() {
     })
     .join()
     .unwrap();
-    let first = policy_failure_diagnostic(get_policy_result, None);
-    let second = policy_failure_diagnostic(get_policy_result, None);
+    let first = policy_failure_diagnostic(get_policy_result, None, false);
+    let second = policy_failure_diagnostic(get_policy_result, None, false);
     assert_eq!(first, second);
     assert!(first.contains("blocked (1)"));
     assert_eq!(

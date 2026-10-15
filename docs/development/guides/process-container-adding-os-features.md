@@ -101,7 +101,7 @@ the request.
 
 | Native constraint | MXC guidance |
 |---|---|
-| Remove `internetClient` | Set `network.egress.default` to `deny` and remove the `network.egress.allow` rules that request egress. If only the default or only rules enabled it, the message identifies that source. |
+| Remove `internetClient` | Set `network.egress.default` to `deny` and remove the `network.egress.allow` rules that request egress. When native denial capture records network decisions, also omit `processContainer.captureDenials`: direct-mode capture requests this capability even with deny-default egress and capture mode `block`. The message identifies the effective sources. |
 | Remove `privateNetworkClientServer` | Set `network.ingress.default` to `deny`. A configured ProcessContainer proxy requires this capability, so also omit `runtimeConfig.networkProxy` and its `processContainer.network.allowedProxyPeer` setting rather than leaving an invalid proxy request. |
 | Remove `networkLoopback` | Set `network.ingress.hostLoopback` to `deny`, even when the OS synthesized the capability from native ingress rather than MXC listing it explicitly. An identity-less proxy needs host-loopback access; omit it or deliberately choose a supported identity-scoped deployment. |
 | Remove an explicitly requested capability | Remove the matching `processContainer.capabilities` entry when it remains effective. Supported request parsing supplies deny-default directional network policy even when `network` is omitted; PSEC construction filters its owned network-capability entries. MXC does not attribute those filtered entries as sources. |
@@ -114,6 +114,9 @@ the field paths in the message are MXC configuration paths. Multiple settings
 can request the same capability: changing only an explicit list entry may not
 remove the effective permission. Narrower network destinations or a proxy do
 not make a policy-forbidden network capability acceptable.
+Capture attribution uses the trace sources selected when MXC built the PSEC
+request. Legacy access-only capture and proxy capture do not synthesize this
+extra internet capability, so they do not receive that revision advice.
 
 Unknown outcomes, flags, codes, contradictory values, unavailable/invalid
 resource text, or a permission with no known request source do not produce a
@@ -153,21 +156,30 @@ an authenticated source for automated decisions.
 
 #### Validation scope
 
-On October 10, 2026, the matching native x64 test VM passed 62 CLI, Node and
-.NET cases plus 11 direct native snapshot checks. The matrix covered effective
-capability sources, proxy dependencies, permissive capture, restrictive
-filesystem revisions, path-count limits, default denial and caller-authored
-compliant requests. Managed `Run`, `RunAsync`, `Spawn` and `SpawnAsync`, and
-Node `run` and `spawn`, retained the original refusal and MXC guidance.
-The native probe verified the 48-byte detail layout, same-thread ownership,
-non-consuming retrieval, short-buffer behavior and snapshot clearing.
+After rebasing onto upstream `525d0f25`, validation on October 15, 2026 passed
+70 CLI, Node and .NET cases plus 11 direct native snapshot checks on
+`ge-uxip-261014-Desktop`. Requests used the stable `1.0.0` contract and typed
+V1 SDK APIs. Coverage includes the internet capability synthesized by
+network-decision capture, other effective capability sources, proxy
+dependencies, permissive capture, restrictive filesystem revisions, path-count
+limits, default denial and caller-authored compliant requests.
+Managed `Run`, `RunAsync`, `Spawn` and `SpawnAsync`, and Node `run` and `spawn`,
+retained the original refusal and MXC guidance. The native probe verified the
+48-byte detail layout, same-thread ownership, non-consuming retrieval,
+short-buffer behavior and snapshot clearing.
 
-The SDK streaming checks used supported Node 24.21.0 without replacing the
-system runtime. Administrative policy and owned workloads were restored;
-the supplied OS and policy-tool binaries were not changed. This is x64
-runtime evidence only, not x86, ARM64, non-Windows or interactive UI coverage.
-Focused local tests additionally cover unknown/malformed details and bounded,
-escaped diagnostic text.
+The VM's existing Node 26.8.1 was used. Administrative policy and owned workloads
+were restored; the OS, policy tools and runtimes were not replaced. Runtime
+evidence is x64 only, not x86, ARM64, non-Windows or interactive UI coverage.
+Focused local checks passed 194 Rust SDK, one FFI, 131 Node and five .NET tests,
+plus formatting, Clippy and native builds.
+
+A separate upstream native proxy host-to-container ingress test timed out
+with socket error 10060 on both the rebased basic-error baseline and the
+diagnostics build, on the local host and this VM. It is retained as a failed
+broader networking check, not counted as a pass; this update does not change
+that proxy implementation. The successful matrix above validates creation
+refusals and their feedback, not positive proxy-ingress reachability.
 
 ## Step-by-step
 

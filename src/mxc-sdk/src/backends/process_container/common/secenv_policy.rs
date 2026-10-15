@@ -102,6 +102,7 @@ impl RawPolicyResult {
         details: &[RawPolicyDetail],
         storage: &[u16],
         policy: Option<&ContainerPolicy>,
+        capture_network_decisions: bool,
     ) -> String {
         if let Err(error) = self.validate_details(details) {
             return format!("Creation-policy diagnostics unavailable: {error}.");
@@ -178,9 +179,12 @@ impl RawPolicyResult {
                 if let Some(policy) = policy {
                     let resource = pool.and_then(|pool| detail.resource_text(pool));
                     if let Ok(resource) = resource {
-                        if let Some(guidance) =
-                            guidance::request_guidance(detail, resource.as_deref(), policy)
-                        {
+                        if let Some(guidance) = guidance::request_guidance(
+                            detail,
+                            resource.as_deref(),
+                            policy,
+                            capture_network_decisions,
+                        ) {
                             let _ = writeln!(message, "   {guidance}");
                         }
                     }
@@ -359,7 +363,7 @@ mod tests {
             let mut result = RawPolicyResult::new(&mut details, &mut storage);
             result.outcome = outcome as u32;
             assert!(result
-                .diagnostic(&details, &storage, None)
+                .diagnostic(&details, &storage, None, false)
                 .contains(&format!(
                     "Windows creation-policy outcome: {name} ({outcome})."
                 )));
@@ -416,7 +420,7 @@ mod tests {
                 result.outcome = 1;
                 result.details_count = 1;
                 assert!(result
-                    .diagnostic(&details, &storage, None)
+                    .diagnostic(&details, &storage, None, false)
                     .contains(&format!("{field}={name} ({code})")));
             }
         }
@@ -434,7 +438,7 @@ mod tests {
             let mut result = RawPolicyResult::new(&mut details, &mut storage);
             result.outcome = 1;
             result.details_count = 1;
-            let message = result.diagnostic(&details, &storage, None);
+            let message = result.diagnostic(&details, &storage, None, false);
             assert_eq!(
                 message.contains("The OS did not mark this detail actionable."),
                 flags & 1 == 0
@@ -491,7 +495,7 @@ mod tests {
         result.details_count = 2;
         result.resource_chars_written = 10;
         result.resource_chars_required = 10;
-        let message = result.diagnostic(&details, &storage, None);
+        let message = result.diagnostic(&details, &storage, None, false);
         details.fill(RawPolicyDetail::default());
         storage.fill(0);
         assert!(message.contains("blocked (1)"));
@@ -521,7 +525,7 @@ mod tests {
         let mut result = RawPolicyResult::new(&mut details, &mut storage);
         result.outcome = 995;
         result.details_count = 1;
-        let message = result.diagnostic(&details, &storage, None);
+        let message = result.diagnostic(&details, &storage, None, false);
         for expected in [
             "unrecognized (995)",
             "unrecognized (999)",
@@ -553,7 +557,7 @@ mod tests {
         let mut result = RawPolicyResult::new(&mut details, &mut storage);
         result.outcome = 1;
         result.details_count = 1;
-        let message = result.diagnostic(&details, &storage, None);
+        let message = result.diagnostic(&details, &storage, None, false);
         assert!(
             message.contains(
                 "action=reducePathCount (3); resourceKind=none (0) (resource 1); \
@@ -574,27 +578,27 @@ mod tests {
         result.outcome = 1;
         result.details_count = 2;
         assert!(result
-            .diagnostic(&details, &storage, None)
+            .diagnostic(&details, &storage, None, false)
             .starts_with("Creation-policy diagnostics unavailable"));
         result.details_count = 1;
         result.details = std::ptr::null_mut();
         assert!(result
-            .diagnostic(&details, &storage, None)
+            .diagnostic(&details, &storage, None, false)
             .contains("detail storage"));
         result.details = details.as_mut_ptr();
         result.details_capacity = 0;
         assert!(result
-            .diagnostic(&details, &storage, None)
+            .diagnostic(&details, &storage, None, false)
             .contains("detail storage"));
         result.details_capacity = 1;
         result.size -= 1;
         assert!(result
-            .diagnostic(&details, &storage, None)
+            .diagnostic(&details, &storage, None, false)
             .contains("header or version"));
         result.size += 1;
         result.version = 99;
         assert!(result
-            .diagnostic(&details, &storage, None)
+            .diagnostic(&details, &storage, None, false)
             .contains("header or version"));
     }
 
@@ -610,14 +614,14 @@ mod tests {
         result.details_count = 1;
         result.resource_chars_written = 2;
         result.resource_chars_required = MAX_RESOURCE_CHARS as u32 + 1;
-        let message = result.diagnostic(&details, &storage, None);
+        let message = result.diagnostic(&details, &storage, None, false);
         assert!(message.contains("action=restrictFilesystemAccess (2)"));
         assert!(message.contains("Resource diagnostics unavailable"));
         assert!(!message.contains("\"A\""));
         result.resource_chars_required = 2;
         result.resource_buffer = std::ptr::null_mut();
         assert!(!result
-            .diagnostic(&details, &storage, None)
+            .diagnostic(&details, &storage, None, false)
             .contains("\"A\""));
     }
 
@@ -699,7 +703,7 @@ mod tests {
         result.details_count = MAX_DETAILS as u32;
         result.resource_chars_written = MAX_RESOURCE_CHARS as u32;
         result.resource_chars_required = MAX_RESOURCE_CHARS as u32;
-        let message = result.diagnostic(&details, &storage, None);
+        let message = result.diagnostic(&details, &storage, None, false);
         assert!(message.len() <= 256 * 1024, "{}", message.len());
         assert!(message.len() > 256 * 1024 - 128);
         assert_eq!(
@@ -726,7 +730,7 @@ mod tests {
             (999, "unrecognized"),
         ] {
             result.outcome = outcome;
-            let message = result.diagnostic(&details, &storage, None);
+            let message = result.diagnostic(&details, &storage, None, false);
             assert!(message.contains(name));
             assert!(message.contains("No caller-action details"));
             assert!(!message.contains("action=restrict"));
@@ -734,7 +738,7 @@ mod tests {
         result.outcome = 999;
         result.details_count = 1;
         assert!(result
-            .diagnostic(&details, &storage, None)
+            .diagnostic(&details, &storage, None, false)
             .contains("No recognized policy-refusal outcome"));
     }
 
@@ -749,12 +753,12 @@ mod tests {
         for written in [0, 1, 3, 5] {
             result.resource_chars_written = written;
             assert!(result
-                .diagnostic(&details, &storage, None)
+                .diagnostic(&details, &storage, None, false)
                 .contains("Resource diagnostics unavailable"));
         }
         result.resource_chars_written = 4;
         assert!(!result
-            .diagnostic(&details, &storage, None)
+            .diagnostic(&details, &storage, None, false)
             .contains("Resource diagnostics unavailable"));
     }
 
@@ -781,16 +785,16 @@ mod tests {
         for outcome in [0, 99] {
             result.outcome = outcome;
             assert!(!result
-                .diagnostic(&details, &storage, Some(&policy))
+                .diagnostic(&details, &storage, Some(&policy), false)
                 .contains("MXC request:"));
         }
         result.outcome = 1;
         assert!(result
-            .diagnostic(&details, &storage, Some(&policy))
+            .diagnostic(&details, &storage, Some(&policy), false)
             .contains("MXC request:"));
         result.resource_chars_required += 1;
         assert!(!result
-            .diagnostic(&details, &storage, Some(&policy))
+            .diagnostic(&details, &storage, Some(&policy), false)
             .contains("MXC request:"));
     }
 
@@ -815,7 +819,7 @@ mod tests {
         result.details_count = MAX_DETAILS as u32;
         result.resource_chars_written = storage.len() as u32;
         result.resource_chars_required = storage.len() as u32;
-        let message = result.diagnostic(&details, &storage, Some(&policy));
+        let message = result.diagnostic(&details, &storage, Some(&policy), false);
         assert!(message.len() <= 256 * 1024, "{}", message.len());
         assert_eq!(message.matches("MXC request:").count(), MAX_DETAILS);
         assert_eq!(
