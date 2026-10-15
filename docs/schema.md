@@ -1,11 +1,19 @@
 
 ## Configuration Schema
 
+> **Audience:** MXC consumers and developers
+
 MXC uses a JSON configuration file. The current stable schema is at
-[`schemas/stable/mxc-config.schema.0.8.0-alpha.json`](../schemas/stable/mxc-config.schema.0.8.0-alpha.json).
-For development, the dev schema at
-[`schemas/dev/mxc-config.schema.0.9.0-alpha.json`](../schemas/dev/mxc-config.schema.0.9.0-alpha.json)
+[`schemas/stable/mxc-config.schema.1.0.0.json`](../schemas/stable/mxc-config.schema.1.0.0.json).
+For development, the schema for version `1.1.0-alpha` at
+[`schemas/dev/mxc-config.schema.1.1.0-alpha.json`](../schemas/dev/mxc-config.schema.1.1.0-alpha.json)
 includes experimental features and may change without notice.
+For self-contained references to what each supported version accepts, see
+[containment policy language](containment-policy/README.md).
+
+See the [consumer glossary](glossary.md) for terminology. This guide describes
+["MXC request JSON"](#mxc-request-json); typed SDK callers use the types in the
+[SDK reference](api-reference/README.md) instead.
 
 Editors that support JSON Schema will provide autocomplete and validation when
 you add a `"$schema"` reference to your config file. Use the stable schema for
@@ -13,20 +21,67 @@ production configs and the dev schema when working on experimental features:
 
 ```json
 // Production
-"$schema": "./schemas/stable/mxc-config.schema.0.8.0-alpha.json"
+"$schema": "./schemas/stable/mxc-config.schema.1.0.0.json"
 
 // Development (experimental features)
-"$schema": "./schemas/dev/mxc-config.schema.0.9.0-alpha.json"
+"$schema": "./schemas/dev/mxc-config.schema.1.1.0-alpha.json"
 ```
 
-### Schema 0.8 networking
+### "MXC request JSON"
 
-Schema 0.8 uses explicit egress and ingress policy and moves the loopback proxy
-endpoint into runtime configuration:
+"MXC request JSON" is a versioned request object defined by the
+[published schemas](../schemas/stable/) or
+[development schema](../schemas/dev/mxc-config.schema.1.1.0-alpha.json).
+Executors and `mxc_ffi`, MXC's C-callable library, use the same registered
+contracts. There is no additional free-form FFI format.
+
+Typed Rust, .NET, and Node SDK callers use `ContainerRequest`,
+`ProvisionRequest`, and `ExecutionRequest`, not JSON. Node and .NET produce
+"MXC request JSON" internally.
+
+Creation requests omit `phase` and `sandboxId`. Lifecycle requests include
+`phase`, and operations after provision include `sandboxId`. For executor
+lifecycle calls, supply those values through `--operation` and `--container-id`,
+not in the JSON file. The executor inserts them before using the same contract
+parser.
+
+For example, starting a provisioned WSLc container uses this "MXC request JSON"
+with `mxc_run_state_aware_json`:
 
 ```json
 {
-    "version": "0.8.0-alpha",
+    "version": "1.0.0",
+    "phase": "start",
+    "sandboxId": "wslc:0123456789abcdef0123456789abcdef"
+}
+```
+
+To supply the same request through the executor, save the non-routing fields
+as `start.json`:
+
+```json
+{
+    "version": "1.0.0"
+}
+```
+
+```text
+wxc-exec.exe start.json --operation start --container-id wslc:0123456789abcdef0123456789abcdef
+```
+
+Replace the example ID with the one returned by provision. The C-callable
+functions take NUL-terminated UTF-8 JSON strings. The schemas specify fields
+and values; backend validation checks whether the requested policy can run.
+For full lifecycle examples, see [container lifecycle JSON requests](#container-lifecycle-json-requests).
+
+### Directional networking (supported contracts)
+
+Supported contracts from `0.9.0-alpha` use explicit egress and ingress policy
+and put the loopback proxy endpoint in runtime configuration:
+
+```json
+{
+    "version": "0.9.0-alpha",
     "network": {
         "egress": {
             "default": "deny",
@@ -44,17 +99,27 @@ endpoint into runtime configuration:
 ```
 
 Direct egress rules and `runtimeConfig.networkProxy` select different
-connectivity models and cannot be combined. A ProcessContainer proxy requires
-`ingress.default: "allow"`. Identity-scoped proxies set `allowedProxyPeer` and
-keep `hostLoopback: "deny"`; identity-less host proxies omit
-`allowedProxyPeer` and require `hostLoopback: "allow"`. The identity-less route
-is a weaker development/testing compatibility deployment because it opens both
-host-loopback directions; it is not the strict proxy-endpoint exception
-defined by the shared model-2 policy.
+connectivity models and cannot be combined. Direct mode applies numeric CIDR,
+protocol, and port rules where the backend supports them. A runtime proxy
+names a caller-managed HTTP/S endpoint; the proxy owns any destination
+filtering. Whether MXC can restrict raw-socket traffic to that endpoint
+depends on the backend; see its guide. When `network`, `network.egress`, or
+`network.egress.default` is omitted, `egress.default` resolves to `deny`.
+Both ingress controls also default to `deny` when omitted. `hostLoopback`
+resolves independently of `ingress.default`, so host-loopback access must
+be requested explicitly.
+A runtime proxy may omit `network.egress`: the effective egress policy is
+still `deny` with no direct allow or deny rules.
+A ProcessContainer proxy requires `ingress.default: "allow"`. Identity-scoped
+proxies set a non-blank `allowedProxyPeer` and keep `hostLoopback: "deny"`;
+identity-less host proxies omit `allowedProxyPeer` and require
+`hostLoopback: "allow"`. The identity-less route is a weaker development/testing
+deployment: it opens both host-loopback directions without restricting access
+to a named proxy peer. It does not enforce a proxy-only host-loopback exception.
 
 ```json
 {
-    "version": "0.8.0-alpha",
+    "version": "0.9.0-alpha",
     "containment": "processcontainer",
     "network": {
         "egress": { "default": "deny" },
@@ -74,15 +139,15 @@ defined by the shared model-2 policy.
 }
 ```
 
-The legacy `defaultPolicy`, `enforcementMode`, `allowLocalNetwork`,
-`allowedHosts`, `blockedHosts`, and `network.proxy` fields remain supported by
-schema 0.6 and 0.7. During the additive schema 0.8 transition, requests may
-continue to use those legacy fields or use the directional fields above, but
-cannot mix both formats in one request.
+The `defaultPolicy`, `enforcementMode`, `allowLocalNetwork`, `allowedHosts`,
+`blockedHosts`, and `network.proxy` fields belonged to retired contracts.
+No supported contract accepts them. Migrate existing policies to
+directional fields and `runtimeConfig.networkProxy` rather than changing
+the version string alone.
 
 ### IsolationSession unrestricted networking (0.9)
 
-IsolationSession cannot restrict networking. Exact v0.9 requests must describe
+IsolationSession cannot restrict networking. JSON requests for `0.9.0-alpha` must describe
 that actual posture through the standard directional network fields:
 
 ```json
@@ -102,9 +167,8 @@ that actual posture through the standard directional network fields:
 
 All three directional values must be explicitly `allow`; omission defaults to
 deny. Legacy network fields, rules, mixed postures, and proxies are rejected.
-An absent or empty `network` object is rejected. The existing experimental
-execution opt-in remains required. Published v0.6/v0.7/v0.8 contracts are
-unchanged by this addition.
+An absent or empty `network` object is rejected. Exact v0.9 IsolationSession
+does not require an experimental execution opt-in.
 Every complete request that carries a process requires a non-empty
 `process.commandLine`. The Windows native CLI may accept a template without
 that field when the command is supplied after `--`; `wxc-exec.exe` inserts or
@@ -116,7 +180,7 @@ that can be executed independently.
 
 ```json
 {
-    "version": "0.9.0-alpha",              // Schema version (semver). Minimum supported: "0.6.0-alpha"; current stable: "0.8.0-alpha".
+    "version": "1.0.0",                    // Exact schema version. Minimum supported: "0.9.0-alpha"; current stable: "1.0.0".
     "containerId": "my-container",         // Externally assigned container ID
     "containment": "processcontainer",     // Backend (see table below)
 
@@ -132,7 +196,7 @@ that can be executed independently.
                                            //  than inheriting the launcher's — see
                                            //  "Working Directory" below)
         "env": ["MY_VAR=value"],           // Omitted: backend default; supplied: used verbatim
-        "inheritDefaultEnv": true,         // Layer env on the backend default (0.9.0-alpha+)
+        "inheritDefaultEnv": true,         // Layer env on the backend default (0.9.0-alpha)
         "timeout": 30000                   // Timeout in ms (0 = no timeout)
     },
 
@@ -147,45 +211,21 @@ that can be executed independently.
     },
 
     "network": {
-        "defaultPolicy": "block",          // "allow" or "block"
-        "enforcementMode": "firewall",     // "capabilities", "firewall", or "both"
-        "allowedHosts": ["203.0.113.0/24"],
-        "blockedHosts": ["203.0.113.7"],   // Denies outrank allows, including broader CIDRs
-                                           // Under bubblewrap at schema 0.8+ with
-                                           //  enforcementMode "firewall", entries must be IP
-                                           //  literals or CIDR blocks: DNS names are rejected at
-                                           //  validation time rather than resolved. Use proxy
-                                           //  mode for hostname-based control.
-        "proxy": { "localhost": 8080 }     // Loopback proxy port (processcontainer; bubblewrap; seatbelt)
-                                           // (use { "builtinTestServer": true } for the bundled
-                                           //  testing-only proxy; requires --allow-testing-features)
-                                           // WSLC and LXC support the cooperative proxy too, but
-                                           // only via { "url": "http://proxy.example:8080" }
-                                           // (own-netns: localhost/builtinTestServer are
-                                           //  unreachable, rejected)
-                                           // Seatbelt requires defaultPolicy "block": a proxy
-                                           //  alongside "allow" adds no enforcement and is rejected
-                                           // Under LXC the proxy is enforced: forwarded egress is
-                                           //  restricted to the proxy endpoint and nothing else, so
-                                           //  the allow/block host lists and DNS are not opened.
-                                           //  The chain hooks FORWARD, so traffic addressed to the
-                                           //  bridge gateway itself is delivered locally via INPUT
-                                           //  and is outside what this chain governs.
-                                           // Under Bubblewrap on schema 0.8+ the proxy is likewise
-                                           //  enforced, in the sandbox's own network namespace:
-                                           //  egress is dropped except the proxy endpoint, and DNS
-                                           //  is not opened. A url-form hostname is resolved on the
-                                           //  host and pinned into the sandbox's /etc/hosts, since
-                                           //  the sandbox has no resolver of its own. `localhost`,
-                                           //  127.0.0.0/8 and the wildcards 0.0.0.0 / :: are
-                                           //  rewritten to the slirp gateway; `::1` is rejected,
-                                           //  because an IPv6-loopback listener cannot accept the
-                                           //  IPv4 connection that gateway produces. Because the
-                                           //  pin outranks every filesystem mount, a `deniedPaths`
-                                           //  entry covering /etc/hosts is rejected rather than
-                                           //  silently overridden. On schema
-                                           //  0.6/0.7 Bubblewrap keeps the cooperative-only
-                                           //  behavior (no egress rules).
+        "egress": {
+            "default": "deny",
+            "allow": [{
+                "to": [{ "cidr": "203.0.113.0/24" }],
+                "ports": [{ "protocol": "tcp", "port": 443 }]
+            }],
+            "deny": [{
+                "to": [{ "cidr": "203.0.113.7/32" }],
+                "ports": [{ "protocol": "tcp", "port": 443 }]
+            }]
+        },
+        "ingress": {
+            "default": "deny",
+            "hostLoopback": "deny"
+        }
     },
 
     "ui": {
@@ -212,13 +252,18 @@ that can be executed independently.
                                            // path in output metadata. Defaults to false.
                                            // Retention requires a terminal wait; abandoning the
                                            // process handle deletes the internal trace.
-                                           // Requires native PSEC/V2 capture; guarded-WPR fallback
-                                           // rejects retention rather than exposing a host-wide ETL.
+                                           // Supported by native PSEC and guarded-WPR capture.
+                                           // Guarded WPR retains only a workload-process-filtered
+                                           // ETL, never its host-wide source trace.
         }
                                            // Omit outputPath for a managed JSON output file.
-                                           // Native PSEC/V2 capture cannot combine with leastPrivilege
-                                           // or network.proxy. Hosts without that complete native set
-                                           // retain an eligible legacy containment tier and use guarded WPR.
+                                           // Native PSEC capture supports runtimeConfig.networkProxy
+                                           // without adding the direct-egress capture capability.
+                                           // leastPrivilege and other proxy policies use a compatible
+                                           // AppContainer tier with guarded WPR. Hosts without compatible
+                                           // native capture exports also use that fallback.
+                                           // If guarded-WPR prerequisites are unavailable, the request
+                                           // fails before MXC creates the sandbox.
     },
 
     "lxc": {                               // LXC-specific
@@ -239,31 +284,33 @@ that can be executed independently.
                                            // and a permitting administrative policy are also required
     },
 
-    "experimental": {                      // Experimental features (requires --experimental)
-        "wslc": {                          // WSL Container settings
-            "image": "alpine:latest",      // Container image name
-            "imageTarPath": "C:\\images\\alpine.tar",  // Import image from local tar file
-            "cpuCount": 4,                 // CPU count for WSLC session
-            "memoryMb": 2048,              // Memory in MB for WSLC session
-            "gpu": false,                  // GPU passthrough
-            "storagePath": "C:\\wslc-storage",  // Image store path
-            "portMappings": [              // Host<->container port forwarding. TCP only -- the WSLC SDK runtime returns E_NOTIMPL for UDP, so the parser hard-rejects "udp" entries with a clear message.
-                { "windowsPort": 8080, "containerPort": 80, "protocol": "tcp" }
-            ]
-        }
+    "wslc": {                              // WSL Container settings (v0.9+)
+        "image": "alpine:latest",          // Container image name
+        "imageTarPath": "C:\\images\\alpine.tar",  // Import image from local tar file
+        "cpuCount": 4,                     // CPU count for WSLC session
+        "memoryMb": 2048,                  // Memory in MB for WSLC session
+        "gpu": false,                      // GPU passthrough
+        "storagePath": "C:\\wslc-storage", // Image store path
+        "portMappings": [                  // Host<->container port forwarding. TCP only -- the WSLC SDK runtime returns E_NOTIMPL for UDP, so the parser hard-rejects "udp" entries with a clear message.
+            { "windowsPort": 8080, "containerPort": 80, "protocol": "tcp" }
+        ]
+    },
+
+    "hyperlight": {                        // Hyperlight settings (v0.10+)
+        "runtime": "node"                  // Guest runtime: agent (default), python, python-shell, node, bash or dotnet-jit
     }
 }
 ```
 
-> **State-aware fields.** The `phase` top-level field is the **state-aware
-> discriminator**: a request that includes it is parsed as a state-aware
-> lifecycle request (see below), *not* the one-shot config above. The `sandboxId`
-> top-level field is state-aware-only — a one-shot request carrying `sandboxId`
+> **Lifecycle operation fields.** The `phase` top-level field selects a
+> container lifecycle operation: JSON that includes it is parsed as input for
+> that operation (see below), *not* the create-and-run configuration above. The `sandboxId`
+> top-level field is only for lifecycle operations; a create-and-run JSON request carrying `sandboxId`
 > is rejected with a parse error. Callers cannot supply `correlationVector`;
 > it is rejected as an unknown field because lifecycle correlation is internal
-> to MXC and is not part of the request or response contract. See
-> [`docs/state-aware-lifecycle/mxc-state-aware-sandbox-api.md`](state-aware-lifecycle/mxc-state-aware-sandbox-api.md)
-> and [`docs/telemetry/telemetry.md`](telemetry/telemetry.md).
+> to MXC and is not a declared JSON request or response field. See
+> [Container lifecycle architecture](development/architecture/container-lifecycle.md)
+> and [telemetry architecture](development/architecture/telemetry.md).
 
 ### Working Directory
 
@@ -280,11 +327,49 @@ use:
 |---------|----------------------------------------|
 | Windows ProcessContainer (AppContainer / BaseContainer) | First `readwritePaths` entry that is an existing directory, else the first such `readonlyPaths` entry, else the system drive root (`%SystemDrive%\`). Never `NULL`. |
 | Seatbelt (macOS) | Same precedence, with `~` expanded as the profile expands it; falls back to `/`. |
-| LXC / WSL Container | The container root — see [`docs/lxc-support/lxc-backend.md`](lxc-support/lxc-backend.md). |
+| Bubblewrap (Linux) | No substitution — a policy grant is never adopted. `--chdir` is emitted only for an explicit `process.cwd`, which from 0.9 is also normalized against the sandbox root and used as `HOME`. With no explicit `cwd` there is no `--chdir` and `HOME` is unset — see [`docs/backends/bwrap/bubblewrap-backend.md`](backends/bwrap/bubblewrap-backend.md). |
+| LXC / WSL Container | The container root — see [`docs/backends/lxc/lxc-backend.md`](backends/lxc/lxc-backend.md). |
 | MicroVM (NanVix) / Hyperlight | Not applicable — these backends reject a working directory outright. |
 
 Policy entries that are blank, name a file, or do not exist yet are skipped:
 a process cannot be launched in any of them.
+
+WSL Container create-and-run execution accepts an explicit `process.cwd` only as a local
+Windows drive path, which is mapped under `/mnt/<drive>` (for example
+`C:\work` becomes `/mnt/c/work`); any other value is rejected before the
+container is created. WSL Container execution in an existing container (`exec`) takes an absolute
+in-container path instead. See
+[`docs/backends/wslc/wsl-container-getting-started.md`](backends/wslc/wsl-container-getting-started.md).
+
+### Environment
+
+`process.env` and `process.inheritDefaultEnv` combine as follows from
+`0.9.0-alpha`:
+
+| `process.env` | `inheritDefaultEnv` | The child gets |
+|---|---|---|
+| omitted | ignored | the backend default |
+| `[]` | `false` (default) | nothing |
+| `[]` | `true` | the backend default |
+| `["FOO=bar"]` | `false` (default) | only `FOO` |
+| `["FOO=bar"]` | `true` | the default, plus `FOO`; a caller entry wins |
+
+`inheritDefaultEnv` layers the supplied entries over the default, so supplying
+none of them asks for the default itself — the same environment an omitted
+`process.env` gets.
+
+Two backends depart from the table. The Windows process container requires
+`SYSTEMROOT` and `LOCALAPPDATA` to be present, so a caller-owned block that
+omits them — including `[]` — is rejected before launch rather than used; the
+rejection names the missing variables. IsolationSession starts every process
+from the agent user's default environment and cannot replace or empty it, so
+`process.env` without `inheritDefaultEnv` — including `[]` — is rejected before
+launch.
+
+What the default block contains is backend-specific; see the backend's guide.
+On the WSL Container backend it is the container image's own `ENV`, which MXC
+neither authors nor enumerates — see
+[`docs/backends/wslc/wsl-container-getting-started.md`](backends/wslc/wsl-container-getting-started.md#environment).
 
 ### Filesystem Policy
 
@@ -305,8 +390,8 @@ The ProcessContainer-only `processContainer.filesystem` section contains:
 On Windows, `deniedPaths` is enforced by one of two mechanisms depending on the
 containment tier selected at runtime:
 
-- **BaseContainer (Tier 1):** enforced natively by the OS when the build advertises
-  the `SANDBOX_CAP_FS_DENY` capability. No host filesystem changes are made.
+- **BaseContainer (Tier 1):** enforced natively by the OS when PSEC advertises
+  `PSE_SUPPORT_FS_DENY`. No host filesystem changes are made.
 - **AppContainer (Tier 2/3):** enforced by host-filesystem DENY ACEs, applied before
   the run and removed on exit. This path is gated by `allowDaclMutation`, requires
   `WRITE_DAC` on each denied path, and temporarily modifies host security descriptors.
@@ -318,7 +403,7 @@ containment tier selected at runtime:
 
 For Windows BaseContainer, a path grant in `readwritePaths` applies to that directory
 and its descendants with the exception of root directories. Granting access to a
-**volume root** (e.g. `C:\`) does **not** cascade to its child folders to prevent over-provisioning. 
+**volume root** (e.g. `C:\`) does **not** cascade to its child folders to prevent over-provisioning.
 
 For example, `"readwritePaths": ["C:\\"]` does **not** grant access to files
 under `C:\data`.
@@ -326,9 +411,9 @@ under `C:\data`.
 #### Upward directory traversal for Windows BaseContainer
 
 Many tools search **upward** from the working directory toward the volume root,
-looking for a marker file that defines their project. With Windows BaseContainer, when such a tool reaches a parent directory that is not in the allowlist, `ACCESS_DENIED` will be returned. 
+looking for a marker file that defines their project. With Windows BaseContainer, when such a tool reaches a parent directory that is not in the allowlist, `ACCESS_DENIED` will be returned.
 
-When resolving this error, grant only the specific directories the tool must reach and keep that set as small as possible. 
+When resolving this error, grant only the specific directories the tool must reach and keep that set as small as possible.
 Avoid resolving this error by granting broad profile roots. Each 'readwritePaths' grant also exposes that directory's descendants and granting broad profile roots may result in over-permissioning.
 
 ### UI Policy
@@ -348,7 +433,7 @@ documentation before relying on the default.
 
 **Per-backend support.** `ui` is enforced by the Windows ProcessContainer
 backend (via job-object UI restrictions plus the Win32k mitigation — see
-[`process-container/UIPolicy_Schema.md`](process-container/UIPolicy_Schema.md))
+[`backends/process-container/UIPolicy_Schema.md`](backends/process-container/UIPolicy_Schema.md))
 and by the macOS Seatbelt backend (via the generated sandbox profile). Other
 backends do not implement UI restrictions; each backend's documentation states
 whether it applies, rejects, or ignores the section. **IsolationSession and WSLc
@@ -356,9 +441,9 @@ refuse any supplied `ui` at every phase on both surfaces**, and each accepts an
 omitted one without applying any UI restriction — so the section's default-deny
 reading does not hold on either. The reasons differ: no `ui` posture is truthful
 for a session-isolated sandbox (see
-[`isolation-session/state-aware-rust.md`](isolation-session/state-aware-rust.md)),
+[IsolationSession Rust lifecycle architecture](development/architecture/backends/isolation-session/state-aware-rust.md)),
 while WSLc has no mechanism to enforce UI restrictions on a container (see
-[`wsl/wslc-state-aware.md`](wsl/wslc-state-aware.md)).
+[WSLc container lifecycle guide](backends/wslc/wslc-state-aware.md)).
 The Windows `processContainer.ui` sub-block carries the ProcessContainer-only
 fields `isolation`, `desktopSystemControl`, `systemSettings`, and `ime`.
 `processContainer.filesystem` carries `enumeratePaths`. Both sub-blocks are
@@ -392,36 +477,46 @@ force a particular backend.
 | Value | Description |
 |-------|-------------|
 | `"processcontainer"` | (Default) Windows process-level isolation. Resolves to AppContainer (legacy) or BaseContainer (newer OS sandbox API) at run time depending on host capabilities and the `--experimental` flag. |
-| `"windows_sandbox"` | Windows Sandbox VM isolation. Dual-mode: a transient **one-shot** runner that launches a fresh disposable VM per execution, and a **state-aware** lifecycle backed by a long-lived per-sandbox daemon. |
+| `"windows_sandbox"` | Windows Sandbox VM isolation. Supports create-and-run execution with a fresh disposable VM per execution, and container lifecycle operations backed by a long-lived per-container daemon. |
 | `"wslc"` | Linux containers via the WSL Container SDK |
 | `"lxc"` | Native LXC container isolation. No abstract intent resolves to LXC; request it explicitly. |
 | `"microvm"` | MicroVM isolation via Windows HyperV Platform (NanVix microkernel) |
 | `"hyperlight"` | MicroVM isolation via Hyperlight + Unikraft with an embedded CPython snapshot (experimental) |
-| `"isolation_session"` | Windows isolation session — runs the workload as a freshly-provisioned, per-execution isolated user account in its own OS-managed session (experimental). Dual-mode: one-shot and state-aware. |
-| `"seatbelt"` | macOS sandbox isolation (Seatbelt). Requires macOS 15 or later — see [`docs/seatbelt/seatbelt-backend.md`](seatbelt/seatbelt-backend.md). |
-| `"bubblewrap"` | Unprivileged Linux sandboxing via Bubblewrap/user namespaces. The Linux default — see [`docs/bwrap-support/bubblewrap-backend.md`](bwrap-support/bubblewrap-backend.md). |
+| `"isolation_session"` | Windows isolation session: create-and-run execution uses a freshly provisioned isolated user account in its own OS-managed session. Container lifecycle operations can retain the session between executions. |
+| `"seatbelt"` | macOS sandbox isolation (Seatbelt). Requires macOS 15 or later — see [`docs/backends/seatbelt/seatbelt-backend.md`](backends/seatbelt/seatbelt-backend.md). |
+| `"bubblewrap"` | Unprivileged Linux sandboxing via Bubblewrap/user namespaces. The Linux default — see [`docs/backends/bwrap/bubblewrap-backend.md`](backends/bwrap/bubblewrap-backend.md). |
 
 Only the backend section matching the selected `containment` value is accepted;
 a config that also carries an unrelated backend's section is **rejected** with a
 "Multiple containment backends configured" error rather than silently ignored.
 
-### State-aware lifecycle envelope
+### Container lifecycle JSON requests
 
-The exact development schema documents a multi-phase envelope shape for the
-state-aware lifecycle (`provision` / `start` / `exec` / `stop` /
-`deprovision`). Where the one-shot config above is a self-contained
-`ExecutionRequest` to run once, a state-aware envelope identifies which
-phase is being driven against an existing provisioned sandbox.
+These examples use ["MXC request JSON"](#mxc-request-json). For executor
+calls, use the conversion described above.
 
-State-aware envelopes currently require the exact `0.9.0-alpha` development
-contract. The published `0.6.0-alpha`, `0.7.0-alpha`, and `0.8.0-alpha`
-contracts contain only one-shot request roots. The state-aware field shape is
-documented by the exact development schema:
+The development schema documents JSON objects for container lifecycle
+operations (`provision` / `start` / `exec` / `stop` / `deprovision`).
+The create-and-run JSON above describes container setup and a workload together.
+Lifecycle JSON instead identifies an operation: `provision` allocates a new
+container; later operations use the returned `sandboxId`.
+
+Choose a supported contract version for the backend and operation:
+
+- IsolationSession uses published `0.9.0-alpha`.
+- WSLC uses published `0.9.0-alpha`, or development `1.1.0-alpha` for
+  `wslc.provision.portMappings`; Windows Sandbox uses development
+  `1.1.0-alpha`.
+
+Contracts before `0.9.0-alpha` are retired. The supported published
+`0.9.0-alpha` and `1.0.0` contracts describe create-and-run JSON requests plus
+IsolationSession and WSLC lifecycle JSON requests. This Windows Sandbox example therefore uses the
+development schema for `1.1.0-alpha`:
 
 ```json
 {
-    "$schema": "./schemas/dev/mxc-config.schema.0.9.0-alpha.json",
-    "version": "0.9.0-alpha",
+    "$schema": "./schemas/dev/mxc-config.schema.1.1.0-alpha.json",
+    "version": "1.1.0-alpha",
     "phase": "exec",                       // One of: provision | start | exec | stop | deprovision
     "sandboxId": "wsb:abcd1234",           // Required for non-provision phases.
                                            // Prefix routes to the backend (wsb: -> windows_sandbox,
@@ -430,10 +525,10 @@ documented by the exact development schema:
                                            // (the backend is inferred from sandboxId).
     "process": { "commandLine": "echo hi" }
     // Cross-cutting fields (process / filesystem / network / ui) sit at the TOP
-    // level, exactly as in a one-shot request -- there is no wrapping `config`
+    // level, exactly as in a create-and-run request -- there is no wrapping `config`
     // object. Backend- and phase-specific config, when a phase has any, nests
-    // under `experimental.<backendKey>.<phase>`, e.g.:
-    //   "experimental": { "isolation_session": { "provision": { "appId": "PFN:Contoso.App_8wekyb3d8bbwe" } } }
+    // under its permanent backend section, e.g.:
+    //   "isolationSession": { "provision": { "appId": "PFN:Contoso.App_8wekyb3d8bbwe" } }
 }
 ```
 
@@ -447,37 +542,66 @@ Phase / sandboxId / containment validation:
 | `stop`          | **Required** | Ignored if present |
 | `deprovision`   | **Required** | Ignored if present |
 
-State-aware-capable backends today: `isolation_session` and `windows_sandbox`
-(both Windows-only, both still experimental). The dispatcher rejects
-state-aware envelopes for backends that have not opted in.
+Backends supporting container lifecycle operations today are `isolation_session`, `windows_sandbox`,
+and `wslc` (all Windows-only). IsolationSession does not require runtime
+experimental authorization; Windows Sandbox does.
 
-Full lifecycle API: [`docs/state-aware-lifecycle/mxc-state-aware-sandbox-api.md`](state-aware-lifecycle/mxc-state-aware-sandbox-api.md).
+WSLC `provision` accepts `wslc.provision.portMappings`, the same
+`windowsPort` / `containerPort` / `protocol` entries as the create-and-run
+`wslc.portMappings` list, applied to the sandbox's own container:
+
+```json
+{
+    "$schema": "./schemas/dev/mxc-config.schema.1.1.0-alpha.json",
+    "version": "1.1.0-alpha",
+    "phase": "provision",
+    "containment": "wslc",
+    "network": {
+        "egress": { "default": "allow" },
+        "ingress": { "default": "allow", "hostLoopback": "allow" }
+    },
+    "wslc": {
+        "provision": {
+            "image": "alpine:latest",
+            "portMappings": [
+                { "windowsPort": 8080, "containerPort": 80 }
+            ]
+        }
+    }
+}
+```
+
+Mappings require the bridged (all-`allow`) posture shown above; the isolated
+posture is rejected at provision.
+
+Two entries claiming the same `windowsPort` are rejected on both surfaces. The
+session sizing knobs (`cpuCount` / `memoryMb` / `gpu` / `storagePath`) stay
+available only for create-and-run execution, because the lifecycle daemon shares one WSL session across
+every sandbox and cannot size them individually.
+
+Full lifecycle API: [container lifecycle](container-lifecycle.md).
 
 ### Schema Versioning
 
-MXC config files include an optional `version` field using
-[Semantic Versioning](https://semver.org/) (MAJOR.MINOR.PATCH). The parser uses
-this to detect incompatible configs and provide clear upgrade guidance. If
-`version` is absent, the config is assumed compatible with the current version.
+MXC execution config files require a `version` field naming a supported
+contract. Version spelling, including patch and prerelease, is significant;
+there is no range, latest-version, or missing-version fallback.
 
 Versions with a pre-release suffix (e.g., `-alpha`) indicate the schema is not
-yet stable — breaking changes may occur in any release. Once the schema is
-stable, version `1.0.0` (no suffix) will be released. After `1.0.0`, breaking
-changes require a major version bump per semver.
+yet stable — breaking changes may occur before publication. Version `1.0.0`
+is the first stable contract. After `1.0.0`, breaking changes require a major
+version bump per semver.
 
-The parser compares the config's major.minor against its supported version
-(pre-release labels are ignored for comparison):
+Supported contracts:
 
-| Config `version` | Parser supports | Result |
-|---|---|---|
-| absent | >=0.6, <=0.9 | Accepted (assumed compatible) |
-| `"0.5.0-alpha"` | >=0.6, <=0.9 | **Rejected** — "older than supported" |
-| `"0.6.0-alpha"` | >=0.6, <=0.9 | Accepted (0.6 in range) |
-| `"0.7.0-alpha"` | >=0.6, <=0.9 | Accepted (0.7 in range) |
-| `"0.8.0-alpha"` | >=0.6, <=0.9 | Accepted (0.8 in range) |
-| `"0.9.0-alpha"` | >=0.6, <=0.9 | Accepted (0.9 in range) |
-| `"0.10.0"` | >=0.6, <=0.9 | **Rejected** — "newer than supported" |
-| `"1.0.0"` | >=0.6, <=0.9 | **Rejected** — "newer than supported" |
+| Config `version` | Status |
+|---|---|
+| `"0.9.0-alpha"` | Published; minimum supported |
+| `"1.0.0"` | Published; current stable |
+| `"1.1.0-alpha"` | Development contract; may change |
+
+An absent version, a retired version, or any unregistered spelling such as
+`0.6.1-alpha`, `0.10.0-alpha`, or `1.0.1` is rejected.
 
 #### When to bump
 

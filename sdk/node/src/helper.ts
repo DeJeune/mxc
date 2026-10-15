@@ -6,11 +6,26 @@ import * as fs from 'fs';
 import * as path from 'path';
 import { randomBytes } from 'crypto';
 import { FileLogger } from './logger.js';
-import { ContainerConfig, ContainmentBackend, ContainmentTypes, ExperimentalBackends, LegacyContainmentAliases } from './types.js';
-import { findWxcExecutable, findLxcExecutable, findSeatbeltExecutable, getPlatformSupport } from './platform.js';
-import { SandboxSpawnOptions } from './sandbox.js';
+import {
+  ContainerConfig,
+  ContainmentBackend,
+  ContainmentTypes,
+  ExperimentalBackends,
+  LegacyContainmentAliases,
+  legacyConfigAliasUnsupportedReason,
+} from './v1/types.js';
+import { findWxcExecutable, findLxcExecutable, findSeatbeltExecutable, getPlatformSupport } from './v1/platform.js';
 import { diagLog } from './diagnostic.js';
-import { mxcErrorFromCode } from './errors.js';
+import { mxcErrorFromCode } from './v1/errors.js';
+
+interface SandboxSpawnOptions {
+  debug?: boolean;
+  experimental?: boolean;
+  executablePath?: string;
+  skipPlatformCheck?: boolean;
+  dryRun?: boolean;
+  logDir?: string;
+}
 
 /** SDK version read from package.json at module load time. */
 export const SDK_VERSION: string = (() => {
@@ -88,67 +103,6 @@ export function makeLogFilePath(dir: string): string {
 }
 
 /**
- * Apply Linux network-policy defaults to a `ContainerConfig`.
- *
- * Linux enforces per-host filtering in one of two ways:
- *   1. **iptables firewall** (`enforcementMode: 'firewall'`) — LXC's
- *      privileged enforcement path. Requires root / CAP_NET_ADMIN.
- *   2. **Cooperative HTTP proxy** (`network.proxy` set) — Bubblewrap's
- *      unprivileged enforcement path. The proxy applies the host policy
- *      for cooperating HTTP clients; raw-socket clients bypass it.
- *
- * Legacy LXC network blocks with no explicit enforcement mode use `'firewall'`
- * because capabilities are Windows-only. Bubblewrap uses firewall only for
- * host lists without a proxy.
- *
- * If the caller explicitly passes `enforcementMode: 'capabilities'` we
- * warn: `'capabilities'` is a Windows/AppContainer concept (a token
- * capability mask) and has no Linux equivalent. The explicit value is left
- * unchanged so native backend validation can report unsupported combinations.
- *
- * Shared between the explicit `'bubblewrap'` / `'lxc'` builders and the
- * abstract `'process'` branch on Linux (which resolves to Bubblewrap
- * server-side).
- *
- * NOTE: when `network.proxy` is configured on Bubblewrap, host filtering
- * is enforced at the proxy layer (unprivileged, no CAP_NET_ADMIN). The
- * Rust config parser explicitly rejects `bubblewrap + proxy + firewall`
- * since the iptables path requires privilege the bwrap backend
- * deliberately avoids. Callers in that mode must leave enforcementMode
- * at its default.
- */
-export function applyLinuxNetworkPolicy(config: ContainerConfig): void {
-  if (!config.network) {
-    return;
-  }
-  if (config.network.enforcementMode === 'capabilities') {
-    console.warn(
-      "mxc-sdk: network.enforcementMode='capabilities' has no effect on Linux " +
-      "(it is a Windows AppContainer / ProcessContainer concept). The Linux " +
-      "runner will not enforce host filtering via capabilities. Use the " +
-      "default mode (auto-promotes to 'firewall' for LXC, or use network.proxy " +
-      "for unprivileged Bubblewrap enforcement)."
-    );
-  }
-  // LXC cannot enforce Windows AppContainer capabilities, so omitted legacy modes use firewall.
-  const isLegacyNetwork =
-    config.network.egress === undefined && config.network.ingress === undefined;
-  if (
-    config.containment === 'lxc' &&
-    isLegacyNetwork &&
-    config.network.enforcementMode === undefined
-  ) {
-    config.network.enforcementMode = 'firewall';
-  }
-  const hasProxy = !!config.network.proxy;
-  const hasHostRules =
-    !!(config.network.allowedHosts?.length || config.network.blockedHosts?.length);
-  if (hasHostRules && !hasProxy) {
-    config.network.enforcementMode = 'firewall';
-  }
-}
-
-/**
  * Resolves the executor binary and builds the common CLI arguments for any
  * MXC request envelope (one-shot or state-aware). Performs platform support
  * and binary-presence checks; does not validate envelope contents — callers
@@ -218,10 +172,18 @@ export function resolveExecutableAndArgs(
   config: ContainerConfig,
   options: SandboxSpawnOptions = {},
 ): { executablePath: string; args: string[] } {
+  const unsupportedAlias = legacyConfigAliasUnsupportedReason(config);
+  if (unsupportedAlias !== undefined) {
+    throw new Error(unsupportedAlias);
+  }
+
+  const legacyExperimental = (config as ContainerConfig & {
+    experimental?: unknown;
+  }).experimental;
   if (
-    config.experimental !== null
-    && typeof config.experimental === 'object'
-    && 'telemetry' in config.experimental
+    legacyExperimental !== null
+    && typeof legacyExperimental === 'object'
+    && 'telemetry' in legacyExperimental
   ) {
     throw new Error(
       "'experimental.telemetry' is no longer accepted; use top-level 'telemetry' instead.",
@@ -231,14 +193,9 @@ export function resolveExecutableAndArgs(
     throw new Error('script is required. Set process.commandLine on the config or pass a script to spawnSandbox().');
   }
 
-  // Resolve deprecated wire values (e.g. "appcontainer" → "processcontainer",
-  // "macos_sandbox" → "seatbelt") once, and drive every containment check
-  // from the resolved value. The native binary accepts both spellings via
-  // serde aliases, so the wire payload is forwarded unchanged below — this
-  // resolution is purely for SDK-side validation. Without it, legacy values
-  // bypass the experimental-mode gate (because they are not in
-  // ExperimentalBackends under their alias) and produce a confusing
-  // "not available on this platform" error instead.
+  // Resolve aliases accepted by the selected registered contract once, and
+  // drive every containment check from the canonical value. The wire payload
+  // remains unchanged so the matching exact Rust parser performs normalization.
   const rawContainment = config.containment;
   const effectiveContainment = rawContainment
     ? (LegacyContainmentAliases[rawContainment] ?? rawContainment)
@@ -289,28 +246,7 @@ export function resolveExecutableAndArgs(
     }
   }
 
-  // `network.proxy.builtinTestServer` is testing-only, deliberately-permissive
-  // scaffolding that the native binary gates behind `--allow-testing-features`.
-  // Mirror that fail-closed posture at the SDK boundary: the caller must opt in
-  // explicitly via `allowTestingFeatures` (a distinct axis from `experimental`).
-  // Forwarding the flag automatically whenever the policy used the feature would
-  // make the gate meaningless — requesting the dangerous feature would silently
-  // enable the gate that is supposed to guard it.
-  const proxy = config.network?.proxy as { builtinTestServer?: boolean } | undefined;
-  const usesBuiltinTestServer = proxy?.builtinTestServer === true;
-  if (usesBuiltinTestServer && !options.allowTestingFeatures) {
-    throw new Error(
-      "network.proxy.builtinTestServer is a testing-only feature. Set " +
-      "'allowTestingFeatures: true' in SandboxSpawnOptions to enable it. For " +
-      "production, point network.proxy at a real HTTP proxy via 'localhost' or 'url'.",
-    );
-  }
-
-  const resolved = resolveBinaryAndCommonArgs(JSON.stringify(config), options);
-  if (usesBuiltinTestServer) {
-    resolved.args.push('--allow-testing-features');
-  }
-  return resolved;
+  return resolveBinaryAndCommonArgs(JSON.stringify(config), options);
 }
 
 /**

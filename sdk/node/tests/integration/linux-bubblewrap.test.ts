@@ -13,8 +13,7 @@ import {
   supportedVersions,
   isLinuxRoot,
   isLinuxBubblewrap,
-  debugSpawnOptions,
-  spawnFromConfigAsync,
+  runConfigForTest,
   startUnixTestProxy,
   getSdkBinDir,
   getSdkPackageRoot,
@@ -42,12 +41,12 @@ describe(`Linux Bubblewrap (schema ${schemaVersion})`, {
   skip: !isLinuxRoot ? 'Linux Bubblewrap tests require Linux with root privileges (sudo npm test)' : undefined,
 }, () => {
   it('should default to Bubblewrap when containment is omitted (silent default)', async () => {
-    // spawnSandboxAsync routes through abstract `containment: 'process'`,
+    // run routes through abstract `containment: 'process'`,
     // which on Linux resolves to Bubblewrap in the binary.
-    const result = await sdk.spawnSandboxAsync(
+    const result = await sdk.runRequestForTest(
       BWRAP_PROBE,
-      { version: schemaVersion.raw },
-      debugSpawnOptions,
+      {},
+      {},
       undefined,
       `bwrap-default-${schemaVersion}`,
     );
@@ -56,46 +55,73 @@ describe(`Linux Bubblewrap (schema ${schemaVersion})`, {
   });
 
   it('should select Bubblewrap for abstract containment="process"', async () => {
-    const config = sdk.createConfigFromPolicy(
-      { version: schemaVersion.raw },
+    const config = sdk.createConfigForTest(
+      {},
       'process',
       `bwrap-process-${schemaVersion}`,
     );
     config.process!.commandLine = BWRAP_PROBE;
     assert.strictEqual(config.containment, 'process', 'wire-format containment should be "process"');
-    const result = await spawnFromConfigAsync(config, debugSpawnOptions);
+    const result = await runConfigForTest(config);
     assert.strictEqual(result.exitCode, 0, `[${schemaVersion}] containment=process Bubblewrap probe failed: ${result.stdout}`);
     assert.ok(result.stdout.includes('OK: under bubblewrap'), `[${schemaVersion}] ${result.stdout}`);
   });
 
   it('should select Bubblewrap for explicit containment="bubblewrap"', async () => {
-    const config = sdk.createConfigFromPolicy(
-      { version: schemaVersion.raw },
+    const config = sdk.createConfigForTest(
+      {},
       'bubblewrap',
       `bwrap-explicit-${schemaVersion}`,
     );
     config.process!.commandLine = BWRAP_PROBE;
     assert.strictEqual(config.containment, 'bubblewrap', 'wire-format containment should be "bubblewrap"');
-    const result = await spawnFromConfigAsync(config, debugSpawnOptions);
+    const result = await runConfigForTest(config);
     assert.strictEqual(result.exitCode, 0, `[${schemaVersion}] explicit Bubblewrap probe failed: ${result.stdout}`);
     assert.ok(result.stdout.includes('OK: under bubblewrap'), `[${schemaVersion}] ${result.stdout}`);
   });
 });
 }
 
-// Network proxy tests use the cooperative env-var proxy, which is
-// unprivileged by design -- the entire reason the proxy path exists is to
-// avoid the root requirement of iptables-based enforcement. Gate on
-// "Linux + bwrap available" rather than "Linux + root". Pinned to schema
-// 0.6.0-alpha because Bubblewrap proxy support is only available in 0.6+.
-const PROXY_SCHEMA = '0.6.0-alpha';
-describe('Linux Bubblewrap network proxy (schema 0.6.0-alpha)', {
+// The v1 policy replaces legacy `network.proxy`, `defaultPolicy`, and host
+// lists with a real endpoint named by `runtimeConfig.networkProxy`. The parser
+// accepts only loopback endpoints, and the request resolves to the proxy-only
+// posture: egress must be deny-by-default with no rules, and the backend opens
+// the proxy endpoint alone.
+//
+// That posture is enforced from inside a private network namespace routed by
+// rootless slirp4netns, which the legacy path does not need -- hence the extra
+// prerequisite here.
+//
+// The SDK's own capability answers it: the native probe runs `slirp4netns
+// --version`, checks that private namespaces can actually be unshared, and
+// inspects the iptables backend, so it fails closed on any part of the
+// dependency set. Testing for the binary alone would let a host with an
+// unusable slirp, `unshare`, `nsenter`, `iptables`, or `ip6tables` past the
+// gate and report an environmental failure as a test failure.
+const hasProxyEnforcement =
+  isLinuxBubblewrap &&
+  sdk.getPlatformSupport().bubblewrapNetwork?.proxyEnforcement === 'supported';
+
+describe('Linux Bubblewrap network proxy (v1 SDK policy)', {
   skip: !isLinuxBubblewrap
     ? 'Linux Bubblewrap proxy tests require Linux with bwrap installed'
-    : undefined,
+    : !hasProxyEnforcement
+      ? 'this host cannot enforce proxy-only egress (see PlatformSupport.bubblewrapNetwork.warnings)'
+      : undefined,
 }, () => {
-  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'mxc-sdk-bwrap-proxy-'));
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'mxc-sdk-bwrap-proxy-v1-'));
   const proxies: ChildProcess[] = [];
+
+  // The helper announces its port through a fixed-name ready file, so two
+  // proxies sharing a directory would have the second read the first one's
+  // port. Each gets its own directory instead.
+  const startProxy = (): number => {
+    const { port, proxyProcess } = startUnixTestProxy(
+      fs.mkdtempSync(path.join(tmpDir, 'proxy-')),
+    );
+    proxies.push(proxyProcess);
+    return port;
+  };
 
   after(() => {
     for (const p of proxies) {
@@ -104,77 +130,74 @@ describe('Linux Bubblewrap network proxy (schema 0.6.0-alpha)', {
     try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch { /* ignore */ }
   });
 
-  it('should route HTTPS traffic through an externally launched unix-test-proxy', async () => {
-    const { port, proxyProcess } = startUnixTestProxy(tmpDir);
-    proxies.push(proxyProcess);
+  it('should route traffic through the endpoint named by runtimeConfig.networkProxy', async () => {
+    const port = startProxy();
 
-    const config = sdk.createConfigFromPolicy(
-      { version: PROXY_SCHEMA },
+    const config = sdk.createConfigForTest(
+      {},
       'bubblewrap',
-      'bwrap-external-proxy',
-    );
-    // Azure Artifacts feed (NETWORK_TEST_URL)
-    config.process!.commandLine =
-      `curl -fsSL '${NETWORK_TEST_URL}' > /dev/null && echo PROXY_OK`;
-    config.network = {
-      ...(config.network ?? {}),
-      defaultPolicy: 'allow',
-      proxy: { localhost: port },
-    };
-
-    const result = await spawnFromConfigAsync(config, { ...debugSpawnOptions, experimental: true });
-    assert.strictEqual(result.exitCode, 0, `external-proxy run failed: ${result.stdout}`);
-    assert.ok(result.stdout.includes('PROXY_OK'), `missing PROXY_OK in: ${result.stdout}`);
-  });
-
-  it('should launch a builtinTestServer proxy and route traffic through it', async () => {
-    const config = sdk.createConfigFromPolicy(
-      { version: PROXY_SCHEMA },
-      'bubblewrap',
-      'bwrap-builtin-proxy',
+      'bwrap-runtime-proxy-v1',
     );
     config.process!.commandLine =
-      `curl -fsSL '${NETWORK_TEST_URL}' > /dev/null && echo BUILTIN_OK`;
+      `curl -fsSL '${NETWORK_TEST_URL}' > /dev/null && echo PROXY_V1_OK`;
     config.network = {
-      ...(config.network ?? {}),
-      defaultPolicy: 'allow',
-      proxy: { builtinTestServer: true },
+      egress: { default: 'deny' },
+      ingress: { default: 'deny', hostLoopback: 'deny' },
+    };
+    config.runtimeConfig = {
+      ...(config.runtimeConfig ?? {}),
+      networkProxy: `http://127.0.0.1:${port}`,
     };
 
-    const result = await spawnFromConfigAsync(config, { ...debugSpawnOptions, experimental: true, allowTestingFeatures: true });
-    assert.strictEqual(result.exitCode, 0, `builtin-proxy run failed: ${result.stdout}`);
-    assert.ok(result.stdout.includes('BUILTIN_OK'), `missing BUILTIN_OK in: ${result.stdout}`);
+    // No allowTestingFeatures: the v1 policy names a caller-supplied endpoint,
+    // not the testing-only built-in proxy.
+    const result = await runConfigForTest(config, { experimental: true });
+    assert.strictEqual(result.exitCode, 0, `v1 proxy run failed: ${result.stdout}`);
+    assert.ok(result.stdout.includes('PROXY_V1_OK'), `missing PROXY_V1_OK in: ${result.stdout}`);
   });
 
-  it('should enforce allowedHosts at the proxy layer', async () => {
-    const config = sdk.createConfigFromPolicy(
-      { version: PROXY_SCHEMA },
+  it('should confine egress to the proxy endpoint', async () => {
+    const port = startProxy();
+
+    const config = sdk.createConfigForTest(
+      {},
       'bubblewrap',
-      'bwrap-allowlist-proxy',
+      'bwrap-runtime-proxy-v1-egress',
     );
-    // Sentinel pattern: allowed host succeeds, disallowed host fails with 403
-    // from the proxy and curl exits non-zero. The script swallows that and
-    // prints BLOCKED_OK so we can assert both signals are present.
+    // `--noproxy '*'` is the load-bearing part: it opts the request out of the
+    // proxy env vars, so a success would mean the sandbox reached the internet
+    // directly and the proxy-only posture was never enforced.
     config.process!.commandLine =
       'set -e; ' +
-      `curl -fsSL '${NETWORK_TEST_URL}' > /dev/null && echo SENTINEL_OK; ` +
-      'if curl -fsS --max-time 5 https://example.com > /dev/null 2>&1; then ' +
-      '  echo SENTINEL_BAD_LEAK; exit 1; ' +
+      `if curl -fsS --noproxy '*' --max-time 10 '${NETWORK_TEST_URL}' > /dev/null 2>&1; then ` +
+      '  echo DIRECT_V1_LEAKED; exit 1; ' +
       'else ' +
-      '  echo BLOCKED_OK; ' +
-      'fi';
+      '  echo DIRECT_V1_BLOCKED_OK; ' +
+      'fi; ' +
+      `curl -fsSL '${NETWORK_TEST_URL}' > /dev/null && echo PROXY_V1_STILL_OK`;
     config.network = {
-      ...(config.network ?? {}),
-      defaultPolicy: 'allow',
-      proxy: { builtinTestServer: true },
-      allowedHosts: ['pkgs.dev.azure.com'],
+      egress: { default: 'deny' },
+      ingress: { default: 'deny', hostLoopback: 'deny' },
+    };
+    config.runtimeConfig = {
+      ...(config.runtimeConfig ?? {}),
+      networkProxy: `http://127.0.0.1:${port}`,
     };
 
-    const result = await spawnFromConfigAsync(config, { ...debugSpawnOptions, experimental: true, allowTestingFeatures: true });
-    assert.strictEqual(result.exitCode, 0, `allowlist run failed: ${result.stdout}`);
-    assert.ok(result.stdout.includes('SENTINEL_OK'), `missing SENTINEL_OK in: ${result.stdout}`);
-    assert.ok(result.stdout.includes('BLOCKED_OK'), `disallowed host was not blocked: ${result.stdout}`);
-    assert.ok(!result.stdout.includes('SENTINEL_BAD_LEAK'), `allowlist leaked: ${result.stdout}`);
+    const result = await runConfigForTest(config, { experimental: true });
+    assert.strictEqual(result.exitCode, 0, `v1 egress run failed: ${result.stdout}`);
+    assert.ok(
+      result.stdout.includes('DIRECT_V1_BLOCKED_OK'),
+      `direct egress was not blocked: ${result.stdout}`,
+    );
+    assert.ok(
+      result.stdout.includes('PROXY_V1_STILL_OK'),
+      `the proxied request did not complete: ${result.stdout}`,
+    );
+    assert.ok(
+      !result.stdout.includes('DIRECT_V1_LEAKED'),
+      `proxy-only egress leaked: ${result.stdout}`,
+    );
   });
 });
 
@@ -259,7 +282,7 @@ describe('lxc-exec --available-backends contract', {
     // them rather than re-probing keeps the comparison exact: a second live
     // walk could legitimately disagree by exhausting its pre-flight budget.
     const platform = await import(
-      pathToFileURL(path.join(getSdkPackageRoot(), 'dist', 'platform.js')).href
+      pathToFileURL(path.join(getSdkPackageRoot(), 'dist', 'v1', 'platform.js')).href
     ) as {
       getPlatformSupport(): { bubblewrapNetwork?: { proxyEnforcement: string; warnings: string[] } };
       _setLinuxProbeRunner(runner: (() => string) | null): void;

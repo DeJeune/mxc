@@ -1,9 +1,71 @@
 # Changelog
 
+> **Audience:** MXC consumers
+
 All notable changes to `@microsoft/mxc-sdk` will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+
+## [Unreleased]
+
+### Added
+
+- `spawnWithPty` supports ProcessContainer requests.
+
+### Changed
+
+- Public operations, request/result types, discovery, and telemetry are
+  exported only from `@microsoft/mxc-sdk/v1`.
+- Creation uses `ContainerRequest` with Promise-returning `run` or `spawn`.
+  Persistent operations use `provisionContainer`,
+  `startContainer`, `stopContainer`, and `deprovisionContainer`.
+  Use Promise-returning `spawnInContainer` for live execution or
+  `runInContainer` for captured output in an existing container.
+- Each operation takes its own options type. PTY operations take initial
+  dimensions in those options and return SDK-owned terminal process handles.
+- Backend discovery uses in-process `getAvailableBackends()` and returns
+  `AvailableBackend[]`, including tiers, capabilities, and warnings.
+- Telemetry consent uses `getTelemetryConsentStatus`,
+  `requestTelemetryConsent`, and `withdrawTelemetryConsent`.
+  Status queries return `TelemetryConsentStatus`.
+
+Entries below describe historical release APIs, not the current V1 surface.
+
+## [0.9.0]
+
+### Changed (breaking)
+
+- Raised the raw exact-contract support floor to `0.9.0-alpha`; raw configs
+  declaring earlier published alpha contracts are now rejected as unsupported.
+- Removed `SandboxSpawnOptions.allowTestingFeatures` and its CLI forwarding.
+  The `network.proxy.builtinTestServer` wire form it enabled was retired;
+  use a caller-managed `runtimeConfig.networkProxy` with directional policy.
+
+### Added
+
+- Stable IsolationSession and WSLC one-shot and state-aware backends under the
+  exact `0.9.0-alpha` contract. Neither backend requires
+  `{ experimental: true }`.
+- State-aware provision, start, stop, and deprovision calls run in-process
+  through `mxc_ffi` rather than spawning `wxc-exec`.
+- Native live, buffered, and dry-run exec support for IsolationSession and
+  WSLC. WSLC exposes stdout/stderr, waiting, timeout, and cancellation, but no
+  stdin because the WSLC SDK has no process-input API.
+- Telemetry consent APIs: `queryTelemetryConsentAsync`,
+  `requestTelemetryConsent`, and `withdrawTelemetryConsentAsync`. Applications
+  supply the consent presenter; MXC persists its own user decision and applies
+  administrative policy as an additional restriction.
+
+### Changed (breaking)
+
+- `execInSandbox` and `execInSandboxAsync` accept only sandbox ids whose
+  backends expose native piped exec streams. Windows Sandbox remains available
+  for provision, start, stop, and deprovision, but Node no longer exposes exec
+  dry-run for a backend it cannot execute through those APIs.
+- The minimum supported Node.js version is 24. On Windows, native stdio
+  requires Node.js 24.21.0 or later within the Node.js 24 release line, or
+  Node.js 26.8.0 or later. Node.js 26.8.0 or later is recommended.
 
 ## [0.7.0]
 
@@ -23,7 +85,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   policy (`readwritePaths` / `readonlyPaths` / `deniedPaths`) is honored
   at provision and is immutable thereafter; `network` / `ui` / Entra
   `user` bundles are not honored on this backend. See
-  [`docs/windows-sandbox/windows-sandbox.md`](../../docs/windows-sandbox/windows-sandbox.md)
+  [`docs/backends/windows-sandbox/windows-sandbox.md`](../../docs/backends/windows-sandbox/windows-sandbox.md)
   for the full per-phase config matrix.
 
 ### Changed

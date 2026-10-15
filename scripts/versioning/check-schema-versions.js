@@ -2,18 +2,23 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
-// Validates the SCHEMA version constants — the Rust parser, the SDK, and the
-// schema filenames must all agree with the canonical source of truth at
-// schemas/schema-version.json. This tracks the config wire format and is
-// deliberately separate from the PRODUCT version (Cargo / npm package), which
-// is checked by scripts/check-version-sync.js.
+// Validates the SCHEMA version constants — the exact Rust contract registry,
+// the SDKs, and the schema filenames must all agree with the canonical source
+// of truth at schemas/schema-version.json. This tracks the config wire format
+// and is deliberately separate from the PRODUCT version (Cargo / npm package),
+// which is checked by scripts/check-version-sync.js.
 //
 // Run from anywhere (paths are resolved relative to the repo root):
 //
 //   node scripts/versioning/check-schema-versions.js
 
-const { readFileSync, existsSync } = require("fs");
+const { readFileSync } = require("fs");
 const { join } = require("path");
+const {
+  loadContractRegistry,
+  requestRootsForContract,
+  validateSdkMajorTargets,
+} = require("./lib/contract-registry.js");
 
 const repoRoot = join(__dirname, "..", "..");
 const errors = [];
@@ -30,16 +35,12 @@ const {
   min,
   maxSupported,
   stateAware,
+  stateAwareWindowsSandbox,
   stateAwareWslc,
   stableLatest,
-  devSchemaFile,
+  sdkMajorTargets,
 } = schemaVer;
-
-// major.minor of a semver-ish "X.Y.Z[-pre]" string.
-function majorMinor(v) {
-  const m = /^(\d+)\.(\d+)\./.exec(v);
-  return m ? `${m[1]}.${m[2]}` : null;
-}
+const sdkV1Target = sdkMajorTargets["1"];
 
 // Assert a regex captures exactly `expected` in `text`.
 function expectConst(file, text, label, regex, expected) {
@@ -55,79 +56,94 @@ function expectConst(file, text, label, regex, expected) {
   }
 }
 
-// -- Rust parser (src/core/wxc_common/src/config_parser.rs) --
-const parser = read("src", "core", "wxc_common", "src", "config_parser.rs");
-expectConst(
-  "config_parser.rs",
-  parser,
-  "CURRENT_SCHEMA_VERSION",
-  /const CURRENT_SCHEMA_VERSION:\s*&str\s*=\s*"([^"]+)"/,
-  maxSupported
-);
-// SUPPORTED_VERSION is a semver range like ">=0.6, <=0.8"; its bounds must
-// match the canonical min/maxSupported major.minor.
-const supMatch = /const SUPPORTED_VERSION:\s*&str\s*=\s*">=([^,]+),\s*<=([^"]+)"/.exec(
-  parser
-);
-if (!supMatch) {
-  errors.push("config_parser.rs: could not find SUPPORTED_VERSION range");
-} else {
-  if (supMatch[1].trim() !== majorMinor(min)) {
-    errors.push(
-      `config_parser.rs: SUPPORTED_VERSION lower bound ">=${supMatch[1].trim()}" but canonical min is ${min} (${majorMinor(min)})`
-    );
+// -- Exact Rust contract registry (mxc_contract) --
+let registry = [];
+let registryByVersion = new Map();
+try {
+  ({ registry, byVersion: registryByVersion } = loadContractRegistry());
+} catch (error) {
+  errors.push(`Could not load exact Rust contract registry: ${error.message}`);
+}
+
+if (registry[0]?.version !== min) {
+  errors.push(
+    `Exact Rust contract registry minimum is "${registry[0]?.version}" but canonical min is "${min}"`
+  );
+}
+if (registry.at(-1)?.version !== maxSupported) {
+  errors.push(
+    `Exact Rust contract registry maximum is "${registry.at(-1)?.version}" but canonical maxSupported is "${maxSupported}"`
+  );
+}
+const publishedVersions = registry
+  .filter(contract => contract?.status === "published")
+  .map(contract => contract.version);
+if (publishedVersions.at(-1) !== stableLatest) {
+  errors.push(
+    `Exact Rust contract registry latest published version is "${publishedVersions.at(-1)}" but canonical stableLatest is "${stableLatest}"`
+  );
+}
+for (const [label, version, requiredRoot] of [
+  ["stateAware", stateAware, "isolation_session_provision"],
+  [
+    "stateAwareWindowsSandbox",
+    stateAwareWindowsSandbox,
+    "windows_sandbox_provision",
+  ],
+  ["stateAwareWslc", stateAwareWslc, "wslc_provision"],
+]) {
+  if (!registryByVersion.has(version)) {
+    errors.push(`Canonical ${label} version "${version}" is absent from the exact Rust registry`);
+    continue;
   }
-  if (supMatch[2].trim() !== majorMinor(maxSupported)) {
+  try {
+    const roots = requestRootsForContract(registryByVersion.get(version));
+    if (!roots.has(requiredRoot)) {
+      errors.push(
+        `Canonical ${label} version "${version}" does not support ${requiredRoot}`
+      );
+    }
+  } catch (error) {
     errors.push(
-      `config_parser.rs: SUPPORTED_VERSION upper bound "<=${supMatch[2].trim()}" but canonical maxSupported is ${maxSupported} (${majorMinor(maxSupported)})`
+      `Canonical ${label} version "${version}" has no exact request-root matrix: ${error.message}`
     );
   }
 }
 
-// -- SDK (sandbox.ts, state-aware-types.ts, state-aware-helper.ts) --
-const sandboxTs = read("sdk", "node", "src", "sandbox.ts");
+// -- SDK (shared V1 target, high-level builder, state-aware types) --
+const contractVersionTs = read("sdk", "node", "src", "v1", "contract-version.ts");
 expectConst(
-  "sandbox.ts",
-  sandboxTs,
-  "SUPPORTED_VERSION",
-  /const SUPPORTED_VERSION\s*=\s*'([^']+)'/,
-  maxSupported
+  "contract-version.ts",
+  contractVersionTs,
+  "SDK_CONTRACT_VERSION",
+  /const SDK_CONTRACT_VERSION\s*=\s*'([^']+)'/,
+  sdkV1Target
 );
-expectConst(
-  "sandbox.ts",
-  sandboxTs,
-  "MIN_VERSION",
-  /const MIN_VERSION\s*=\s*'([^']+)'/,
-  min
-);
-const stateAwareTs = read("sdk", "node", "src", "state-aware-types.ts");
-expectConst(
-  "state-aware-types.ts",
-  stateAwareTs,
-  "STATE_AWARE_VERSION",
-  /const STATE_AWARE_VERSION\s*=\s*'([^']+)'/,
-  stateAware
-);
-expectConst(
-  "state-aware-helper.ts",
-  read("sdk", "node", "src", "state-aware-helper.ts"),
-  "WSLC_STATE_AWARE_VERSION",
-  /const WSLC_STATE_AWARE_VERSION\s*=\s*'([^']+)'/,
-  stateAwareWslc
-);
-// -- C# SDK (sdk/dotnet/Microsoft.Mxc.Sdk/SchemaVersions.cs) --
+const containerTs = read("sdk", "node", "src", "v1", "container.ts");
+if (
+  !/import\s*\{\s*SDK_CONTRACT_VERSION\s*\}\s*from\s*['"]\.\/contract-version\.js['"]/.test(containerTs) ||
+  !/export\s*\{\s*SDK_CONTRACT_VERSION\s*\}/.test(containerTs)
+) {
+  errors.push("container.ts: SDK_CONTRACT_VERSION must import and re-export the shared contract-version.ts target");
+}
+const lifecycleTs = read("sdk", "node", "src", "v1", "lifecycle-types.ts");
+if (
+  !/export\s*\{\s*SDK_CONTRACT_VERSION\s*\}\s*from\s*['"]\.\/contract-version\.js['"]/.test(lifecycleTs)
+) {
+  errors.push("lifecycle-types.ts: SDK_CONTRACT_VERSION must re-export the shared contract-version.ts target");
+}
+// -- C# SDK (sdk/dotnet/Microsoft.Mxc.Sdk/V1/SchemaVersions.cs) --
 const schemaVersionsCs = read(
   "sdk",
   "dotnet",
   "Microsoft.Mxc.Sdk",
+  "V1",
   "SchemaVersions.cs"
 );
 for (const [label, expected] of [
   ["Minimum", min],
   ["MaximumSupported", maxSupported],
   ["LatestStable", stableLatest],
-  ["StateAware", stateAware],
-  ["WslcStateAware", stateAwareWslc],
 ]) {
   expectConst(
     "SchemaVersions.cs",
@@ -137,19 +153,44 @@ for (const [label, expected] of [
     expected
   );
 }
-
-// -- Schema files exist for the declared stable + dev versions --
-const stablePath = join(
-  "schemas",
-  "stable",
-  `mxc-config.schema.${stableLatest}.json`
-);
-if (!existsSync(join(repoRoot, stablePath))) {
-  errors.push(`Missing stable schema file for stableLatest "${stableLatest}": ${stablePath}`);
+const sdkContractMatch =
+  /const string SdkContract\s*=\s*(LatestStable|"([^"]+)")/.exec(
+    schemaVersionsCs
+  );
+if (!sdkContractMatch) {
+  errors.push("SchemaVersions.cs: could not find SdkContract");
+} else {
+  const sdkContract =
+    sdkContractMatch[1] === "LatestStable"
+      ? stableLatest
+      : sdkContractMatch[2];
+  if (sdkContract !== sdkV1Target) {
+    errors.push(
+      `SchemaVersions.cs: SdkContract resolves to "${sdkContract}" but canonical sdkMajorTargets[1] expects "${sdkV1Target}"`
+    );
+  }
 }
-const devPath = join("schemas", "dev", `mxc-config.schema.${devSchemaFile}.json`);
-if (!existsSync(join(repoRoot, devPath))) {
-  errors.push(`Missing dev schema file for devSchemaFile "${devSchemaFile}": ${devPath}`);
+if (
+  !/const string StateAware\s*=\s*SdkContract\s*;/.test(schemaVersionsCs)
+) {
+  errors.push(
+    "SchemaVersions.cs: StateAware must alias the high-level SdkContract"
+  );
+}
+
+// -- Canonical stable + development descriptors have the expected status --
+if (registryByVersion.get(stableLatest)?.status !== "published") {
+  errors.push(`Canonical stableLatest "${stableLatest}" is not published in the exact registry`);
+}
+if (registryByVersion.get(maxSupported)?.status !== "development") {
+  errors.push(
+    `Canonical maxSupported "${maxSupported}" is not the development contract in the exact registry`
+  );
+}
+try {
+  validateSdkMajorTargets(sdkMajorTargets, registry);
+} catch (error) {
+  errors.push(`Invalid SDK major targets: ${error.message}`);
 }
 
 // ---------------------------------------------------------------------------
@@ -166,6 +207,6 @@ if (errors.length > 0) {
 
 console.log(
   `Schema version sync OK: maxSupported ${maxSupported} ` +
-    `(min ${min}, state-aware ${stateAware}, WSLC state-aware ${stateAwareWslc}, ` +
-    `stable ${stableLatest})`
+    `(min ${min}, state-aware ${stateAware}, Windows Sandbox state-aware ${stateAwareWindowsSandbox}, WSLC state-aware ${stateAwareWslc}, ` +
+    `stable ${stableLatest}, SDK major targets ${Object.keys(sdkMajorTargets).length})`
 );

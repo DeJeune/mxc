@@ -5,17 +5,23 @@
 //! "C"` surface, using csbindgen. The generated file is gitignored rather than
 //! committed, so it is regenerated rather than diffed.
 //!
-//! Code generation is gated behind the **`dotnetsdk`** cargo feature so that
-//! normal builds — including the whole-workspace backend build matrix — do
-//! **not** compile csbindgen or write into the source tree. Two callers pass
-//! that feature: the C# csproj's `GenerateNativeBindings` target, which keeps
-//! the bindings current for each C# compile, and
+//! Code generation is gated behind the **`dotnetsdk`** cargo feature so normal
+//! builds do not compile csbindgen or write into the source tree. Callers that
+//! need generated bindings opt in explicitly: local C# builds through the
+//! csproj's `GenerateNativeBindings` target, the Windows x64 pipeline build
+//! that publishes bindings for downstream managed jobs, and
 //! `scripts/check-dotnet-bindings-codegen.js`, which regenerates and asserts
 //! the expected entry points are produced.
 
+#[path = "../../mxc-sdk/build/build_mxc_build_common.rs"]
+mod mxc_build_common;
+
 fn main() {
+    mxc_build_common::embed_version_info("MXC native SDK library", "mxc_ffi.dll");
+
     println!("cargo:rerun-if-changed=src/lib.rs");
     println!("cargo:rerun-if-changed=src/error_detail.rs");
+    println!("cargo:rerun-if-changed=src/pty.rs");
     println!("cargo:rerun-if-changed=src/streaming.rs");
     println!("cargo:rerun-if-changed=src/state_aware.rs");
     println!("cargo:rerun-if-changed=build.rs");
@@ -47,6 +53,7 @@ fn generate_csharp_bindings() {
     if let Err(e) = csbindgen::Builder::default()
         .input_extern_file("src/lib.rs")
         .input_extern_file("src/error_detail.rs")
+        .input_extern_file("src/pty.rs")
         .input_extern_file("src/streaming.rs")
         .input_extern_file("src/state_aware.rs")
         .csharp_dll_name("mxc_ffi")

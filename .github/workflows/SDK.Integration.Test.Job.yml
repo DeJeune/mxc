@@ -5,17 +5,27 @@ on:
 
 jobs:
   sdk-integration-tests:
-    name: SDK Integration Tests (${{ matrix.os_label }})
+    name: SDK Integration Tests (${{ matrix.name_label }})
     strategy:
       fail-fast: false
       matrix:
         include:
-          - os_label: windows
+          - name_label: windows-node24
+            os_label: windows
             runner: windows-latest
-          - os_label: linux
+            node_version: 24.21.0
+          - name_label: windows-node26
+            os_label: windows
+            runner: windows-latest
+            node_version: 26.8.0
+          - name_label: linux
+            os_label: linux
             runner: ubuntu-latest
-          - os_label: macos
+            node_version: 24
+          - name_label: macos
+            os_label: macos
             runner: macos-26
+            node_version: 24
     runs-on: ${{ matrix.runner }}
     defaults:
       run:
@@ -37,7 +47,7 @@ jobs:
 
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
-          node-version: 20
+          node-version: ${{ matrix.node_version }}
           cache: npm
           cache-dependency-path: sdk/node/tests/integration/package-lock.json
 
@@ -190,11 +200,20 @@ jobs:
 
       # Linux needs root for Bubblewrap unprivileged-userns paths; `sudo -E`
       # preserves the env vars above.
+      #
+      # `sudo` resets PATH from its own `secure_path`, which picks the image's
+      # Node ahead of the one setup-node installed, so the suite would run on a
+      # different major than this matrix selected. `env "PATH=$PATH"` carries
+      # the chosen toolchain through.
+      #
+      # This lane installs LXC and starts lxc-net specifically so the LXC
+      # backend is covered, so MXC_LXC_TESTS_REQUIRE_EXECUTION turns an LXC
+      # skip into a failure here rather than a green job that tested nothing.
       - name: npm test
         shell: bash
         run: |
           if [ "${{ matrix.os_label }}" = "linux" ]; then
-            sudo -E npm test
+            sudo -E env "PATH=$PATH" MXC_LXC_TESTS_REQUIRE_EXECUTION=1 npm test
           else
             npm test
           fi

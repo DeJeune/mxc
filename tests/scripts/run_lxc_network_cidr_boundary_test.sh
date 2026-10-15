@@ -2,15 +2,12 @@
 # LXC CIDR boundary network filtering test
 #
 # Proves roadmap item 19 / AB#62830559 accepts boundary-valid CIDR
-# destinations while using the default-allow firewall path. The boundary values
-# pinned here are IPv4/IPv6 /0, IPv4 /32, IPv6 /128, non-zero host-bit CIDRs,
-# and a bare literal plus matching single-address CIDR spelling in one policy.
+# destinations while using the default-block firewall path. The boundary values
+# pinned here are IPv4/IPv6 /0, network-aligned /20 and /32 prefixes,
+# and single-address IPv4 /32 and IPv6 /128 prefixes.
 #
-# NOTE: this fixture asserts that boundary prefixes are accepted and programmed,
-# not effective reachability. Allow-list rules are emitted before block-list rules
-# and iptables is first-match-wins (interim behaviour, AB#62830341), so the
-# `0.0.0.0/0` and `::/0` allow entries shadow every blockedHosts entry here.
-# Do not add reachability assertions to this file expecting the block list to win.
+# This fixture asserts boundary prefixes are accepted and programmed, not
+# effective reachability; the GA egress test covers deny precedence.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -33,21 +30,19 @@ skip() {
 command -v iptables >/dev/null 2>&1 || skip "iptables is not installed."
 command -v ip6tables >/dev/null 2>&1 || skip "ip6tables is not installed."
 command -v lxc-create >/dev/null 2>&1 || skip "LXC (lxc-create) is not installed."
+command -v python3 >/dev/null 2>&1 || skip "python3 is not installed."
 [ -f "$LXC_EXEC" ] || skip "lxc-exec binary not built; run build.sh first."
 
 CONFIG="$REPO_DIR/tests/configs/lxc_network_cidr_boundary.json"
 EXPECTED_ALLOWED_HOSTS=(
     "0.0.0.0/0"
     "::/0"
-    "140.82.112.5"
-    "140.82.112.5/20"
+    "140.82.112.0/20"
     "140.82.112.5/32"
-    "2606:50c0:8000::153/32"
+    "2606:50c0::/32"
 )
 EXPECTED_BLOCKED_HOSTS=(
-    "198.51.100.42"
     "198.51.100.42/32"
-    "2001:db8::5"
     "2001:db8::5/128"
 )
 
@@ -97,16 +92,19 @@ assert_firewall_chain_cleaned_up() {
 }
 
 load_config_hosts() {
-    if command -v python3 >/dev/null 2>&1; then
-        python3 -c 'import json, sys; data=json.load(open(sys.argv[1], encoding="utf-8")); net=data["network"]; [print(f"allowed\t{h}") for h in net.get("allowedHosts", [])]; [print(f"blocked\t{h}") for h in net.get("blockedHosts", [])]' "$CONFIG"
-    else
-        awk '
-            /"allowedHosts"[[:space:]]*:/ { list="allowed"; next }
-            /"blockedHosts"[[:space:]]*:/ { list="blocked"; next }
-            list && /]/ { list=""; next }
-            list { print list "\t" $0 }
-        ' "$CONFIG" | sed -n 's/^\([^[:space:]]*\)[[:space:]]*"\([^"]*\)".*/\1\t\2/p'
-    fi
+    python3 - "$CONFIG" <<'PY'
+import ipaddress
+import json
+import sys
+
+egress = json.load(open(sys.argv[1]))["network"]["egress"]
+assert egress["default"] == "deny"
+for label in ("allow", "deny"):
+    for rule in egress[label]:
+        for dest in rule["to"]:
+            ipaddress.ip_network(dest["cidr"], strict=True)
+            print(label + "\t" + dest["cidr"])
+PY
 }
 
 contains_host() {
@@ -121,15 +119,16 @@ contains_host() {
     return 1
 }
 
-mapfile -t CONFIG_HOST_LINES < <(load_config_hosts)
+CONFIG_HOST_TEXT="$(load_config_hosts)" || fail "directional rules contain an invalid or non-network-aligned CIDR."
+mapfile -t CONFIG_HOST_LINES <<<"$CONFIG_HOST_TEXT"
 CONFIG_ALLOWED_HOSTS=()
 CONFIG_BLOCKED_HOSTS=()
 for line in "${CONFIG_HOST_LINES[@]}"; do
     list="${line%%$'\t'*}"
     host="${line#*$'\t'}"
     case "$list" in
-        allowed) CONFIG_ALLOWED_HOSTS+=("$host") ;;
-        blocked) CONFIG_BLOCKED_HOSTS+=("$host") ;;
+        allow) CONFIG_ALLOWED_HOSTS+=("$host") ;;
+        deny) CONFIG_BLOCKED_HOSTS+=("$host") ;;
         *) fail "unexpected host list '$list' in $CONFIG." ;;
     esac
 done
@@ -173,7 +172,7 @@ if [ "$STATUS" -ne 0 ]; then
     fail "lxc-exec exited with status $STATUS for boundary-valid prefixes."
 fi
 
-# SPEC_BRIEF §3 accepts prefix lengths at the inclusive family bounds, including /0.
+# Valid prefixes include both families' inclusive bounds, including /0.
 for host in "${ALL_CONFIG_HOSTS[@]}"; do
     if echo "$OUTPUT" | grep -Fq "Warning: could not resolve host '$host'"; then
         fail "host '$host' was not resolved."
@@ -187,20 +186,17 @@ done
 # logging is unchanged.
 assert_programmed_rule iptables "0.0.0.0/0" ACCEPT
 assert_programmed_rule ip6tables "::/0" ACCEPT
-assert_programmed_rule iptables "140.82.112.5" ACCEPT
-assert_programmed_rule iptables "140.82.112.5/20" ACCEPT
+assert_programmed_rule iptables "140.82.112.0/20" ACCEPT
 assert_programmed_rule iptables "140.82.112.5/32" ACCEPT
-assert_programmed_rule ip6tables "2606:50c0:8000::153/32" ACCEPT
-assert_programmed_rule iptables "198.51.100.42" DROP
+assert_programmed_rule ip6tables "2606:50c0::/32" ACCEPT
 assert_programmed_rule iptables "198.51.100.42/32" DROP
-assert_programmed_rule ip6tables "2001:db8::5" DROP
 assert_programmed_rule ip6tables "2001:db8::5/128" DROP
 
-if ! echo "$OUTPUT" | grep -q "Default network policy: ACCEPT"; then
-    fail "default-allow policy was not applied."
+if ! echo "$OUTPUT" | grep -q "Default network policy: DROP"; then
+    fail "default-deny policy was not applied."
 fi
-if echo "$OUTPUT" | grep -q "Default network policy: DROP"; then
-    fail "default-deny policy was applied unexpectedly."
+if echo "$OUTPUT" | grep -q "Default network policy: ACCEPT"; then
+    fail "default-allow policy was applied unexpectedly."
 fi
 
 # The v6 half is required by roadmap item 19 / AB#62830559; skipping it would be a dual-stack bypass.
@@ -228,5 +224,5 @@ fi
 
 assert_firewall_chain_cleaned_up
 
-echo "PASS: CIDR boundary entries were resolved and programmed with default allow."
+echo "PASS: CIDR boundary entries were accepted and programmed under default deny."
 echo "LXC CIDR boundary network filtering test complete."

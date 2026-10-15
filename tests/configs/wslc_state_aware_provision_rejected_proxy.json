@@ -1,5 +1,6 @@
 {
-    "version": "0.9.0-alpha",
+    "$schema": "../../schemas/stable/mxc-config.schema.1.0.0.json",
+    "version": "1.0.0",
     "phase": "provision",
     "containment": "wslc",
     "network": {
@@ -9,11 +10,9 @@
     "runtimeConfig": {
         "networkProxy": "http://127.0.0.1:8888"
     },
-    "experimental": {
-        "wslc": {
-            "provision": {
-                "image": "alpine:latest"
-            }
+    "wslc": {
+        "provision": {
+        "image": "alpine:latest"
         }
     }
 }

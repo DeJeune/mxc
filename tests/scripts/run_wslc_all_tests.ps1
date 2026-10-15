@@ -2,7 +2,8 @@
 # Licensed under the MIT License.
 
 # WSLC (WSL Container) E2E test runner.
-# Requires: Windows 11, WSL2 enabled, WSLC SDK installed, pre-pulled images.
+# Requires: Windows 11, WSL2 enabled, WSLC SDK installed, and either network
+# access to the test images' registries or those images already cached.
 # Cannot run in GitHub Actions CI (needs WSL2 + WSLC runtime).
 #
 # Runs the one-shot WSLC configs directly, then delegates to
@@ -17,9 +18,9 @@
 #
 # Image pre-pull:
 #   This script invokes scripts\setup-wslc.ps1 as a preflight to populate the
-#   WSLC image cache. MXC's runner no longer auto-pulls images at run time
-#   (see issue #165), so the cache must be warmed before any test that
-#   references a registry image. Pass -SkipSetup to bypass.
+#   WSLC image cache. The runner pulls on a cache miss by itself, so this only
+#   keeps per-test timings clear of one-off download cost. Pass -SkipSetup to
+#   bypass and let the first test that needs an image pull it.
 #
 # Prerequisites for tar import tests:
 #
@@ -46,8 +47,13 @@ $ErrorActionPreference = "Stop"
 $RepoRoot = Split-Path -Parent (Split-Path -Parent $PSScriptRoot)
 $TestConfigs = Join-Path $RepoRoot "tests\configs"
 
-# Find binary -- prefer explicit path, then probe target-specific and default dirs.
-$Target = "x86_64-pc-windows-msvc"
+# Find binary -- prefer explicit path, then probe target-specific and default
+# dirs. Use the host arch to determine which target to use.
+$Target = if ($env:PROCESSOR_ARCHITECTURE -eq 'ARM64') {
+    'aarch64-pc-windows-msvc'
+} else {
+    'x86_64-pc-windows-msvc'
+}
 $Profile = if ($Debug) { "debug" } else { "release" }
 
 if ($WxcExecPath) {
@@ -69,10 +75,11 @@ if (-not $WxcExec -or -not (Test-Path $WxcExec)) {
     exit 1
 }
 
-# Preflight: ensure the WSLC image cache is populated. The runner no longer
-# auto-pulls (see scripts\setup-wslc.ps1 and #165). Skipping is supported for
-# the common case where the caller has already pre-pulled or wants to test
-# a hermetic environment.
+# Preflight: warm the WSLC image cache so per-test timings stay clear of one-off
+# download cost. The runner pulls on a miss by itself, so -SkipSetup is a
+# supported way to exercise that path instead. The lifecycle fixtures provision
+# with the isolated posture, which refuses a registry pull, so the daemon's slot
+# has to be warmed here too or the delegated suite below starts cold.
 if (-not $SkipSetup) {
     $SetupScript = Join-Path $RepoRoot "scripts\setup-wslc.ps1"
     if (Test-Path $SetupScript) {
@@ -87,9 +94,15 @@ if (-not $SkipSetup) {
             "ghcr.io/linuxserver/baseimage-alpine:3.21",
             "quay.io/fedora/fedora-minimal:latest"
         )
-        & $SetupScript -WxcExecPath $WxcExec -Image $images -Force
+        & $SetupScript -WxcExecPath $WxcExec -Image $images -DaemonSlots 1 -Force
         if ($LASTEXITCODE -ne 0) {
-            Write-Host "WARN: setup-wslc.ps1 reported failures; continuing with tests anyway." -ForegroundColor Yellow
+            # The create-and-run half pulls on a miss, but the delegated
+            # lifecycle suite provisions with the isolated posture and cannot,
+            # so a cold slot 0 surfaces much later as unrelated failures.
+            Write-Host "ERROR: setup-wslc.ps1 failed; daemon store slot 0 may be cold." -ForegroundColor Red
+            Write-Host "  The delegated lifecycle suite refuses registry pulls, so it cannot recover." -ForegroundColor Yellow
+            Write-Host "  Resolve the setup failure above, or pass -SkipSetup if both stores are warm." -ForegroundColor Yellow
+            exit 1
         }
         Write-Host ""
     } else {
@@ -103,7 +116,11 @@ function Run-WslcTest {
         [string]$ConfigFile,
         [int]$ExpectedExit = 0,
         [string]$OutputContains = "",
+        [string]$OutputNotContains = "",
         [string]$OutputMatches = "",
+        [switch]$ForceDebug,
+        [hashtable]$EnvVars = $null,
+        [string]$As = "",
         [scriptblock]$PostExitCheck = $null
     )
 
@@ -111,30 +128,42 @@ function Run-WslcTest {
     if (-not (Test-Path $configPath)) {
         Write-Host "  $ConfigFile ... " -NoNewline
         Write-Host "SKIP (file not found)" -ForegroundColor Yellow
-        return @{ Name = $ConfigFile; Pass = $true; Skipped = $true; Reason = "File not found" }
+        return @{ Name = $(if ($As) { $As } else { $ConfigFile }); Pass = $true; Skipped = $true; Reason = "File not found" }
     }
 
     # Skip if the config references a tar file that doesn't exist locally
     $configJson = Get-Content $configPath -Raw | ConvertFrom-Json
-    $tarPath = $configJson.experimental.wslc.imageTarPath
+    $tarPath = $configJson.wslc.imageTarPath
     if ($tarPath -and -not (Test-Path $tarPath)) {
         Write-Host "  $ConfigFile ... " -NoNewline
         Write-Host "SKIP (tar not found: $tarPath)" -ForegroundColor Yellow
-        return @{ Name = $ConfigFile; Pass = $true; Skipped = $true; Reason = "Tar file not found: $tarPath" }
+        return @{ Name = $(if ($As) { $As } else { $ConfigFile }); Pass = $true; Skipped = $true; Reason = "Tar file not found: $tarPath" }
     }
 
-    Write-Host "  $ConfigFile ... " -NoNewline
+    Write-Host "  $(if ($As) { $As } else { $ConfigFile }) ... " -NoNewline
 
     $prevPref = $ErrorActionPreference
     $ErrorActionPreference = "Continue"
-    $wxcArgs = @("--experimental")
-    if ($Debug) {
+    # Scoped to this one invocation so a policy or budget override cannot leak
+    # into the tests that follow.
+    $restore = @{}
+    if ($EnvVars) {
+        foreach ($k in $EnvVars.Keys) {
+            $restore[$k] = [Environment]::GetEnvironmentVariable($k)
+            [Environment]::SetEnvironmentVariable($k, $EnvVars[$k])
+        }
+    }
+    $wxcArgs = @()
+    if ($Debug -or $ForceDebug) {
         $wxcArgs += "--debug"
     }
     $wxcArgs += $configPath
     $output = & $WxcExec @wxcArgs 2>&1 | Out-String
     $exitCode = $LASTEXITCODE
     $ErrorActionPreference = $prevPref
+    foreach ($k in $restore.Keys) {
+        [Environment]::SetEnvironmentVariable($k, $restore[$k])
+    }
 
     # Access violation (0xC0000005) or other hard crashes corrupt WSL runtime
     # state, causing subsequent WslcCreateSession calls to fail with
@@ -158,6 +187,11 @@ function Run-WslcTest {
     if ($pass -and $OutputContains -and $output -notmatch [regex]::Escape($OutputContains)) {
         $pass = $false
         $reason = "Output missing '$OutputContains'"
+    }
+
+    if ($pass -and $OutputNotContains -and $output -match [regex]::Escape($OutputNotContains)) {
+        $pass = $false
+        $reason = "Output unexpectedly contained '$OutputNotContains'"
     }
 
     # OutputMatches is a regex pattern (no escaping).
@@ -197,7 +231,7 @@ function Run-WslcTest {
     # session resources (mounts, networking) before the next test starts.
     Start-Sleep 2
 
-    return @{ Name = $ConfigFile; Pass = $pass; Skipped = $false; Reason = $reason }
+    return @{ Name = $(if ($As) { $As } else { $ConfigFile }); Pass = $pass; Skipped = $false; Reason = $reason }
 }
 
 # Banner
@@ -213,6 +247,15 @@ $null = $results.Add((Run-WslcTest "wslc_env_vars.json" -OutputContains "MY_VAR=
 $null = $results.Add((Run-WslcTest "wslc_exit_code.json" -ExpectedExit 42 -OutputContains "About to exit with code 42"))
 $null = $results.Add((Run-WslcTest "wslc_stderr.json" -OutputContains "stdout message"))
 $null = $results.Add((Run-WslcTest "wslc_large_output.json"))
+
+Write-Host "`n--- Environment Tests ---" -ForegroundColor Cyan
+# PYTHON_VERSION is baked into the image by ENV. Unlike PATH and TERM, no shell
+# fabricates it when it starts without one, so its absence is real evidence that
+# the image environment was replaced rather than a shell default reading back.
+$null = $results.Add((Run-WslcTest "wslc_env_default_block.json" -OutputMatches 'PYVER=\[3\.\d'))
+$null = $results.Add((Run-WslcTest "wslc_env_empty.json" -OutputMatches 'PYVER=\[\][\s\S]*FOO=\[\]'))
+$null = $results.Add((Run-WslcTest "wslc_env_verbatim.json" -OutputMatches 'PYVER=\[\][\s\S]*FOO=\[bar\]'))
+$null = $results.Add((Run-WslcTest "wslc_env_inherit.json" -OutputMatches 'PYVER=\[3\.\d[\s\S]*FOO=\[bar\][\s\S]*LANG=\[C\.OVERRIDDEN\][\s\S]*LANGCOUNT=\[1\]'))
 
 Write-Host "`n--- Filesystem Tests ---" -ForegroundColor Cyan
 
@@ -314,21 +357,45 @@ $null = $results.Add(@{
 })
 
 Write-Host "`n--- Network Tests ---" -ForegroundColor Cyan
-$null = $results.Add((Run-WslcTest "wslc_network_isolated.json"))
+# The pair is the oracle. Both fixtures run the same raw-IP TCP connect, so the
+# only difference between a reached and a blocked verdict is the posture --
+# a probe that cannot resolve DNS or has no interpreter reports neither.
+$null = $results.Add((Run-WslcTest "wslc_network_isolated.json" `
+    -OutputContains "NET_EGRESS_BLOCKED" -OutputNotContains "NET_EGRESS_REACHED"))
+$null = $results.Add((Run-WslcTest "wslc_network_bridged.json" `
+    -OutputContains "NET_EGRESS_REACHED"))
+# WSLc networking is all-or-nothing: it has no CAP_NET_ADMIN for in-container
+# rules, so a per-destination egress rule must be refused rather than quietly
+# widened to the posture's default.
+foreach ($ruleConfig in @("wslc_network_egress_rules_rejected.json", "wslc_network_egress_deny_rules_rejected.json")) {
+    $null = $results.Add((Run-WslcTest $ruleConfig -ExpectedExit -1 `
+        -OutputContains "network.egress allow/deny rules" `
+        -OutputNotContains "WSLC_EGRESS_RULES_SHOULD_NOT_RUN"))
+}
+# `process.env` without `inheritDefaultEnv` is launched through `env -i NAME=VALUE`,
+# which puts the injected proxy URL in argv and therefore in /proc/<pid>/cmdline.
+$null = $results.Add((Run-WslcTest "wslc_network_proxy_credentials_rejected.json" -ExpectedExit -1 `
+    -OutputContains "must not carry credentials" `
+    -OutputNotContains "WSLC_PROXY_CREDENTIALS_SHOULD_NOT_RUN"))
 # Delegate the cooperative proxy fixture to its owning script, which asserts
 # HTTP_PROXY injection/scrub, NO_PROXY neutralization, and attacker-value
-# removal -- assertions the marker-only Run-WslcTest path cannot make.
+# removal -- assertions the marker-only Run-WslcTest path cannot make. Both
+# environment scopes run: the injected variables reach the container through
+# argv when the caller's environment replaces the image's, and through the SDK's
+# setter when it layers over it.
 $proxyScript = Join-Path $PSScriptRoot "run_wslc_proxy_test.ps1"
-$proxyArgs = @{ WxcExecPath = $WxcExec }
-if ($Debug) { $proxyArgs.Debug = $true }
-& $proxyScript @proxyArgs
-$proxyPass = ($LASTEXITCODE -eq 0)
-$null = $results.Add(@{
-    Name    = "wslc_network_proxy.json"
-    Pass    = $proxyPass
-    Skipped = $false
-    Reason  = $(if ($proxyPass) { "" } else { "cooperative proxy test failed" })
-})
+foreach ($proxyConfig in @("wslc_network_proxy.json", "wslc_network_proxy_inherit.json")) {
+    $proxyArgs = @{ WxcExecPath = $WxcExec; ConfigFile = $proxyConfig }
+    if ($Debug) { $proxyArgs.Debug = $true }
+    & $proxyScript @proxyArgs
+    $proxyPass = ($LASTEXITCODE -eq 0)
+    $null = $results.Add(@{
+        Name    = $proxyConfig
+        Pass    = $proxyPass
+        Skipped = $false
+        Reason  = $(if ($proxyPass) { "" } else { "cooperative proxy test failed" })
+    })
+}
 $null = $results.Add((Run-WslcTest "wslc_port_mapping_tcp.json" -OutputContains "PORT_MAPPING_TCP_OK"))
 $null = $results.Add((Run-WslcTest "wslc_port_mapping_multiple.json" -OutputContains "PORT_MAPPING_MULTI_OK"))
 
@@ -340,6 +407,52 @@ $null = $results.Add((Run-WslcTest "wslc_custom_registry_ghcr.json" -OutputConta
 $null = $results.Add((Run-WslcTest "wslc_custom_registry_quay.json" -OutputContains "Image pulled from Quay"))
 $null = $results.Add((Run-WslcTest "wslc_tar_import_rootfs.json" -OutputContains "Hello from tar-imported image"))
 $null = $results.Add((Run-WslcTest "wslc_tar_import_docker_save.json" -OutputContains "Hello from docker-save image"))
+
+Write-Host "`n--- Cold-Cache Tests ---" -ForegroundColor Cyan
+# The preflight above warms the default store, so nothing else here reaches the
+# cache-miss branch.
+$ColdCacheStore = "C:\mxc_wslc_cold_cache_test"
+
+# A predictable path any local user can pre-create is a path they can turn into
+# a junction; deleting through one would reach whatever it targets.
+function Clear-ColdCacheStore {
+    if (-not (Test-Path $ColdCacheStore)) { return }
+    $item = Get-Item $ColdCacheStore -Force
+    if ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) {
+        Write-Host "  REFUSING to purge $ColdCacheStore -- it is a reparse point" -ForegroundColor Red
+        exit 1
+    }
+    Remove-Item $ColdCacheStore -Recurse -Force -ErrorAction SilentlyContinue
+}
+
+Clear-ColdCacheStore
+# --debug is forced: the pull and cache-hit signals are only logged there, and
+# asserting on the workload marker alone would pass on a needless re-pull.
+$null = $results.Add((Run-WslcTest "wslc_cold_cache_pull.json" -ForceDebug `
+    -OutputContains "Pulling image 'busybox:latest'"))
+$null = $results.Add((Run-WslcTest "wslc_cold_cache_pull.json" -ForceDebug `
+    -OutputContains "Image 'busybox:latest' found" -OutputNotContains "Pulling image"))
+# The store is warm now, so a miss here can only come from the denied posture.
+Clear-ColdCacheStore
+$null = $results.Add((Run-WslcTest "wslc_cold_cache_denied_egress.json" -ExpectedExit -1 `
+    -OutputContains "declares no egress" -OutputNotContains "SHOULD_NOT_RUN"))
+# `Check the image name and tag` is unique to the non-retryable arm; every arm
+# says `could not be pulled`.
+$null = $results.Add((Run-WslcTest "wslc_cold_cache_unresolvable.json" -ExpectedExit -1 `
+    -OutputContains "Check the image name and tag"))
+Clear-ColdCacheStore
+
+# A one-second budget on a real pull: the progress callback must abort it rather
+# than let a stalled registry hold the lifecycle worker.
+$null = $results.Add((Run-WslcTest "wslc_cold_cache_pull.json" -ExpectedExit -1 `
+    -As "wslc_cold_cache_pull.json (deadline)" `
+    -EnvVars @{ MXC_WSLC_PULL_TIMEOUT_SECS = "1" } `
+    -OutputContains "did not finish pulling within 1s"))
+Clear-ColdCacheStore
+
+# The allowlist is covered by wslc_common's registry-policy tests, which drive
+# the real registry read through a redirected HKCU key. A release binary has no
+# override to point at a test key, which is what makes the policy trustworthy.
 
 Write-Host "`n--- Timeout Tests ---" -ForegroundColor Cyan
 $null = $results.Add((Run-WslcTest "wslc_timeout.json" -ExpectedExit -1 -OutputContains "Starting long task"))
@@ -361,8 +474,9 @@ $null = $results.Add((Run-WslcTest "wslc_destroy_on_exit_false_rejected.json" `
 Write-Host "`n--- State-Aware Lifecycle Tests ---" -ForegroundColor Cyan
 # Delegate the multi-invocation provision/start/exec/stop/deprovision lifecycle
 # to its owning harness (it needs the daemon binary, mints + threads sandbox ids,
-# and drives the idle-teardown watchdog). Images are already pre-pulled above, so
-# skip its redundant preflight. Fold its exit code into the summary.
+# and drives the idle-teardown watchdog). The preflight above warmed the daemon
+# store slot as well, so skip its redundant preflight. Fold its exit code into
+# the summary.
 $saScript = Join-Path $PSScriptRoot "run_wslc_state_aware_tests.ps1"
 $saArgs = @{ WxcExecPath = $WxcExec; SkipSetup = $true }
 if ($Debug) { $saArgs.Debug = $true }

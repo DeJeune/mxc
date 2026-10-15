@@ -17,12 +17,14 @@
     <!-- Test isolation overrides are compiled only with Rust debug assertions,
          including when the managed tests themselves run in Release. -->
     <MxcTestCargoProfileDir>debug</MxcTestCargoProfileDir>
-    <MxcTestCargoFeatures>test-support</MxcTestCargoFeatures>
+    <MxcTestCargoFeatures>dotnetsdk test-support</MxcTestCargoFeatures>
     <MxcTestCargoFeatures Condition="'$(MxcWithIsolationSession)' == 'true' and $([MSBuild]::IsOSPlatform('Windows'))">$(MxcTestCargoFeatures) isolation_session</MxcTestCargoFeatures>
     <MxcTestCargoFeatures Condition="'$(MxcWithWslc)' == 'true' and $([MSBuild]::IsOSPlatform('Windows'))">$(MxcTestCargoFeatures) wslc</MxcTestCargoFeatures>
     <MxcTestNativeFileName Condition="$([MSBuild]::IsOSPlatform('Windows'))">mxc_ffi.dll</MxcTestNativeFileName>
     <MxcTestNativeFileName Condition="$([MSBuild]::IsOSPlatform('OSX'))">libmxc_ffi.dylib</MxcTestNativeFileName>
     <MxcTestNativeFileName Condition="'$(MxcTestNativeFileName)' == ''">libmxc_ffi.so</MxcTestNativeFileName>
+    <MxcUsePrebuiltTestNativeLibrary Condition="'$(MxcTestPrebuiltNativeLibrary)' != ''">true</MxcUsePrebuiltTestNativeLibrary>
+    <MxcUsePrebuiltTestNativeLibrary Condition="'$(MxcUsePrebuiltTestNativeLibrary)' == ''">false</MxcUsePrebuiltTestNativeLibrary>
   </PropertyGroup>
 
   <ItemGroup>
@@ -31,7 +33,7 @@
 
   <Target Name="BuildMxcTestSupportNativeLibrary"
           AfterTargets="Build"
-          Condition="'$(DesignTimeBuild)' != 'true'">
+          Condition="'$(DesignTimeBuild)' != 'true' and '$(MxcUsePrebuiltTestNativeLibrary)' != 'true'">
     <Exec Command="rustc -vV"
           WorkingDirectory="$(MxcSrcDir)"
           ConsoleToMSBuild="true"
@@ -59,15 +61,21 @@
           DestinationFolder="$(TargetDir)" />
   </Target>
 
+  <Target Name="StageMxcTestSupportNativeLibrary"
+          AfterTargets="Build"
+          Condition="'$(DesignTimeBuild)' != 'true' and '$(MxcUsePrebuiltTestNativeLibrary)' == 'true'">
+    <Error Condition="!Exists('$(MxcTestPrebuiltNativeLibrary)')"
+           Text="The prebuilt test-support native library does not exist at $(MxcTestPrebuiltNativeLibrary)." />
+    <Copy SourceFiles="$(MxcTestPrebuiltNativeLibrary)"
+          DestinationFolder="$(TargetDir)" />
+  </Target>
+
   <ItemGroup>
     <ProjectReference Include="..\Microsoft.Mxc.Sdk\Microsoft.Mxc.Sdk.csproj" />
   </ItemGroup>
 
   <ItemGroup>
-    <!-- Hand-authored cross-language policy fixtures, shared with the Rust FFI
-         tests (src/ffi/mxc_ffi). They live outside this SDK because both
-         languages assert against them; see tests/policy/README.md. -->
-    <EmbeddedResource Include="..\..\..\tests\policy\*.json" Link="policy\%(Filename)%(Extension)" />
+    <EmbeddedResource Include="..\..\..\tests\policy\sdk-v1\**\*.json" Link="policy\sdk-v1\%(RecursiveDir)%(Filename)%(Extension)" />
   </ItemGroup>
 
 </Project>

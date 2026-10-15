@@ -9,6 +9,8 @@ import * as path from 'path';
 import { Worker } from 'node:worker_threads';
 import {
   getPlatformSupport,
+  getAvailableBackends,
+  parseAvailableBackends,
   _resetPlatformSupportCache,
   _setProbeRunner,
   _parseBwrapVersion,
@@ -28,7 +30,137 @@ import {
   findWxcExecutable,
   _resetWxcExecutableCache,
   _setWxcExecutableVerifier,
-} from '../../src/platform.js';
+} from '../../src/v1/platform.js';
+import {
+  _setProbeNativeDependencies,
+  readAvailableBackendsJsonWithNative,
+} from '../../src/bindings/probe.js';
+import { MxcError } from '../../src/v1/errors.js';
+
+describe('native backend discovery', () => {
+  afterEach(() => _setProbeNativeDependencies());
+
+  it('projects Windows and Linux capability payloads with absent lists normalized', () => {
+    assert.deepStrictEqual(parseAvailableBackends(JSON.stringify([
+      { backend: 'processcontainer', tier: 'base-container', capabilities: [
+        'captureDenials', 'filesystemDeniedPaths', 'filesystemEnumeratePaths',
+        'ingressHostLoopbackAllow',
+      ] },
+      { backend: 'bubblewrap', capabilities: ['proxyEnforcement'], warnings: ['diagnostic'] },
+      { backend: 'lxc' },
+      { backend: 'seatbelt' },
+      { backend: 'isolation_session' },
+    ])), [
+      { backend: 'processcontainer', tier: 'base-container', capabilities: [
+        'captureDenials', 'filesystemDeniedPaths', 'filesystemEnumeratePaths',
+        'ingressHostLoopbackAllow',
+      ], warnings: [] },
+      { backend: 'bubblewrap', capabilities: ['proxyEnforcement'], warnings: ['diagnostic'] },
+      { backend: 'lxc', capabilities: [], warnings: [] },
+      { backend: 'seatbelt', capabilities: [], warnings: [] },
+      { backend: 'isolation_session', capabilities: [], warnings: [] },
+    ]);
+    assert.deepStrictEqual(parseAvailableBackends('[]'), []);
+  });
+
+  it('maps newer native names to unknown without claiming a supported capability', () => {
+    assert.deepStrictEqual(parseAvailableBackends(JSON.stringify([{
+      backend: 'new_backend', tier: 'new_tier', capabilities: ['new_capability'],
+    }])), [{
+      backend: 'unknown', tier: 'unknown', capabilities: ['unknown'], warnings: [],
+    }]);
+  });
+
+  it('reports identity-less loopback proxy support without general ingress support', () => {
+    assert.deepStrictEqual(parseAvailableBackends(JSON.stringify([{
+      backend: 'processcontainer',
+      tier: 'base-container',
+      capabilities: ['identitylessLoopbackProxy'],
+    }])), [{
+      backend: 'processcontainer',
+      tier: 'base-container',
+      capabilities: ['identitylessLoopbackProxy'],
+      warnings: [],
+    }]);
+  });
+
+  it('rejects malformed discovery results instead of returning no backends', () => {
+    for (const payload of [
+      null, {}, [null], [[]], [{}], [{ backend: 1 }],
+      [{ backend: 'lxc', tier: null }], [{ backend: 'lxc', capabilities: null }],
+      [{ backend: 'lxc', capabilities: [1] }], [{ backend: 'lxc', warnings: [false] }],
+    ]) {
+      assert.throws(() => parseAvailableBackends(JSON.stringify(payload)),
+        (error: unknown) => error instanceof MxcError && error.code === 'backend_error');
+    }
+    assert.throws(() => parseAvailableBackends('not JSON'),
+      (error: unknown) => error instanceof MxcError && error.code === 'backend_error');
+  });
+
+  it('reads the FFI discovery export in process and frees before unloading', () => {
+    const events: string[] = [];
+    const pointer = { address: 1 };
+    _setProbeNativeDependencies(
+      (() => ({ handle: { unload: () => events.push('unload') } })) as never,
+      ((_: unknown, spec: { symbol: string }) => {
+        if (spec.symbol === 'mxc_available_backends_json') {
+          return () => { events.push('discover'); return pointer; };
+        }
+        assert.strictEqual(spec.symbol, 'mxc_string_free');
+        return (value: unknown) => {
+          assert.strictEqual(value, pointer);
+          events.push('free');
+        };
+      }) as never,
+      (value: unknown) => {
+        assert.strictEqual(value, pointer);
+        events.push('decode');
+        return '[{"backend":"lxc"}]';
+      },
+    );
+    const first = getAvailableBackends();
+    first[0].warnings.push('caller mutation');
+    assert.deepStrictEqual(getAvailableBackends(), [{
+      backend: 'lxc', capabilities: [], warnings: [],
+    }]);
+    assert.deepStrictEqual(events, [
+      'discover', 'decode', 'free', 'unload', 'discover', 'decode', 'free', 'unload',
+    ]);
+  });
+
+  it('unloads if the native export cannot be bound', () => {
+    let unloaded = false;
+    _setProbeNativeDependencies(
+      (() => ({ handle: { unload: () => { unloaded = true; } } })) as never,
+      (() => { throw new Error('missing native export'); }) as never,
+    );
+    assert.throws(() => getAvailableBackends(), /missing native export/);
+    assert.strictEqual(unloaded, true);
+  });
+
+  it('frees owned results even if decoding fails', () => {
+    for (const decode of [
+      () => undefined,
+      () => { throw new Error('decode failed'); },
+    ]) {
+      let freed = false;
+      assert.throws(() => readAvailableBackendsJsonWithNative({
+        availableBackends: () => 1,
+        freeString: () => { freed = true; },
+      }, decode));
+      assert.strictEqual(freed, true);
+    }
+  });
+
+  it('rejects null native results without freeing an allocation', () => {
+    for (const pointer of [null, undefined, 0, 0n]) {
+      assert.throws(() => readAvailableBackendsJsonWithNative({
+        availableBackends: () => pointer,
+        freeString: () => assert.fail('no allocation to free'),
+      }), /null result/);
+    }
+  });
+});
 
 const isWindows = os.platform() === 'win32';
 
@@ -75,7 +207,7 @@ function directZombieChildren(): Set<number> {
         zombies.add(Number(entry));
       }
     } catch (err) {
-      if ((err as NodeJS.ErrnoException).code !== 'ENOENT') throw err;
+      if (!isProcessGoneError(err)) throw err;
     }
   }
   return zombies;
@@ -636,19 +768,22 @@ describe('bwrap version parsing', () => {
 describe('bwrap subprocess helpers', () => {
   it('publishes a worker result only after the anchor closes', () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'mxc-bwrap-anchor-order-'));
-    const anchorPath = path.join(dir, 'delayed-anchor.js');
+    const anchorPath = path.join(dir, 'anchor.js');
     fs.writeFileSync(
       anchorPath,
-      "process.stdout.write('{\"kind\":\"notFound\"}\\n');\n" +
-        'setTimeout(() => process.exit(0), 300);\n',
+      "process.stdout.write('{\"kind\":\"notFound\"}\\n', () => process.exit(0));\n",
     );
     const shared = new SharedArrayBuffer(12 + 1024);
     const header = new Int32Array(shared, 0, 3);
+    const workerReadyBarrier = new Int32Array(new SharedArrayBuffer(4));
+    const anchorExitBarrier = new Int32Array(new SharedArrayBuffer(4));
     const worker = new Worker(
       new URL('../../src/bwrap-probe-worker.js', import.meta.url),
       {
         workerData: {
           shared,
+          workerReadyBarrier: workerReadyBarrier.buffer,
+          anchorExitBarrier: anchorExitBarrier.buffer,
           anchorPath,
           helperPath: anchorPath,
           probeTimeoutMs: 1000,
@@ -659,12 +794,28 @@ describe('bwrap subprocess helpers', () => {
     );
     worker.on('error', () => {});
     try {
-      const started = Date.now();
-      const waitResult = Atomics.wait(header, 0, 0, 1000);
-      const elapsed = Date.now() - started;
+      const readyWaitResult = Atomics.wait(workerReadyBarrier, 0, 0, 30000);
+      assert.notStrictEqual(
+        readyWaitResult,
+        'timed-out',
+        'worker did not finish startup',
+      );
+      const exitWaitResult = Atomics.wait(anchorExitBarrier, 0, 0, 5000);
+      assert.notStrictEqual(exitWaitResult, 'timed-out');
+      assert.strictEqual(
+        Atomics.load(header, 0),
+        0,
+        'worker published from exit instead of waiting for close',
+      );
+      Atomics.store(anchorExitBarrier, 0, 2);
+      Atomics.notify(anchorExitBarrier, 0);
+      const waitResult = Atomics.wait(header, 0, 0, 5000);
       assert.notStrictEqual(waitResult, 'timed-out');
-      assert.ok(elapsed >= 200, `worker published after ${elapsed}ms, before anchor close`);
     } finally {
+      if (Atomics.load(anchorExitBarrier, 0) === 1) {
+        Atomics.store(anchorExitBarrier, 0, 2);
+        Atomics.notify(anchorExitBarrier, 0);
+      }
       worker.unref();
       fs.rmSync(dir, { recursive: true, force: true });
     }
@@ -672,7 +823,7 @@ describe('bwrap subprocess helpers', () => {
 
   it('ignores anchor stderr so diagnostics cannot stall cleanup', () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'mxc-bwrap-anchor-stderr-'));
-    const anchorPath = path.join(dir, 'noisy-anchor.js');
+    const anchorPath = path.join(dir, 'noisy-anchor.cjs');
     fs.writeFileSync(
       anchorPath,
       "const fs = require('node:fs');\n" +

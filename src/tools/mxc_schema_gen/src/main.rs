@@ -1,13 +1,13 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
-//! Version-aware JSON Schema and TypeScript wire-oracle generator.
+//! Version-aware JSON Schema and SDK wire-type generator.
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use clap::{Args, Parser, Subcommand};
-use mxc_config_contract::{descriptor, supported_versions, ContractDescriptor, ContractVersion};
+use mxc_sdk::mxc_contract::{descriptor, supported_versions, ContractDescriptor, ContractVersion};
 use serde_json::{json, Value};
 
 #[derive(Debug, Parser)]
@@ -23,6 +23,8 @@ enum Command {
     Schema(GenerateArgs),
     /// Generate a TypeScript wire oracle.
     Types(GenerateArgs),
+    /// Generate C# wire types.
+    Csharp(GenerateArgs),
     /// List registered contract versions and artifact metadata.
     Versions {
         /// Emit machine-readable JSON.
@@ -34,86 +36,66 @@ enum Command {
 #[derive(Debug, Args)]
 struct GenerateArgs {
     /// Exact registered contract version.
-    #[arg(long, conflicts_with = "legacy_wire")]
-    version: Option<String>,
-    /// Generate from the rolling legacy wire model.
-    #[arg(long, conflicts_with = "version")]
-    legacy_wire: bool,
+    #[arg(long)]
+    version: String,
     /// Output path. Omit to write the artifact to standard output.
     #[arg(long)]
     out: Option<PathBuf>,
 }
 
-#[derive(Debug, Clone, Copy)]
-enum Target {
-    LegacyWire,
-    Contract(ContractVersion),
+fn target(args: &GenerateArgs) -> Result<ContractVersion, String> {
+    ContractVersion::parse_exact(&args.version)
+        .ok_or_else(|| format!("unsupported exact contract version: {}", args.version))
 }
 
-fn target(args: &GenerateArgs) -> Result<Target, String> {
-    match (&args.version, args.legacy_wire) {
-        (Some(version), false) => ContractVersion::parse_exact(version)
-            .map(Target::Contract)
-            .ok_or_else(|| format!("unsupported exact contract version: {version}")),
-        (None, true) => Ok(Target::LegacyWire),
-        (None, false) => Err("one of --version <exact> or --legacy-wire is required".to_string()),
-        _ => unreachable!("clap rejects conflicting target options"),
-    }
-}
-
-fn development_schema(version: ContractVersion) -> Result<(Value, ContractDescriptor), String> {
+fn exact_schema(version: ContractVersion) -> Result<(Value, ContractDescriptor), String> {
     let descriptor = descriptor(version);
-    if !descriptor.is_development() {
+    if !descriptor.generates_artifacts() {
         return Err(format!(
-            "published contract generation for {} is not supported",
+            "published contract {} has no renderable exact model",
             version.as_str()
         ));
     }
-
-    // Keep this exhaustive after the status gate so every future development
-    // contract must explicitly wire its schema source into the generator.
-    let mut schema = match version {
-        ContractVersion::V0_9_0Alpha => mxc_config_contract::dev::development_schema(),
-        ContractVersion::V0_8_0Alpha
-        | ContractVersion::V0_6_0Alpha
-        | ContractVersion::V0_7_0Alpha => {
-            unreachable!("published contracts were rejected above")
-        }
-    };
-    mxc_schema_support::prepare_schema(&mut schema, descriptor.schema_id());
+    let mut schema = renderable_exact_schema(version)?;
+    mxc_sdk::mxc_schema_support::prepare_schema(&mut schema, descriptor.schema_id());
     Ok((schema, descriptor))
 }
 
-fn schema_content(target: Target) -> Result<String, String> {
-    match target {
-        Target::LegacyWire => Ok(format!(
-            "{}\n",
-            wxc_common::wire::generate_config_schema_json()
-        )),
-        Target::Contract(version) => {
-            let (schema, _) = development_schema(version)?;
-            let root = schema
-                .as_object()
-                .ok_or_else(|| "generated contract schema root is not an object".to_string())?;
-            Ok(format!(
-                "{}\n",
-                mxc_schema_support::render_root_ordered(root)
-            ))
+fn renderable_exact_schema(version: ContractVersion) -> Result<Value, String> {
+    match version {
+        ContractVersion::V0_9_0Alpha => {
+            Ok(mxc_sdk::mxc_contract::published::v0_9_0_alpha::published_schema())
         }
+        ContractVersion::V1_0_0 => Ok(mxc_sdk::mxc_contract::published::v1_0_0::published_schema()),
+        ContractVersion::V1_1_0Alpha => Ok(mxc_sdk::mxc_contract::dev::development_schema()),
     }
 }
 
-fn types_content(target: Target) -> Result<String, String> {
-    match target {
-        Target::LegacyWire => Ok(wxc_common::wire::generate_sdk_types_ts()),
-        Target::Contract(version) => {
-            let (schema, _) = development_schema(version)?;
-            Ok(mxc_schema_support::emit_contract_ts(
-                &schema,
-                version.as_str(),
-            ))
-        }
-    }
+fn schema_content(version: ContractVersion) -> Result<String, String> {
+    let (schema, _) = exact_schema(version)?;
+    let root = schema
+        .as_object()
+        .ok_or_else(|| "generated contract schema root is not an object".to_string())?;
+    Ok(format!(
+        "{}\n",
+        mxc_sdk::mxc_schema_support::render_root_ordered(root)
+    ))
+}
+
+fn types_content(version: ContractVersion) -> Result<String, String> {
+    let (schema, _) = exact_schema(version)?;
+    Ok(mxc_sdk::mxc_schema_support::emit_contract_ts(
+        &schema,
+        version.as_str(),
+    ))
+}
+
+fn csharp_content(version: ContractVersion) -> Result<String, String> {
+    let (schema, _) = exact_schema(version)?;
+    Ok(mxc_sdk::mxc_schema_support::emit_contract_cs(
+        &schema,
+        version.as_str(),
+    ))
 }
 
 fn write_artifact(content: &str, path: Option<&Path>, label: &str) -> Result<(), String> {
@@ -151,7 +133,13 @@ fn versions_json() -> Value {
                     "status": descriptor.status().as_str(),
                     "schemaId": descriptor.schema_id(),
                     "schemaPath": descriptor.schema_path(),
-                    "typescriptPath": descriptor.typescript_path()
+                    "typescriptPath": descriptor.typescript_path(),
+                    "csharpPath": descriptor.csharp_path(),
+                    "generatesArtifacts": descriptor.generates_artifacts(),
+                    "requestRoots": descriptor.request_roots().iter().map(|root| json!({
+                        "fixtureDirectory": root.fixture_directory(),
+                        "schemaDefinition": root.schema_definition()
+                    })).collect::<Vec<_>>()
                 })
             })
             .collect(),
@@ -187,6 +175,10 @@ fn run() -> Result<(), String> {
             let content = types_content(target(&args)?)?;
             write_artifact(&content, args.out.as_deref(), "TypeScript wire types")
         }
+        Command::Csharp(args) => {
+            let content = csharp_content(target(&args)?)?;
+            write_artifact(&content, args.out.as_deref(), "C# wire types")
+        }
         Command::Versions { json } => print_versions(json),
     }
 }
@@ -212,23 +204,58 @@ mod tests {
             .as_array()
             .unwrap()
             .iter()
-            .find(|record| record["version"] == "0.9.0-alpha")
+            .find(|record| record["version"] == "1.1.0-alpha")
             .unwrap();
 
         assert_eq!(development["status"], "development");
         assert_eq!(
             development["schemaPath"],
-            "schemas/dev/mxc-config.schema.0.9.0-alpha.json"
+            "schemas/dev/mxc-config.schema.1.1.0-alpha.json"
         );
         assert_eq!(
             development["typescriptPath"],
-            "sdk/node/src/generated/v0_9_0_alpha/wire.ts"
+            "sdk/node/src/generated/v1_1_0_alpha/wire.ts"
         );
+        assert_eq!(development["csharpPath"], serde_json::Value::Null);
+        assert_eq!(development["generatesArtifacts"], true);
+        assert!(development["requestRoots"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|root| root["fixtureDirectory"] == "wslc_provision"
+                && root["schemaDefinition"] == "WslcProvisionRequest"));
     }
 
     #[test]
-    fn published_generation_is_rejected() {
-        let error = development_schema(ContractVersion::V0_8_0Alpha).unwrap_err();
-        assert!(error.contains("not supported"), "{error}");
+    fn published_v0_9_generation_is_supported() {
+        let (schema, descriptor) = exact_schema(ContractVersion::V0_9_0Alpha).unwrap();
+
+        assert_eq!(descriptor.status().as_str(), "published");
+        assert_eq!(
+            schema["$id"],
+            "https://github.com/microsoft/mxc/schemas/stable/mxc-config.schema.0.9.0-alpha.json"
+        );
+        assert!(schema["definitions"]["OneShotRequest"].is_object());
+        let types = types_content(ContractVersion::V0_9_0Alpha).unwrap();
+        assert!(types.contains("Emitted from the exact MXC 0.9.0-alpha contract"));
+        assert!(types.contains("export type OneShotRequest"));
+    }
+
+    #[test]
+    fn published_v1_generation_is_supported() {
+        let (schema, descriptor) = exact_schema(ContractVersion::V1_0_0).unwrap();
+
+        assert_eq!(descriptor.status().as_str(), "published");
+        assert_eq!(
+            schema["$id"],
+            "https://github.com/microsoft/mxc/schemas/stable/mxc-config.schema.1.0.0.json"
+        );
+        assert!(schema["definitions"]["OneShotRequest"].is_object());
+        let types = types_content(ContractVersion::V1_0_0).unwrap();
+        assert!(types.contains("Emitted from the exact MXC 1.0.0 contract"));
+        assert!(types.contains("export interface OneShotRequest"));
+        let csharp = csharp_content(ContractVersion::V1_0_0).unwrap();
+        assert!(csharp.contains("Emitted from the exact MXC 1.0.0 contract"));
+        assert!(csharp.contains("internal sealed class OneShotRequest"));
     }
 }

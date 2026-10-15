@@ -5,24 +5,26 @@
 .SYNOPSIS
     Runs WSLc state-aware lifecycle E2E tests. Companion to
     run_wslc_all_tests.ps1 -- that script asserts the one-shot path; this
-    script asserts the state-aware path (`phase` / `sandboxId` envelope style,
-    multi-invocation provision -> start -> exec* -> stop -> deprovision driven
-    through the long-lived `wxc-wslc-daemon`).
+    script asserts the CLI-routed state-aware path (multi-invocation provision
+    -> start -> exec* -> stop -> deprovision driven through the long-lived
+    `wxc-wslc-daemon`).
 
 .DESCRIPTION
-    Each test invokes wxc-exec.exe with a base64-encoded state-aware request
-    envelope. Provision / start / stop / deprovision return a JSON envelope on
-    stdout (asserted on `result` / `error`); a successful exec streams the
-    script's own stdout (relayed from the daemon) and exits with the script's
-    exit code. Because the daemon owns the live WslcSession / WslcContainer
-    handles, exec against a provisioned+started sandbox hits a WARM container:
+    Each test invokes wxc-exec.exe with lifecycle routing in --operation /
+    --container-id and a base64-encoded phase-specific request payload.
+    Provision / start / stop / deprovision return a JSON envelope on stdout
+    (asserted on `result` / `error`); a successful exec streams the script's
+    own stdout (relayed from the daemon) and exits with the script's exit code.
+    Because the daemon owns the live WslcSession / WslcContainer handles, exec
+    against a provisioned+started sandbox hits a WARM container:
     the tests prove this two ways -- (1) in-container state (a /tmp marker)
     written by one exec is visible to a later, separate wxc-exec invocation,
     and (2) after the last sandbox is deprovisioned the daemon idles out and
     exits on its own.
 
     Requires: Windows 11, WSL2, the WSLC SDK runtime (wslcsdk.dll staged next
-    to the binaries), pre-pulled images, and a wxc-exec.exe + wxc-wslc-daemon.exe
+    to the binaries), registry access or an already-cached alpine:latest, and a
+    wxc-exec.exe + wxc-wslc-daemon.exe
     built with `--features wslc`. Cannot run in GitHub Actions CI.
 
     Prerequisite probes (skip, not fail, if missing):
@@ -37,7 +39,7 @@
     provision so the spawned daemon inherits them.
 
 .PARAMETER WxcExecPath
-    Path to wxc-exec.exe. Default probes the x64 target release/debug dirs.
+    Path to wxc-exec.exe. Default probes the host-arch target release/debug dirs.
 
 .PARAMETER ConfigDir
     Directory holding the state-aware request fixtures. Defaults to
@@ -47,7 +49,8 @@
     Probe the debug target dir and pass --debug to wxc-exec.
 
 .PARAMETER SkipSetup
-    Skip the WSLC image pre-pull preflight (assume the cache is warm).
+    Skip the image-cache warming preflight. The provision fixtures declare deny
+    egress, which refuses a registry pull, so the cache has to be warm already.
 
 .EXAMPLE
     .\run_wslc_state_aware_tests.ps1
@@ -66,7 +69,13 @@ $RepoRoot = Split-Path -Parent (Split-Path -Parent $PSScriptRoot)
 
 # ---------------- Locate wxc-exec.exe + daemon ----------------
 
-$Target = "x86_64-pc-windows-msvc"
+# Find binary -- prefer explicit path, then probe target-specific and default
+# dirs. Use the host arch to determine which target to use. 
+$Target = if ($env:PROCESSOR_ARCHITECTURE -eq 'ARM64') {
+    'aarch64-pc-windows-msvc'
+} else {
+    'x86_64-pc-windows-msvc'
+}
 $Prof = if ($Debug) { "debug" } else { "release" }
 
 if ($WxcExecPath) {
@@ -95,7 +104,7 @@ Write-Host "Binary: $WxcExec`n" -ForegroundColor Gray
 $DaemonExe = Join-Path (Split-Path -Parent $WxcExec) "wxc-wslc-daemon.exe"
 if (-not (Test-Path $DaemonExe)) {
     Write-Host "SKIPPED: wxc-wslc-daemon.exe not found next to wxc-exec.exe ($DaemonExe)" -ForegroundColor Yellow
-    Write-Host "  Build it with: cargo build --features wslc $(if (-not $Debug) { '--release ' })--target $Target -p wxc-wslc-daemon" -ForegroundColor Yellow
+    Write-Host "  Build it with: cargo build -p mxc-sdk --bin wxc-wslc-daemon --features wslc $(if (-not $Debug) { '--release ' })--target $Target" -ForegroundColor Yellow
     exit 0
 }
 $DaemonProcName = "wxc-wslc-daemon"
@@ -115,13 +124,24 @@ if (-not $ConfigDir) {
 
 # ---------------- Image pre-pull preflight ----------------
 
+# The daemon leases its store from the slot pool, not from
+# %TEMP%\mxc-wslc-sessions, and the fixtures below provision with the isolated
+# posture, which refuses a registry pull. Slot 0 is the one a daemon holding a
+# single session leases, so that is the store these images have to be in.
 if (-not $SkipSetup) {
     $SetupScript = Join-Path $RepoRoot "scripts\setup-wslc.ps1"
     if (Test-Path $SetupScript) {
         Write-Host "Pre-pulling WSLc images (pass -SkipSetup to skip)..." -ForegroundColor Cyan
-        & $SetupScript -WxcExecPath $WxcExec -Image @("alpine:latest") -Force
+        & $SetupScript -WxcExecPath $WxcExec -Image @("alpine:latest", "python:3.12-alpine") -DaemonSlots 1 -Force
         if ($LASTEXITCODE -ne 0) {
-            Write-Host "WARN: setup-wslc.ps1 reported failures; continuing anyway." -ForegroundColor Yellow
+            # Continuing would leave slot 0 cold, and the isolated fixtures
+            # cannot pull, so every later provision fails for a reason that
+            # looks nothing like this preflight.
+            Write-Host "ERROR: setup-wslc.ps1 failed to warm daemon store slot 0." -ForegroundColor Red
+            Write-Host "  The lifecycle fixtures provision with the isolated posture, which refuses a" -ForegroundColor Yellow
+            Write-Host "  registry pull, so a cold slot fails every provision rather than pulling." -ForegroundColor Yellow
+            Write-Host "  Resolve the setup failure above, or pass -SkipSetup if slot 0 is already warm." -ForegroundColor Yellow
+            exit 1
         }
         Write-Host ""
     } else {
@@ -131,17 +151,12 @@ if (-not $SkipSetup) {
 
 # ---------------- Helpers ----------------
 
-# Encode a state-aware request envelope and run wxc-exec against it. The request
-# comes from a static JSON fixture under tests/configs (with `{{SANDBOX_ID}}`
-# substitution) or an inline hashtable. A `wslc:{{SANDBOX_ID}}` placeholder
-# retains backend identity during static corpus parsing and is replaced as one
-# unit by the full real ID. Returns @{ ExitCode; Stdout; Stderr }.
-function Invoke-StateAware {
+function ConvertTo-StateAwareInvocation {
     param(
         [hashtable]$Request,
         [string]$ConfigFile,
         [string]$SandboxId,
-        [switch]$DryRun
+        [int]$WindowsPort
     )
 
     if ($ConfigFile) {
@@ -158,31 +173,113 @@ function Invoke-StateAware {
             $json = $json -replace 'wslc:\{\{SANDBOX_ID\}\}', $SandboxId
             $json = $json -replace '\{\{SANDBOX_ID\}\}', $SandboxId
         }
-    } elseif ($Request) {
-        if (-not $Request.ContainsKey('version')) {
-            $Request = $Request.Clone()
-            $Request['version'] = '0.9.0-alpha'
+        try {
+            $requestObject = $json | ConvertFrom-Json
+        } catch {
+            throw "Config fixture is not valid JSON: $path ($($_.Exception.Message))"
         }
-        $json = $Request | ConvertTo-Json -Compress -Depth 12
+
+        # The fixture carries a schema-valid default so the static config corpus
+        # still validates; a caller that needs a port nothing else owns
+        # overrides it here.
+        if ($WindowsPort) {
+            $mappings = $requestObject.wslc.provision.portMappings
+            if (-not $mappings) {
+                throw "Fixture $ConfigFile has no wslc.provision.portMappings to override"
+            }
+            foreach ($mapping in $mappings) { $mapping.windowsPort = $WindowsPort }
+        }
+    } elseif ($Request) {
+        $requestObject = $Request.Clone()
+        if (-not $Request.ContainsKey('version')) {
+            $requestObject['version'] = '1.0.0'
+        }
     } else {
-        throw "Invoke-StateAware requires either -Request or -ConfigFile"
+        throw "State-aware invocation requires either -Request or -ConfigFile"
     }
 
-    $b64 = [Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes($json))
+    if ($requestObject -is [System.Collections.IDictionary]) {
+        $phaseKey = $requestObject.Keys | Where-Object { $_ -ceq 'phase' } | Select-Object -First 1
+        if ($null -eq $phaseKey) { throw "State-aware request must contain a string 'phase'" }
+        $phase = $requestObject[$phaseKey]
+        $null = $requestObject.Remove($phaseKey)
+    } else {
+        $phaseProperty = $requestObject.PSObject.Properties |
+            Where-Object { $_.Name -ceq 'phase' } |
+            Select-Object -First 1
+        if ($null -eq $phaseProperty) { throw "State-aware request must contain a string 'phase'" }
+        $phase = $phaseProperty.Value
+        $requestObject.PSObject.Properties.Remove($phaseProperty.Name)
+    }
+    if ($phase -isnot [string]) { throw "State-aware request must contain a string 'phase'" }
 
-    $argList = @('--experimental')
+    $routingSandboxId = $null
+    if ($phase -ne 'provision') {
+        if ($requestObject -is [System.Collections.IDictionary]) {
+            $sandboxIdKey = $requestObject.Keys |
+                Where-Object { $_ -ceq 'sandboxId' } |
+                Select-Object -First 1
+            if ($null -eq $sandboxIdKey) {
+                throw "State-aware '$phase' request must contain a string 'sandboxId'"
+            }
+            $routingSandboxId = $requestObject[$sandboxIdKey]
+            $null = $requestObject.Remove($sandboxIdKey)
+        } else {
+            $sandboxIdProperty = $requestObject.PSObject.Properties |
+                Where-Object { $_.Name -ceq 'sandboxId' } |
+                Select-Object -First 1
+            if ($null -eq $sandboxIdProperty) {
+                throw "State-aware '$phase' request must contain a string 'sandboxId'"
+            }
+            $routingSandboxId = $sandboxIdProperty.Value
+            $requestObject.PSObject.Properties.Remove($sandboxIdProperty.Name)
+        }
+        if ($routingSandboxId -isnot [string]) {
+            throw "State-aware '$phase' request must contain a string 'sandboxId'"
+        }
+    }
+
+    $json = $requestObject | ConvertTo-Json -Compress -Depth 12
+    $b64 = [Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes($json))
+    @{
+        Operation    = [string]$phase
+        SandboxId    = $routingSandboxId
+        ConfigBase64 = $b64
+    }
+}
+
+# Launch one state-aware phase and return without waiting, so a caller can start
+# another phase while this one is still running. Complete it with Wait-StateAware.
+#
+# Drive wxc-exec via System.Diagnostics.Process rather than Start-Process
+# -Wait: the state-aware phase process exits as soon as it has driven the
+# daemon, but the daemon lives on. Start-Process -Wait does a process-tree
+# (job-object) wait and would block until the surviving daemon also exits.
+# WaitForExit()/ReadToEnd() here wait only on the direct phase process (the
+# daemon does not inherit its stdio), matching how real SDK callers behave;
+# capturing stderr this way also keeps wxc-exec's warnings off PowerShell's
+# error stream (a bare `&` + `2>` throws under $ErrorActionPreference=Stop).
+function Start-StateAware {
+    [CmdletBinding()]
+    param(
+        [hashtable]$Request,
+        [string]$ConfigFile,
+        [string]$SandboxId,
+        [int]$WindowsPort,
+        [switch]$DryRun
+    )
+
+    $invocation = ConvertTo-StateAwareInvocation `
+        -Request $Request -ConfigFile $ConfigFile -SandboxId $SandboxId -WindowsPort $WindowsPort
+
+    $argList = @('--operation', $invocation.Operation)
+    if ($invocation.Operation -ne 'provision') {
+        $argList += @('--container-id', $invocation.SandboxId)
+    }
     if ($DryRun) { $argList += '--dry-run' }
     if ($Debug) { $argList += '--debug' }
-    $argList += @('--config-base64', $b64)
+    $argList += @('--config-base64', $invocation.ConfigBase64)
 
-    # Drive wxc-exec via System.Diagnostics.Process rather than Start-Process
-    # -Wait: the state-aware phase process exits as soon as it has driven the
-    # daemon, but the daemon lives on. Start-Process -Wait does a process-tree
-    # (job-object) wait and would block until the surviving daemon also exits.
-    # WaitForExit()/ReadToEnd() here wait only on the direct phase process (the
-    # daemon does not inherit its stdio), matching how real SDK callers behave;
-    # capturing stderr this way also keeps wxc-exec's warnings off PowerShell's
-    # error stream (a bare `&` + `2>` throws under $ErrorActionPreference=Stop).
     $psi = [System.Diagnostics.ProcessStartInfo]::new()
     $psi.FileName = $WxcExec
     foreach ($a in $argList) { $psi.ArgumentList.Add($a) }
@@ -194,27 +291,160 @@ function Invoke-StateAware {
     $proc = [System.Diagnostics.Process]::new()
     $proc.StartInfo = $psi
     $null = $proc.Start()
-    # Read stdout to EOF (fires when the phase process exits) while draining
-    # stderr async so a large stderr can never deadlock the stdout read.
-    $stderrTask = $proc.StandardError.ReadToEndAsync()
-    $stdoutText = $proc.StandardOutput.ReadToEnd()
-    $proc.WaitForExit()
-    $stderrText = $stderrTask.GetAwaiter().GetResult()
-    $exitCode = $proc.ExitCode
-    $proc.Dispose()
+
+    # Read both pipes async so neither can fill and stall the child while this
+    # caller is off starting another phase.
     @{
-        ExitCode = $exitCode
-        Stdout   = if ($null -eq $stdoutText) { "" } else { [string]$stdoutText }
-        Stderr   = if ($null -eq $stderrText) { "" } else { [string]$stderrText }
+        Process    = $proc
+        StdoutTask = $proc.StandardOutput.ReadToEndAsync()
+        StderrTask = $proc.StandardError.ReadToEndAsync()
+        StartedAt  = [DateTime]::UtcNow
     }
 }
 
+# Complete a Start-StateAware handle. Returns
+# @{ ExitCode; Stdout; Stderr; StartedAt; EndedAt } with UTC timestamps.
+function Wait-StateAware {
+    param([hashtable]$Handle)
+
+    $stdoutText = $Handle.StdoutTask.GetAwaiter().GetResult()
+    $stderrText = $Handle.StderrTask.GetAwaiter().GetResult()
+    $Handle.Process.WaitForExit()
+    $endedAt = [DateTime]::UtcNow
+    $exitCode = $Handle.Process.ExitCode
+    $Handle.Process.Dispose()
+    @{
+        ExitCode  = $exitCode
+        Stdout    = if ($null -eq $stdoutText) { "" } else { [string]$stdoutText }
+        Stderr    = if ($null -eq $stderrText) { "" } else { [string]$stderrText }
+        StartedAt = $Handle.StartedAt
+        EndedAt   = $endedAt
+    }
+}
+
+# Start a phase like Start-StateAware but leave stdout unread, so a caller can
+# watch for a marker line while the process is still running. Pair with
+# Wait-StateAwareLines, which returns the same shape as Wait-StateAware.
+function Start-StateAwareLines {
+    [CmdletBinding()]
+    param(
+        [hashtable]$Request,
+        [string]$ConfigFile,
+        [string]$SandboxId,
+        [int]$WindowsPort
+    )
+
+    $invocation = ConvertTo-StateAwareInvocation `
+        -Request $Request -ConfigFile $ConfigFile -SandboxId $SandboxId -WindowsPort $WindowsPort
+
+    $argList = @('--operation', $invocation.Operation)
+    if ($invocation.Operation -ne 'provision') {
+        $argList += @('--container-id', $invocation.SandboxId)
+    }
+    if ($Debug) { $argList += '--debug' }
+    $argList += @('--config-base64', $invocation.ConfigBase64)
+
+    $psi = [System.Diagnostics.ProcessStartInfo]::new()
+    $psi.FileName = $WxcExec
+    foreach ($a in $argList) { $psi.ArgumentList.Add($a) }
+    $psi.UseShellExecute = $false
+    $psi.RedirectStandardOutput = $true
+    $psi.RedirectStandardError = $true
+    $psi.CreateNoWindow = $true
+
+    $proc = [System.Diagnostics.Process]::new()
+    $proc.StartInfo = $psi
+    $null = $proc.Start()
+
+    # Stderr drains async so a large stderr cannot stall the child while this
+    # caller is reading stdout a line at a time.
+    @{
+        Process     = $proc
+        StderrTask  = $proc.StandardError.ReadToEndAsync()
+        Buffered    = New-Object System.Collections.Generic.List[string]
+        PendingLine = $null
+        StartedAt   = [DateTime]::UtcNow
+    }
+}
+
+# Read stdout lines until one matches $Marker, keeping them for the eventual
+# Wait-StateAwareLines. $false if the stream ends or the wait runs out.
+function Wait-StateAwareMarker {
+    param(
+        [hashtable]$Handle,
+        [string]$Marker,
+        [int]$TimeoutSec = 60
+    )
+
+    $deadline = [DateTime]::UtcNow.AddSeconds($TimeoutSec)
+    while ([DateTime]::UtcNow -lt $deadline) {
+        if ($null -eq $Handle.PendingLine) {
+            $Handle.PendingLine = $Handle.Process.StandardOutput.ReadLineAsync()
+        }
+        if (-not $Handle.PendingLine.Wait(250)) { continue }
+        $line = $Handle.PendingLine.GetAwaiter().GetResult()
+        $Handle.PendingLine = $null
+        if ($null -eq $line) { return $false }
+        $null = $Handle.Buffered.Add($line)
+        if ($line -match $Marker) { return $true }
+    }
+    $false
+}
+
+# Complete a Start-StateAwareLines handle, rejoining the lines already read with
+# the rest of the stream.
+function Wait-StateAwareLines {
+    param([hashtable]$Handle)
+
+    if ($null -ne $Handle.PendingLine) {
+        $pending = $Handle.PendingLine.GetAwaiter().GetResult()
+        $Handle.PendingLine = $null
+        if ($null -ne $pending) { $null = $Handle.Buffered.Add($pending) }
+    }
+    $rest = $Handle.Process.StandardOutput.ReadToEndAsync().GetAwaiter().GetResult()
+    $stderrText = $Handle.StderrTask.GetAwaiter().GetResult()
+    $Handle.Process.WaitForExit()
+    $endedAt = [DateTime]::UtcNow
+    $exitCode = $Handle.Process.ExitCode
+    $Handle.Process.Dispose()
+
+    $stdout = [string]::Join([Environment]::NewLine, $Handle.Buffered)
+    if (-not [string]::IsNullOrEmpty($rest)) {
+        if ($stdout.Length -gt 0) { $stdout += [Environment]::NewLine }
+        $stdout += $rest
+    }
+    @{
+        ExitCode  = $exitCode
+        Stdout    = $stdout
+        Stderr    = if ($null -eq $stderrText) { "" } else { [string]$stderrText }
+        StartedAt = $Handle.StartedAt
+        EndedAt   = $endedAt
+    }
+}
+
+# Parse or clone a state-aware request, move lifecycle routing to executor
+# arguments, encode the remaining phase-specific payload, and run wxc-exec.
+# A `wslc:{{SANDBOX_ID}}` fixture placeholder retains backend identity during
+# static corpus parsing and is replaced as one unit by the full real ID.
+# Returns @{ ExitCode; Stdout; Stderr }.
+function Invoke-StateAware {
+    [CmdletBinding()]
+    param(
+        [hashtable]$Request,
+        [string]$ConfigFile,
+        [string]$SandboxId,
+        [int]$WindowsPort,
+        [switch]$DryRun
+    )
+
+    Wait-StateAware (Start-StateAware `
+        -Request $Request -ConfigFile $ConfigFile -SandboxId $SandboxId `
+        -WindowsPort $WindowsPort -DryRun:$DryRun)
+}
+
 # Like Invoke-StateAware but records the wall-clock arrival time of each stdout
-# line, so a test can prove output is streamed incrementally (an early line lands
-# well before a later one) rather than buffered and dumped together at process
-# exit. `ReadLineAsync` returns the moment the child flushes a newline-terminated
-# line, so a streamed line is observed immediately; a buffer-then-dump impl would
-# surface every line at once only when the process exits. Returns
+# line. It uses the same parsed/cloned request preparation and CLI routing, then
+# observes each newline-terminated line as soon as the child flushes it. Returns
 # @{ ExitCode; Stdout; Stderr; Lines = @(@{ Text; At }) } (At = UTC DateTime).
 function Invoke-StateAwareStreaming {
     param(
@@ -223,34 +453,15 @@ function Invoke-StateAwareStreaming {
         [string]$SandboxId
     )
 
-    if ($ConfigFile) {
-        $path = Join-Path $ConfigDir $ConfigFile
-        if (-not (Test-Path $path)) { throw "Config fixture not found: $path" }
-        $json = Get-Content $path -Raw
-        if ($json -match '\{\{SANDBOX_ID\}\}') {
-            if (-not $SandboxId) {
-                throw "Fixture $ConfigFile contains {{SANDBOX_ID}} but -SandboxId was not supplied"
-            }
-            if ($json -match 'wslc:\{\{SANDBOX_ID\}\}' -and -not $SandboxId.StartsWith('wslc:')) {
-                throw "Fixture $ConfigFile requires a wslc: sandbox ID"
-            }
-            $json = $json -replace 'wslc:\{\{SANDBOX_ID\}\}', $SandboxId
-            $json = $json -replace '\{\{SANDBOX_ID\}\}', $SandboxId
-        }
-    } elseif ($Request) {
-        if (-not $Request.ContainsKey('version')) {
-            $Request = $Request.Clone()
-            $Request['version'] = '0.9.0-alpha'
-        }
-        $json = $Request | ConvertTo-Json -Compress -Depth 12
-    } else {
-        throw "Invoke-StateAwareStreaming requires either -Request or -ConfigFile"
-    }
+    $invocation = ConvertTo-StateAwareInvocation `
+        -Request $Request -ConfigFile $ConfigFile -SandboxId $SandboxId
 
-    $b64 = [Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes($json))
-    $argList = @('--experimental')
+    $argList = @('--operation', $invocation.Operation)
+    if ($invocation.Operation -ne 'provision') {
+        $argList += @('--container-id', $invocation.SandboxId)
+    }
     if ($Debug) { $argList += '--debug' }
-    $argList += @('--config-base64', $b64)
+    $argList += @('--config-base64', $invocation.ConfigBase64)
 
     $psi = [System.Diagnostics.ProcessStartInfo]::new()
     $psi.FileName = $WxcExec
@@ -294,6 +505,14 @@ function Parse-Envelope {
     try { $Stdout | ConvertFrom-Json } catch { $null }
 }
 
+# The executor writes the exec error envelope after any warnings and the
+# diagnostic buffer, so it is the last non-empty line on stderr.
+function Parse-StderrEnvelope {
+    param([string]$Stderr)
+    $last = ($Stderr -split '\r?\n' | Where-Object { $_.Trim() } | Select-Object -Last 1)
+    Parse-Envelope -Stdout $last
+}
+
 # Which arm of the envelope is present.
 function Envelope-Arm {
     param($Envelope)
@@ -303,9 +522,95 @@ function Envelope-Arm {
     '<unknown>'
 }
 
+# The epoch seconds a stamped exec printed before and after its sleep; $null if
+# the run did not report both.
+function Get-ExecInterval {
+    param([string]$Stdout)
+    $stamps = @($Stdout -split '\r?\n' | Where-Object { $_.Trim() -match '^\d+$' } | ForEach-Object { [long]$_.Trim() })
+    if ($stamps.Count -lt 2) { return $null }
+    @{ Start = $stamps[0]; End = $stamps[-1] }
+}
+
 # Is the daemon process currently running?
 function Test-DaemonRunning {
     $null -ne (Get-Process -Name $DaemonProcName -ErrorAction SilentlyContinue)
+}
+
+# Bind port 0 on loopback so the OS picks a free ephemeral port, then release
+# it. WSLC forwards on 127.0.0.1 only, so that is the scope that has to be free.
+function Get-FreeTcpPort {
+    $listener = [System.Net.Sockets.TcpListener]::new([System.Net.IPAddress]::Loopback, 0)
+    $listener.Start()
+    try {
+        $listener.LocalEndpoint.Port
+    } finally {
+        $listener.Stop()
+    }
+}
+
+# Connect to a mapped host port and return the bytes the container's listener
+# sends back, or $null. Binding inside the container succeeds in any Linux
+# netns whether or not the host mapping was ever configured, so only this
+# round trip shows the forward exists.
+function Get-TcpResponse {
+    param([int]$Port, [int]$TimeoutMs = 5000, [int]$RetryMs = 250)
+
+    $deadline = (Get-Date).AddMilliseconds($TimeoutMs)
+    while ((Get-Date) -lt $deadline) {
+        $client = [System.Net.Sockets.TcpClient]::new()
+        try {
+            $connect = $client.ConnectAsync('127.0.0.1', $Port)
+            if ($connect.Wait(1000) -and $client.Connected) {
+                $stream = $client.GetStream()
+                $stream.ReadTimeout = 2000
+                $buffer = New-Object byte[] 256
+                $read = $stream.Read($buffer, 0, $buffer.Length)
+                if ($read -gt 0) {
+                    return [System.Text.Encoding]::ASCII.GetString($buffer, 0, $read)
+                }
+            }
+        } catch {
+            # Listener not up yet, or the forward is absent; retry until the deadline.
+        } finally {
+            $client.Dispose()
+        }
+        Start-Sleep -Milliseconds $RetryMs
+    }
+    $null
+}
+
+# Provision and start a sandbox with a mapped host port, retrying when another
+# process takes the port first. WSLC installs the forward at container start
+# rather than at provision, so a port claimed in between fails the start phase
+# with HRESULT 0x80072740.
+function New-PortMappedSandbox {
+    param([int]$MaxAttempts = 3)
+
+    for ($attempt = 1; $attempt -le $MaxAttempts; $attempt++) {
+        $port = Get-FreeTcpPort
+        $provision = Invoke-StateAware `
+            -ConfigFile 'wslc_state_aware_provision_port_mappings.json' -WindowsPort $port
+        $provisionEnv = Parse-Envelope -Stdout $provision.Stdout
+        if ((Envelope-Arm $provisionEnv) -ne 'result') {
+            return @{ Port = $port; SandboxId = $null; Provision = $provision; Start = $null }
+        }
+
+        $sandboxId = [string]$provisionEnv.result.sandboxId
+        $start = Invoke-StateAware -ConfigFile 'wslc_state_aware_start.json' -SandboxId $sandboxId
+        $startEnv = Parse-Envelope -Stdout $start.Stdout
+        $portTaken = (Envelope-Arm $startEnv) -eq 'error' -and
+            "$($startEnv.error.message)" -match '0x80072740'
+
+        if (-not $portTaken -or $attempt -eq $MaxAttempts) {
+            return @{ Port = $port; SandboxId = $sandboxId; Provision = $provision; Start = $start }
+        }
+
+        Write-Host "  host port $port was taken before start; retrying" -ForegroundColor DarkGray
+        try {
+            $null = Invoke-StateAware `
+                -ConfigFile 'wslc_state_aware_deprovision.json' -SandboxId $sandboxId
+        } catch { }
+    }
 }
 
 $script:TestResults = @()
@@ -514,6 +819,56 @@ try {
         } | Out-Null
     }
 
+    # A6b: the environment scope reaches process launch through the daemon, not
+    # just the one-shot runner. The probe counts HOSTNAME in the real
+    # environment rather than expanding $HOSTNAME, which the image's shell
+    # fabricates whether or not the variable was inherited.
+    if ($execedOk) {
+        Run-StateAwareTest "A: exec (verbatim env replaces the image environment)" {
+            $r = Invoke-StateAware -ConfigFile 'wslc_state_aware_exec_env_replace.json' -SandboxId $script:sandboxId
+            Assert-True ($r.ExitCode -eq 0) "exit code = 0"
+            Assert-True ($r.Stdout -match 'MY_SA_VAR=\[replaced\]') `
+                "the caller's entry reaches the container"
+            Assert-True ($r.Stdout -match 'HOSTCOUNT=\[0\]') `
+                "the image environment is absent ($($r.Stdout.Trim()))"
+        } | Out-Null
+    }
+
+    if ($execedOk) {
+        Run-StateAwareTest "A: exec (inheritDefaultEnv layers over the image environment)" {
+            $r = Invoke-StateAware -ConfigFile 'wslc_state_aware_exec_env_inherit.json' -SandboxId $script:sandboxId
+            Assert-True ($r.ExitCode -eq 0) "exit code = 0"
+            Assert-True ($r.Stdout -match 'MY_SA_VAR=\[layered\]') `
+                "the caller's entry reaches the container"
+            Assert-True ($r.Stdout -match 'HOSTCOUNT=\[1\]') `
+                "the image environment survives ($($r.Stdout.Trim()))"
+        } | Out-Null
+    }
+
+    # The two states that carry no entries. They differ only in the scope the
+    # daemon is told to apply, so nothing else distinguishes them on the wire.
+    if ($execedOk) {
+        Run-StateAwareTest "A: exec (omitted env takes the image environment)" {
+            $r = Invoke-StateAware -ConfigFile 'wslc_state_aware_exec_env_default.json' -SandboxId $script:sandboxId
+            Assert-True ($r.ExitCode -eq 0) "exit code = 0"
+            Assert-True ($r.Stdout -match 'HOSTCOUNT=\[1\]') `
+                "the image environment survives ($($r.Stdout.Trim()))"
+        } | Out-Null
+    }
+
+    if ($execedOk) {
+        Run-StateAwareTest "A: exec (explicitly empty env leaves the child nothing)" {
+            $r = Invoke-StateAware -ConfigFile 'wslc_state_aware_exec_env_empty.json' -SandboxId $script:sandboxId
+            Assert-True ($r.ExitCode -eq 0) "exit code = 0"
+            Assert-True ($r.Stdout -match 'HOSTCOUNT=\[0\]') `
+                "the image environment is absent ($($r.Stdout.Trim()))"
+            # PWD and SHLVL are fabricated by the shell itself, so an emptied
+            # environment reads back as those two and nothing else.
+            Assert-True ($r.Stdout -match 'VARCOUNT=\[2\]') `
+                "only the shell's own variables remain ($($r.Stdout.Trim()))"
+        } | Out-Null
+    }
+
     # A7: the exact exec root rejects immutable filesystem policy
     # structurally. Direct WSLc policy tests retain the backend validation.
     if ($execedOk) {
@@ -711,8 +1066,162 @@ try {
     }
 }
 
-# ---------------- Lifecycle D: validation rejections ----------------
+# ---------------- Lifecycle CP: provision-time port mappings ----------------
 
+# `wslc.provision.portMappings` is container-scoped, so the daemon applies it to
+# the container this sandbox owns. The container starts a listener on the mapped
+# container port and the assertion connects to the host port to read a sentinel
+# back. Requires schema 1.1.0-alpha, the only contract declaring the field.
+$script:portSandboxId = $null
+$script:portStarted = $false
+$portDeprovisionedOk = $false
+$portSandbox = New-PortMappedSandbox
+$hostPort = $portSandbox.Port
+$script:portSandboxId = $portSandbox.SandboxId
+try {
+    $portProvisionedOk = Run-StateAwareTest "CP: provision (port mappings)" {
+        $null = Assert-ResultEnvelope $portSandbox.Provision "port-mapping provision"
+    }
+
+    $portStartedOk = $false
+    if ($portProvisionedOk) {
+        $portStartedOk = Run-StateAwareTest "CP: start" {
+            $null = Assert-ResultEnvelope $portSandbox.Start "port-mapping start"
+            $script:portStarted = $true
+        }
+    }
+
+    if ($portStartedOk) {
+        Run-StateAwareTest "CP: host reaches the container through the mapped port ($hostPort -> 8080)" {
+            $r = Invoke-StateAware -ConfigFile 'wslc_state_aware_exec_port_bind.json' -SandboxId $script:portSandboxId
+            Assert-True ($r.ExitCode -eq 0) "listener exec exit code = 0"
+            Assert-True ($r.Stdout -match 'LISTENER_STARTED') "container listener started"
+
+            $response = Get-TcpResponse -Port $hostPort
+            Assert-True ($null -ne $response) `
+                "host connected to 127.0.0.1:$hostPort (forward configured)"
+            Assert-True ($response -match 'STATE_AWARE_PORT_MAPPING_OK') `
+                "host read the container's sentinel back through the forward (got '$response')"
+        } | Out-Null
+    }
+
+    if ($portProvisionedOk) {
+        Run-StateAwareTest "CP: stop" {
+            $r = Invoke-StateAware -ConfigFile 'wslc_state_aware_stop.json' -SandboxId $script:portSandboxId
+            $null = Assert-ResultEnvelope $r "port-mapping stop"
+            $script:portStarted = $false
+        } | Out-Null
+        $portDeprovPassed = Run-StateAwareTest "CP: deprovision" {
+            $r = Invoke-StateAware -ConfigFile 'wslc_state_aware_deprovision.json' -SandboxId $script:portSandboxId
+            $null = Assert-ResultEnvelope $r "port-mapping deprovision"
+        }
+        if ($portDeprovPassed) { $portDeprovisionedOk = $true }
+    }
+} finally {
+    if ($null -ne $script:portSandboxId -and -not $portDeprovisionedOk) {
+        Write-Host ""
+        Write-Host "[cleanup] best-effort deprovision of $script:portSandboxId" -ForegroundColor DarkGray
+
+        # Deprovisioning a started container can fail or strand container
+        # processes, so stop it first when start succeeded.
+        if ($script:portStarted) {
+            try { $null = Invoke-StateAware -ConfigFile 'wslc_state_aware_stop.json' -SandboxId $script:portSandboxId } catch { }
+        }
+        try { $null = Invoke-StateAware -ConfigFile 'wslc_state_aware_deprovision.json' -SandboxId $script:portSandboxId } catch { }
+    }
+}
+
+# ---------------- Lifecycle CQ: mapped-container ownership ----------------
+
+# The forward belongs to one container, so a sibling listening on the same
+# container port must not answer on it, a second container cannot take a host
+# port already forwarded, and deprovisioning must release the port for reuse.
+$script:cqSandboxId = $null
+$script:cqStarted = $false
+$script:cqSiblingId = $null
+$script:cqCollisionId = $null
+$script:cqReuseId = $null
+$cqSandbox = New-PortMappedSandbox
+$cqPort = $cqSandbox.Port
+$script:cqSandboxId = $cqSandbox.SandboxId
+try {
+    $cqReady = $false
+    if ($null -ne $script:cqSandboxId -and (Envelope-Arm (Parse-Envelope -Stdout $cqSandbox.Start.Stdout)) -eq 'result') {
+        $script:cqStarted = $true
+        $r = Invoke-StateAware -ConfigFile 'wslc_state_aware_exec_port_bind.json' -SandboxId $script:cqSandboxId
+        $cqReady = ($r.ExitCode -eq 0 -and $r.Stdout -match 'LISTENER_STARTED')
+    }
+
+    if ($cqReady) {
+        Run-StateAwareTest "CQ: an unmapped sibling on the same container port never answers the forward" {
+            $script:cqSiblingId = Provision-Sandbox -ConfigFile 'wslc_state_aware_provision_unmapped_sibling.json'
+            Assert-True ($null -ne $script:cqSiblingId) "sibling provisioned"
+            if ($script:cqSiblingId) {
+                $null = Invoke-StateAware -ConfigFile 'wslc_state_aware_start.json' -SandboxId $script:cqSiblingId
+                $s = Invoke-StateAware -ConfigFile 'wslc_state_aware_exec_sibling_port_bind.json' -SandboxId $script:cqSiblingId
+                Assert-True ($s.Stdout -match 'LISTENER_STARTED') "sibling listener started on the same container port"
+
+                $response = Get-TcpResponse -Port $cqPort
+                Assert-True ($response -match 'STATE_AWARE_PORT_MAPPING_OK') `
+                    "the forward answered from its own container (got '$response')"
+                Assert-True ($response -notmatch 'SIBLING_SENTINEL_MUST_NOT_ESCAPE') `
+                    "the unmapped sibling never reached the host port (got '$response')"
+            }
+        } | Out-Null
+
+        Run-StateAwareTest "CQ: a second container cannot claim a host port already forwarded" {
+            $p = Invoke-StateAware -ConfigFile 'wslc_state_aware_provision_port_mappings.json' -WindowsPort $cqPort
+            $envObj = Parse-Envelope -Stdout $p.Stdout
+            if ((Envelope-Arm $envObj) -eq 'result') {
+                $script:cqCollisionId = [string]$envObj.result.sandboxId
+                $s = Invoke-StateAware -ConfigFile 'wslc_state_aware_start.json' -SandboxId $script:cqCollisionId
+                Assert-True ($s.ExitCode -ne 0) "the colliding sandbox failed to start"
+                $startEnv = Parse-Envelope -Stdout $s.Stdout
+                $code = if ($startEnv) { $startEnv.error.code } else { '<no envelope>' }
+                Assert-True ($code -eq 'backend_error') "the collision surfaced as 'backend_error' (got '$code')"
+                Assert-True ("$($startEnv.error.message)" -match '0x80072740') `
+                    "the message carries the address-in-use HRESULT (got '$($startEnv.error.message)')"
+            } else {
+                Assert-True $false "the colliding provision returned an envelope: $($p.Stdout)"
+            }
+        } | Out-Null
+    }
+
+    # Release the port, then prove a fresh sandbox can forward it again.
+    if ($script:cqSandboxId) {
+        if ($script:cqStarted) {
+            $null = Invoke-StateAware -ConfigFile 'wslc_state_aware_stop.json' -SandboxId $script:cqSandboxId
+            $script:cqStarted = $false
+        }
+        $null = Invoke-StateAware -ConfigFile 'wslc_state_aware_deprovision.json' -SandboxId $script:cqSandboxId
+        $script:cqSandboxId = $null
+
+        Run-StateAwareTest "CQ: deprovision releases the host port for reuse ($cqPort)" {
+            $p = Invoke-StateAware -ConfigFile 'wslc_state_aware_provision_port_mappings.json' -WindowsPort $cqPort
+            $envObj = Assert-ResultEnvelope $p "same-port reprovision"
+            if ($envObj) {
+                $script:cqReuseId = [string]$envObj.result.sandboxId
+                $s = Invoke-StateAware -ConfigFile 'wslc_state_aware_start.json' -SandboxId $script:cqReuseId
+                $null = Assert-ResultEnvelope $s "same-port start"
+                $e = Invoke-StateAware -ConfigFile 'wslc_state_aware_exec_port_bind.json' -SandboxId $script:cqReuseId
+                Assert-True ($e.Stdout -match 'LISTENER_STARTED') "listener started in the reusing sandbox"
+                $response = Get-TcpResponse -Port $cqPort
+                Assert-True ($response -match 'STATE_AWARE_PORT_MAPPING_OK') `
+                    "the reused host port forwards again (got '$response')"
+            }
+        } | Out-Null
+    }
+} finally {
+    foreach ($id in @($script:cqSiblingId, $script:cqCollisionId, $script:cqReuseId, $script:cqSandboxId)) {
+        if ($id) {
+            Write-Host "[cleanup] best-effort deprovision of $id" -ForegroundColor DarkGray
+            try { $null = Invoke-StateAware -ConfigFile 'wslc_state_aware_stop.json' -SandboxId $id } catch { }
+            try { $null = Invoke-StateAware -ConfigFile 'wslc_state_aware_deprovision.json' -SandboxId $id } catch { }
+        }
+    }
+}
+
+# ---------------- Lifecycle D: validation rejections ----------------
 # Validation runs before any daemon call, so these never provision a real
 # sandbox and need no cleanup. They cover the provision-phase honor-matrix
 # rejection cells.
@@ -747,7 +1256,7 @@ foreach ($egress in @('deny', 'allow')) {
                         egress = @{ default = $egress }
                         ingress = @{ default = $ingress; hostLoopback = $hostLoopback }
                     }
-                    experimental = @{ wslc = @{ provision = @{ image = 'alpine:latest' } } }
+                    wslc = @{ provision = @{ image = 'alpine:latest' } }
                 }
                 $r = Invoke-StateAware -Request $req -DryRun
                 Assert-True ($r.ExitCode -ne 0) "exit code is non-zero (policy rejected)"
@@ -764,7 +1273,7 @@ Run-StateAwareTest "D: provision (bridged with omitted ingress deny defaults rej
         phase = 'provision'
         containment = 'wslc'
         network = @{ egress = @{ default = 'allow' } }
-        experimental = @{ wslc = @{ provision = @{ image = 'alpine:latest' } } }
+        wslc = @{ provision = @{ image = 'alpine:latest' } }
     }
     $r = Invoke-StateAware -Request $req -DryRun
     Assert-True ($r.ExitCode -ne 0) "exit code is non-zero (policy rejected)"
@@ -803,7 +1312,7 @@ foreach ($phase in @('provision', 'exec')) {
             }
             if ($phase -eq 'provision') {
                 $req.containment = 'wslc'
-                $req.experimental = @{ wslc = @{ provision = @{ image = 'alpine:latest' } } }
+                $req.wslc = @{ provision = @{ image = 'alpine:latest' } }
             } else {
                 $req.sandboxId = 'wslc:0123456789abcdef0123456789abcdef'
                 $req.process = @{ commandLine = 'echo LEGACY_NETWORK_MUST_NOT_RUN' }
@@ -820,9 +1329,9 @@ foreach ($phase in @('provision', 'exec')) {
     }
 }
 
-# The exact exec root rejects a directional posture before dispatch, preserving
-# the provision-time network mode across later process invocations.
-Run-StateAwareTest "D: exec (directional network change rejected structurally)" {
+# The exec contract accepts directional network syntax, then the backend rejects
+# changing the network mode bound during provision.
+Run-StateAwareTest "D: exec (directional network change rejected by policy)" {
     $req = @{
         phase = 'exec'
         sandboxId = 'wslc:0123456789abcdef0123456789abcdef'
@@ -833,12 +1342,12 @@ Run-StateAwareTest "D: exec (directional network change rejected structurally)" 
         }
     }
     $r = Invoke-StateAware -Request $req -DryRun
-    Assert-True ($r.ExitCode -ne 0) "exit code is non-zero (contract rejected)"
+    Assert-True ($r.ExitCode -ne 0) "exit code is non-zero (policy rejected)"
     $envObj = Parse-Envelope -Stdout $r.Stdout
     $code = if ($envObj) { $envObj.error.code } else { '<no envelope>' }
-    Assert-True ($code -eq 'malformed_request') "error.code is 'malformed_request' (got '$code')"
+    Assert-True ($code -eq 'policy_validation') "error.code is 'policy_validation' (got '$code')"
     $msg = if ($envObj) { [string]$envObj.error.message } else { '' }
-    Assert-True ($msg -match 'at `network`.*unknown field `network`') `
+    Assert-True ($msg -match 'network mode is bound to the provision phase') `
         "error.message identifies immutable exec network policy (got '$msg')"
 } | Out-Null
 
@@ -982,7 +1491,7 @@ try {
             $req = @{ phase = 'exec'; sandboxId = $script:edgeSandboxId; process = @{ commandLine = 'echo should-not-run'; timeout = 30000 } }
             $r = Invoke-StateAware -Request $req
             Assert-True ($r.ExitCode -ne 0) "exit code is non-zero (exec before start rejected)"
-            $envObj = Parse-Envelope -Stdout $r.Stdout
+            $envObj = Parse-StderrEnvelope -Stderr $r.Stderr
             $code = if ($envObj) { $envObj.error.code } else { '<no envelope>' }
             Assert-True ($code -eq 'not_started') "error.code is 'not_started' (got '$code')"
         } | Out-Null
@@ -1004,7 +1513,7 @@ try {
             $slow = @{ phase = 'exec'; sandboxId = $script:edgeSandboxId; process = @{ commandLine = 'sleep 30'; timeout = 3000 } }
             $r = Invoke-StateAware -Request $slow
             Assert-True ($r.ExitCode -ne 0) "timed-out exec exits non-zero"
-            $envObj = Parse-Envelope -Stdout $r.Stdout
+            $envObj = Parse-StderrEnvelope -Stderr $r.Stderr
             $code = if ($envObj) { $envObj.error.code } else { '<no envelope>' }
             Assert-True ($code -eq 'backend_error') "timeout maps to 'backend_error' (got '$code')"
 
@@ -1012,6 +1521,38 @@ try {
             $r2 = Invoke-StateAware -Request $after
             Assert-True ($r2.ExitCode -eq 0) "next exec after a timeout succeeds (container stayed warm)"
             Assert-True ($r2.Stdout -match 'survived-timeout') "warm container still executes commands"
+        } | Out-Null
+    }
+
+    # F2b: the command emits output before its timeout fires, which is the case
+    # where an envelope on stdout would corrupt the script's output.
+    if ($edgeStartedOk) {
+        Run-StateAwareTest "F: post-admission exec failure keeps stdout clean" {
+            $req = @{ phase = 'exec'; sandboxId = $script:edgeSandboxId; process = @{ commandLine = "sh -c 'echo PRE_FAILURE_MARKER; sleep 30'"; timeout = 5000 } }
+            $r = Invoke-StateAware -Request $req
+            Assert-True ($r.ExitCode -ne 0) "post-admission failure exits non-zero"
+            Assert-True ($r.Stdout -match 'PRE_FAILURE_MARKER') `
+                "stdout carries the script's output ($($r.Stdout.Trim()))"
+            Assert-True ($r.Stdout -notmatch '"error"') `
+                "stdout carries no envelope fragment ($($r.Stdout.Trim()))"
+            $envObj = Parse-StderrEnvelope -Stderr $r.Stderr
+            $code = if ($envObj) { $envObj.error.code } else { '<no envelope>' }
+            Assert-True ($code -eq 'backend_error') "error.code is 'backend_error' on stderr (got '$code')"
+        } | Out-Null
+    }
+
+    # F2c: printf, not echo, so the script's stderr ends without a newline.
+    if ($edgeStartedOk) {
+        Run-StateAwareTest "F: exec error envelope survives unterminated script stderr" {
+            $req = @{ phase = 'exec'; sandboxId = $script:edgeSandboxId; process = @{ commandLine = "sh -c 'printf SCRIPT_STDERR_NO_NEWLINE >&2; sleep 30'"; timeout = 5000 } }
+            $r = Invoke-StateAware -Request $req
+            Assert-True ($r.ExitCode -ne 0) "post-admission failure exits non-zero"
+            Assert-True ($r.Stderr -match 'SCRIPT_STDERR_NO_NEWLINE') `
+                "stderr carries the script's unterminated output"
+            $envObj = Parse-StderrEnvelope -Stderr $r.Stderr
+            $code = if ($envObj) { $envObj.error.code } else { '<no envelope>' }
+            Assert-True ($code -eq 'backend_error') `
+                "the envelope is still parseable on its own line (got '$code')"
         } | Out-Null
     }
 
@@ -1143,6 +1684,225 @@ try {
     }
     if ($null -ne $script:mcSandboxB -and -not $mcBDeprovisionedOk) {
         try { $null = Invoke-StateAware -ConfigFile 'wslc_state_aware_deprovision.json' -SandboxId $script:mcSandboxB } catch { }
+    }
+}
+
+# ---------------- Lifecycle J: exec concurrency ----------------
+
+# Placed ahead of H because H drives the daemon to exit. Each scenario needs two
+# phases in flight at once -- overlapping runs on separate sandboxes, a refused
+# same-container second exec, and a lifecycle command issued mid-run -- so all
+# three use Start-StateAware rather than the sequential Invoke-StateAware.
+$script:ccSandboxA = $null
+$script:ccSandboxB = $null
+$ccADeprovisionedOk = $false
+$ccBDeprovisionedOk = $false
+try {
+    $ccAReady = $false
+    $ccBReady = $false
+    $ccAProvOk = Run-StateAwareTest "J: provision sandbox A" {
+        $r = Invoke-StateAware -ConfigFile 'wslc_state_aware_provision.json'
+        $envObj = Assert-ResultEnvelope $r "concurrency A provision"
+        if ($envObj) { $script:ccSandboxA = [string]$envObj.result.sandboxId }
+    }
+    $ccBProvOk = Run-StateAwareTest "J: provision sandbox B" {
+        $r = Invoke-StateAware -ConfigFile 'wslc_state_aware_provision.json'
+        $envObj = Assert-ResultEnvelope $r "concurrency B provision"
+        if ($envObj) { $script:ccSandboxB = [string]$envObj.result.sandboxId }
+    }
+    if ($ccAProvOk) {
+        $ccAReady = Run-StateAwareTest "J: start sandbox A" {
+            $r = Invoke-StateAware -ConfigFile 'wslc_state_aware_start.json' -SandboxId $script:ccSandboxA
+            $null = Assert-ResultEnvelope $r "concurrency A start"
+        }
+    }
+    if ($ccBProvOk) {
+        $ccBReady = Run-StateAwareTest "J: start sandbox B" {
+            $r = Invoke-StateAware -ConfigFile 'wslc_state_aware_start.json' -SandboxId $script:ccSandboxB
+            $null = Assert-ResultEnvelope $r "concurrency B start"
+        }
+    }
+
+    # J1: both sandboxes share one utility VM, so their clocks agree and the two
+    # runs can be compared directly. Serialized runs cannot overlap at all.
+    if ($ccAReady -and $ccBReady) {
+        Run-StateAwareTest "J: execs on two sandboxes overlap in wall clock" {
+            $stamped = "sh -c 'date +%s; sleep 6; date +%s'"
+            $sleepA = @{ phase = 'exec'; sandboxId = $script:ccSandboxA; process = @{ commandLine = $stamped; timeout = 60000 } }
+            $sleepB = @{ phase = 'exec'; sandboxId = $script:ccSandboxB; process = @{ commandLine = $stamped; timeout = 60000 } }
+
+            $handleA = Start-StateAware -Request $sleepA
+            $handleB = Start-StateAware -Request $sleepB
+            $ra = Wait-StateAware $handleA
+            $rb = Wait-StateAware $handleB
+
+            Assert-True ($ra.ExitCode -eq 0) "A exec exit 0"
+            Assert-True ($rb.ExitCode -eq 0) "B exec exit 0"
+
+            $ia = Get-ExecInterval -Stdout $ra.Stdout
+            $ib = Get-ExecInterval -Stdout $rb.Stdout
+            Assert-True ($null -ne $ia -and $null -ne $ib) "both runs reported an in-container start and end"
+            if ($null -ne $ia -and $null -ne $ib) {
+                $overlapSec = [math]::Min($ia.End, $ib.End) - [math]::Max($ia.Start, $ib.Start)
+                Assert-True ($overlapSec -ge 2) `
+                    "the two 6s runs overlapped by ${overlapSec}s inside their containers"
+            }
+        } | Out-Null
+    }
+
+    # J2: the refusal is a pre-admission error, so it reaches the client as an
+    # envelope on stderr rather than a terminal stream frame.
+    if ($ccAReady) {
+        Run-StateAwareTest "J: second exec on the same sandbox is refused as busy" {
+            $blocker = @{ phase = 'exec'; sandboxId = $script:ccSandboxA; process = @{ commandLine = "sh -c 'echo blocker-ready; sleep 6; echo blocker-done'"; timeout = 30000 } }
+            $second = @{ phase = 'exec'; sandboxId = $script:ccSandboxA; process = @{ commandLine = 'echo should-not-run'; timeout = 30000 } }
+
+            $blockerHandle = Start-StateAwareLines -Request $blocker
+            $ready = Wait-StateAwareMarker -Handle $blockerHandle -Marker 'blocker-ready'
+            Assert-True $ready "the first exec reported running inside its container"
+            $rs = Invoke-StateAware -Request $second
+
+            Assert-True ($rs.ExitCode -ne 0) "the refused exec exits non-zero"
+            Assert-True ($rs.Stdout -notmatch 'should-not-run') "the refused command never ran"
+            $envObj = Parse-StderrEnvelope -Stderr $rs.Stderr
+            $code = if ($envObj) { $envObj.error.code } else { '<no envelope>' }
+            $message = if ($envObj) { [string]$envObj.error.message } else { '' }
+            Assert-True ($code -eq 'backend_error') "busy surfaces as 'backend_error' (got '$code')"
+            Assert-True ($message -match 'already has an exec in flight') `
+                "the message names the single-flight slot (got '$message')"
+
+            $rb = Wait-StateAwareLines $blockerHandle
+            Assert-True ($rb.ExitCode -eq 0) "the first exec is unaffected by the refusal"
+            Assert-True ($rb.Stdout -match 'blocker-done') "the first exec ran to completion"
+        } | Out-Null
+    }
+
+    # J3: stop must wait for the run instead of deleting the container under it,
+    # so its wall clock covers the rest of the 4s exec.
+    if ($ccBReady) {
+        $ccStopWaited = Run-StateAwareTest "J: stop during an in-flight exec waits for the run" {            $longRun = @{ phase = 'exec'; sandboxId = $script:ccSandboxB; process = @{ commandLine = "sh -c 'echo run-ready; sleep 6; echo run-survived'"; timeout = 30000 } }
+
+            $execHandle = Start-StateAwareLines -Request $longRun
+            $ready = Wait-StateAwareMarker -Handle $execHandle -Marker 'run-ready'
+            Assert-True $ready "the exec reported running inside its container"
+            $stopHandle = Start-StateAware -ConfigFile 'wslc_state_aware_stop.json' -SandboxId $script:ccSandboxB
+            $rstop = Wait-StateAware $stopHandle
+            $rexec = Wait-StateAwareLines $execHandle
+
+            Assert-True ($rexec.ExitCode -eq 0) "the in-flight exec still exits 0"
+            Assert-True ($rexec.Stdout -match 'run-survived') "the run was not cut short by the stop"
+            $null = Assert-ResultEnvelope $rstop "stop issued during an exec"
+            $stopSec = [math]::Round(($rstop.EndedAt - $rstop.StartedAt).TotalSeconds, 2)
+            Assert-True ($stopSec -ge 1.5) `
+                "stop took ${stopSec}s, so it waited for the run rather than racing it"
+        } | Out-Null
+    }
+
+    # J4: a long exec on A must not delay a full lifecycle on another sandbox,
+    # so C's own run has to fall inside A's. Both sandboxes share one utility VM,
+    # so their in-container stamps are on the same clock.
+    if ($ccAReady) {
+        Run-StateAwareTest "J: a long exec on A does not block lifecycle work on another sandbox" {
+            $blocker = @{ phase = 'exec'; sandboxId = $script:ccSandboxA; process = @{ commandLine = "sh -c 'echo blocker-ready; date +%s; sleep 25; date +%s; echo blocker-done'"; timeout = 60000 } }
+            $blockerHandle = Start-StateAwareLines -Request $blocker
+            $ready = Wait-StateAwareMarker -Handle $blockerHandle -Marker 'blocker-ready'
+            Assert-True $ready "A's exec reported running inside its container"
+
+            $sandboxC = $null
+            $icC = $null
+            try {
+                $rp = Invoke-StateAware -ConfigFile 'wslc_state_aware_provision.json'
+                $envObj = Assert-ResultEnvelope $rp "C provision during A's exec"
+                if ($envObj) { $sandboxC = [string]$envObj.result.sandboxId }
+
+                if ($sandboxC) {
+                    $rs = Invoke-StateAware -ConfigFile 'wslc_state_aware_start.json' -SandboxId $sandboxC
+                    $null = Assert-ResultEnvelope $rs "C start during A's exec"
+
+                    $req = @{ phase = 'exec'; sandboxId = $sandboxC; process = @{ commandLine = "sh -c 'date +%s; echo C-ran-during-A; date +%s'"; timeout = 30000 } }
+                    $re = Invoke-StateAware -Request $req
+                    Assert-True ($re.ExitCode -eq 0) "C exec during A's exec exits 0"
+                    Assert-True ($re.Stdout -match 'C-ran-during-A') "C produced its own output"
+                    $icC = Get-ExecInterval -Stdout $re.Stdout
+
+                    $rstop = Invoke-StateAware -ConfigFile 'wslc_state_aware_stop.json' -SandboxId $sandboxC
+                    $null = Assert-ResultEnvelope $rstop "C stop during A's exec"
+                }
+            } finally {
+                if ($sandboxC) {
+                    try { $null = Invoke-StateAware -ConfigFile 'wslc_state_aware_deprovision.json' -SandboxId $sandboxC } catch { }
+                }
+            }
+
+            $rb = Wait-StateAwareLines $blockerHandle
+            Assert-True ($rb.ExitCode -eq 0) "A's exec still exits 0"
+            Assert-True ($rb.Stdout -match 'blocker-done') "A's exec ran to completion"
+
+            $iaA = Get-ExecInterval -Stdout $rb.Stdout
+            Assert-True ($null -ne $iaA -and $null -ne $icC) "both runs reported in-container stamps"
+            if ($null -ne $iaA -and $null -ne $icC) {
+                Assert-True ($icC.Start -ge $iaA.Start -and $icC.End -le $iaA.End) `
+                    "C ran inside A's run: A $($iaA.Start)..$($iaA.End), C $($icC.Start)..$($icC.End)"
+            }
+        } | Out-Null
+    }
+
+    if ($ccAProvOk) {
+        $ccADeprovPassed = Run-StateAwareTest "J: deprovision A" {
+            $r = Invoke-StateAware -ConfigFile 'wslc_state_aware_deprovision.json' -SandboxId $script:ccSandboxA
+            $null = Assert-ResultEnvelope $r "concurrency A deprovision"
+        }
+        if ($ccADeprovPassed) { $ccADeprovisionedOk = $true }
+    }
+    if ($ccBProvOk) {
+        $ccBDeprovPassed = Run-StateAwareTest "J: deprovision B" {
+            $r = Invoke-StateAware -ConfigFile 'wslc_state_aware_deprovision.json' -SandboxId $script:ccSandboxB
+            $null = Assert-ResultEnvelope $r "concurrency B deprovision"
+        }
+        if ($ccBDeprovPassed) { $ccBDeprovisionedOk = $true }
+    }
+} finally {
+    if ($null -ne $script:ccSandboxA -and -not $ccADeprovisionedOk) {
+        try { $null = Invoke-StateAware -ConfigFile 'wslc_state_aware_deprovision.json' -SandboxId $script:ccSandboxA } catch { }
+    }
+    if ($null -ne $script:ccSandboxB -and -not $ccBDeprovisionedOk) {
+        try { $null = Invoke-StateAware -ConfigFile 'wslc_state_aware_deprovision.json' -SandboxId $script:ccSandboxB } catch { }
+    }
+}
+
+# ---------------- Lifecycle S: store isolation from create-and-run ----------------
+
+# A store's VHDX admits one live session, and the daemon used to default to the
+# create-and-run store, so this combination is what failed. Must stay ahead of
+# test H, which drives the daemon to exit.
+Run-StateAwareTest "S: create-and-run execution succeeds while a sandbox is live" {
+    $script:storeSandbox = Provision-Sandbox
+    Assert-True ($null -ne $script:storeSandbox) "provisioned a sandbox to hold the daemon's store"
+    if ($null -eq $script:storeSandbox) { return }
+
+    try {
+        Assert-True (Test-DaemonRunning) "the daemon is live and holding its store slot"
+
+        $oneShotConfig = Join-Path $RepoRoot "tests\examples\wslc_hello_world.json"
+        if (-not (Test-Path $oneShotConfig)) {
+            Assert-True $false "create-and-run fixture not found at $oneShotConfig"
+            return
+        }
+
+        $prevPref = $ErrorActionPreference
+        $ErrorActionPreference = "Continue"
+        $output = & $WxcExec --config $oneShotConfig 2>&1 | Out-String
+        $exitCode = $LASTEXITCODE
+        $ErrorActionPreference = $prevPref
+
+        Assert-True ($exitCode -eq 0) "create-and-run run exits 0 while a sandbox is provisioned"
+        Assert-True ($output -notmatch '0x80070020') `
+            "create-and-run run reports no sharing violation (got: $($output.Trim()))"
+        Assert-True ($output -match 'Hello from WSL Container') `
+            "create-and-run run produced its own output"
+    } finally {
+        $null = Invoke-StateAware -ConfigFile 'wslc_state_aware_deprovision.json' `
+            -SandboxId $script:storeSandbox
     }
 }
 

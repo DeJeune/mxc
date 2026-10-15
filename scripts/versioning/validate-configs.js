@@ -10,7 +10,7 @@
 const { readFileSync, readdirSync, existsSync } = require("fs");
 const { join, resolve } = require("path");
 const Ajv = require("ajv");
-const { compareVersions, parseVersion } = require("./lib/version");
+const { loadContractRegistry } = require("./lib/contract-registry.js");
 
 const repoRoot = resolve(__dirname, "..", "..");
 
@@ -19,44 +19,31 @@ function readJson(...parts) {
 }
 
 const schemaVer = readJson("schemas", "schema-version.json");
-const stableSchemaDir = join(repoRoot, "schemas", "stable");
 
-function parseRegisteredVersion(version) {
-  const parsed = parseVersion(version);
-  if (!parsed) {
-    throw new Error(`Invalid registered schema version: ${version}`);
+const { registry } = loadContractRegistry();
+const schemaPaths = new Map();
+for (const contract of registry) {
+  if (!existsSync(join(repoRoot, contract.schemaPath))) {
+    throw new Error(
+      `Registered schema for ${contract.version} does not exist: ${contract.schemaPath}`
+    );
   }
-  return parsed;
+  schemaPaths.set(contract.version, contract.schemaPath);
 }
-
-const minimumVersion = parseRegisteredVersion(schemaVer.min);
-const stableVersions = readdirSync(stableSchemaDir)
-  .map((name) => /^mxc-config\.schema\.(.+)\.json$/.exec(name)?.[1])
-  .filter(Boolean)
-  .map((version) => ({
-    version,
-    parsed: parseRegisteredVersion(version),
-  }))
-  .sort((left, right) => compareVersions(left.parsed, right.parsed));
-if (!stableVersions.some(({ version }) => version === schemaVer.min)) {
-  throw new Error(`Minimum registered schema not found: ${schemaVer.min}`);
+for (const required of [schemaVer.min, schemaVer.maxSupported]) {
+  if (!schemaPaths.has(required)) {
+    throw new Error(`Canonical schema version is absent from the exact registry: ${required}`);
+  }
 }
-
-const schemaPaths = new Map(
-  stableVersions
-    .filter(({ parsed }) => compareVersions(parsed, minimumVersion) >= 0)
-    .map(({ version }) => [
-      version,
-      join("schemas", "stable", `mxc-config.schema.${version}.json`),
-    ])
-);
-schemaPaths.set(
-  schemaVer.stateAware,
-  join("schemas", "dev", `mxc-config.schema.${schemaVer.stateAware}.json`)
-);
 
 // Directories whose *.json files (recursively) are configs we expect to validate.
-const CONFIG_DIRS = [join("tests", "examples"), join("tests", "configs")];
+// `tests/policy/sdk-v1/expected` holds the exact documents every SDK must emit
+// for the shared v1 policy goldens.
+const CONFIG_DIRS = [
+  join("tests", "examples"),
+  join("tests", "configs"),
+  join("tests", "policy", "sdk-v1", "expected"),
+];
 
 // Files that are intentionally invalid (negative tests) and must NOT validate.
 const exemptionsPath = join(repoRoot, "scripts", "versioning", "config-validation-exemptions.json");
