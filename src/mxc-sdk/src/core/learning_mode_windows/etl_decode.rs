@@ -480,7 +480,7 @@ impl<'visitor> Accumulator<'visitor> {
         let (access_type, resource_type) = analysis.classification;
         self.record_capture_signature(CaptureVerboseLoggingSignature {
             provider: CaptureVerboseLoggingProvider::LearningModeNetworkDecision,
-            provider_guid: "{71237669-21C3-4101-BD2F-FF38945D725A}".to_string(),
+            provider_guid: "{301EC03D-2951-5EFB-6D99-59C64628BBFC}".to_string(),
             event_id,
             event_name,
             reason: analysis.reason,
@@ -1417,7 +1417,7 @@ mod tests {
 
     #[test]
     fn network_decision_is_retained_only_in_unscoped_native_analysis() {
-        let provider = windows::core::GUID::from_u128(0x71237669_21c3_4101_bd2f_ff38945d725a);
+        let provider = windows::core::GUID::from_u128(0x301ec03d_2951_5efb_6d99_59c64628bbfc);
         assert!(is_learning_mode_event(provider, 1));
         for event_id in [0, 2, 14, 28] {
             assert!(!is_learning_mode_event(provider, event_id));
@@ -1448,7 +1448,7 @@ mod tests {
         );
         assert_eq!(
             signature.provider_guid,
-            "{71237669-21C3-4101-BD2F-FF38945D725A}"
+            "{301EC03D-2951-5EFB-6D99-59C64628BBFC}"
         );
         assert_eq!(signature.pid, 0);
         assert_eq!(
@@ -1509,7 +1509,7 @@ mod tests {
     fn network_decode_failure_does_not_attribute_the_broker_pid() {
         let mut accumulator = Accumulator::analyze();
         accumulator.record_event_decode_error(
-            windows::core::GUID::from_u128(0x71237669_21c3_4101_bd2f_ff38945d725a),
+            windows::core::GUID::from_u128(0x301ec03d_2951_5efb_6d99_59c64628bbfc),
             1,
             SCOPED_PID,
             tdh_decode::DecodeError::event(
