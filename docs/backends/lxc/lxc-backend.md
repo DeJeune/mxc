@@ -333,33 +333,24 @@ The zone query should answer the zone you assigned.
   container init keeps `CAP_NET_ADMIN` there, so a process running as root inside
   the container can flush or delete them. The command MXC runs is attached with
   `CAP_NET_ADMIN` dropped from its bounding set whenever chains are installed, so
-  it cannot. That same attach installs a seccomp filter refusing three ways of
-  reaching a packet socket: the `AF_PACKET` family whatever the socket type,
-  `AF_XDP`, and the legacy `SOCK_PACKET` type, which the kernel rewrites into
-  `AF_PACKET` after the family argument has already been read. Each is refused with
-  `EPERM`, and a socket-type flag riding along does not change the answer. The
-  filter refuses io_uring as well, with `ENOSYS`: a ring creates sockets without the
-  `socket` system call the filter reads, and `ENOSYS` is the answer callers probe
-  for before falling back to ordinary I/O. A process issuing system calls under an
-  ABI other than the one the filter was built against is killed outright rather
-  than refused, because its arguments are not where the filter reads them.
-  Installing the filter at all requires MXC to hold `CAP_SYS_ADMIN`. The kernel
-  accepts `no_new_privs` in its place, and MXC does not set it; a deployment
-  lacking the capability does not lose the filter quietly, as the attach fails and
-  the command never runs. Without all of this a workload holding
-  `CAP_NET_RAW` could put frames on the wire beneath the chains, which filter at
-  the IP layer. Default-deny closes external reachability for a container that does
-  not deliberately tear it down, including services the workload itself starts.
-- **The packet-socket refusal is a creation-time check, not a transmit-time one.**
-  The kernel tests `CAP_NET_RAW` when a socket is opened and never again. A
-  descriptor opened before the filter is attached keeps sending for as long as
-  something holds it, and container init runs unfiltered with `CAP_NET_RAW` in hand
-  (see the next limitation). Taking that descriptor needs no cooperation from init:
-  a workload permitted to trace it can pull the descriptor out with `pidfd_getfd`.
-  Either route is outside what this filter covers. The filter also
-  names the families it refuses one by one; a family added by a later kernel is
-  permitted until it is named here. Both gaps close only below the socket layer, on
-  the host side of the container's interface, which this backend does not do today.
+  it cannot. That same attach drops `CAP_NET_RAW`, the capability the kernel tests
+  when any packet-capable socket is created: `AF_PACKET` whatever the socket type,
+  `AF_XDP`, raw IP, and the legacy `SOCK_PACKET` the kernel rewrites into
+  `AF_PACKET`. The test sits in the kernel's socket-creation path, which both
+  `socket` and io_uring reach; the socket comes back `EPERM` by either route.
+  Without the drop a workload holding `CAP_NET_RAW` could put frames on the wire
+  beneath the chains, which filter at the IP layer. The drop also ends raw ICMP,
+  and MXC reopens unprivileged ping by widening `net.ipv4.ping_group_range` inside
+  the container; a `SOCK_DGRAM` `IPPROTO_ICMP` echo still works. Default-deny
+  closes external reachability for a container that does not deliberately tear it
+  down, including services the workload itself starts.
+- **The drop covers the command MXC runs, not container init.** Init keeps
+  `CAP_NET_RAW` just as it keeps `CAP_NET_ADMIN`. A privileged process inside the
+  container can still open a packet socket. The kernel checks the capability at
+  creation, never at transmit, and an already-open descriptor handed to the
+  workload keeps sending. Nothing in a stock container image opens one; closing the
+  gap entirely needs a gate below the socket layer, which this backend does not add
+  today.
 - **Policy is not in force while the container starts.** The chains are installed
   after the container has started and its address has settled, so container init
   and anything it starts run unfiltered in both directions for that interval. The

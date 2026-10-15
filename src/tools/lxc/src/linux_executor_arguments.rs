@@ -139,10 +139,10 @@ impl LinuxExecutorArguments {
 
         #[cfg(not(all(feature = "hyperlight", target_arch = "x86_64")))]
         {
-            return Err(
+            Err(
                 "Error: --setup-hyperlight requires x86_64 (Hyperlight needs KVM or WHP)"
                     .to_string(),
-            );
+            )
         }
 
         #[cfg(all(feature = "hyperlight", target_arch = "x86_64"))]
