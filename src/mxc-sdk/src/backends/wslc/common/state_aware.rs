@@ -580,7 +580,7 @@ fn build_provision_config(
         // No request can name a session yet: nothing on the public surface
         // carries one, so every provision joins the daemon's implicit session,
         // which is exactly what it did before sessions became addressable.
-        session_id: None,
+        session_ref: None,
     })
 }
 

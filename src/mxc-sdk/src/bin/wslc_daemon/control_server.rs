@@ -467,40 +467,40 @@ async fn release_undelivered_sandbox(session: &SessionHandle, sandbox_id: &str) 
 ///
 /// The id exists only here, so giving up leaks a WSL2 utility VM and the store
 /// slot it holds.
-async fn release_undelivered_session(session: &SessionHandle, session_id: &str) {
-    retry_undelivered_release(session_id, |config| session.deprovision_session(config)).await;
+async fn release_undelivered_session(session: &SessionHandle, session_ref: &str) {
+    retry_undelivered_release(session_ref, |config| session.deprovision_session(config)).await;
 }
 
 /// Retry a deprovision until it lands or the attempts run out.
 ///
 /// `deprovision` is a parameter so the transient and terminal paths can be
 /// driven without a live session.
-async fn retry_undelivered_release<F, Fut>(session_id: &str, mut deprovision: F)
+async fn retry_undelivered_release<F, Fut>(session_ref: &str, mut deprovision: F)
 where
     F: FnMut(DeprovisionSessionConfig) -> Fut,
     Fut: std::future::Future<Output = Result<(), WorkerError>>,
 {
     for attempt in 1..=UNDELIVERED_RELEASE_ATTEMPTS {
         let config = DeprovisionSessionConfig {
-            session_id: session_id.to_string(),
+            session_ref: session_ref.to_string(),
         };
         match deprovision(config).await {
             Ok(()) => {
                 eprintln!(
-                    "[wslc-daemon] released session {session_id}: its reply never \
+                    "[wslc-daemon] released session {session_ref}: its reply never \
                      reached the client"
                 );
                 return;
             }
             Err(e) if attempt == UNDELIVERED_RELEASE_ATTEMPTS => {
                 eprintln!(
-                    "[wslc-daemon] could not release session {session_id} after \
+                    "[wslc-daemon] could not release session {session_ref} after \
                      {UNDELIVERED_RELEASE_ATTEMPTS} attempts: {e}. Nothing is using it, so the \
                      daemon releases it once the empty-session grace elapses."
                 );
             }
             Err(e) => {
-                eprintln!("[wslc-daemon] release of session {session_id} failed ({e}); retrying");
+                eprintln!("[wslc-daemon] release of session {session_ref} failed ({e}); retrying");
                 tokio::time::sleep(UNDELIVERED_RELEASE_BACKOFF).await;
             }
         }
@@ -528,7 +528,9 @@ where
     if delivered.is_err() {
         match resp {
             DaemonResponse::Provisioned { sandbox_id } => release(sandbox_id.clone()).await,
-            DaemonResponse::SessionProvisioned { session_id } => release(session_id.clone()).await,
+            DaemonResponse::SessionProvisioned { session_ref } => {
+                release(session_ref.clone()).await
+            }
             _ => {}
         }
     }
@@ -577,12 +579,12 @@ where
         }
         DaemonRequest::ProvisionSession(config) => {
             let resp = match session.provision_session(config).await {
-                Ok(session_id) => DaemonResponse::SessionProvisioned { session_id },
+                Ok(session_ref) => DaemonResponse::SessionProvisioned { session_ref },
                 Err(e) => worker_err_response(e),
             };
-            deliver_minted_reply(&mut pipe, &resp, |session_id| {
+            deliver_minted_reply(&mut pipe, &resp, |session_ref| {
                 let session = &session;
-                async move { release_undelivered_session(session, &session_id).await }
+                async move { release_undelivered_session(session, &session_ref).await }
             })
             .await?;
         }
@@ -1412,7 +1414,7 @@ mod tests {
     async fn an_undelivered_session_reply_releases_that_session() {
         let released = std::cell::RefCell::new(Vec::new());
         let resp = DaemonResponse::SessionProvisioned {
-            session_id: "wslcsess:abc".to_string(),
+            session_ref: "wslcsess:abc".to_string(),
         };
 
         let outcome = deliver_minted_reply(&mut BrokenPipe, &resp, |id| {
@@ -1525,7 +1527,7 @@ mod tests {
                 volumes: Vec::new(),
                 network: Default::default(),
                 port_mappings: Vec::new(),
-                session_id: None,
+                session_ref: None,
             }),
         )
         .await

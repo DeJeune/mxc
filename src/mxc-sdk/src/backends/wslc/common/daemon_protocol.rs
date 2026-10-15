@@ -132,7 +132,8 @@ pub struct ProvisionSessionConfig {
 /// behind it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DeprovisionSessionConfig {
-    pub session_id: String,
+    #[serde(rename = "session_id")]
+    pub session_ref: String,
 }
 
 /// Inputs to `provision`: ensure the session (booting the WSL2 utility VM on
@@ -161,8 +162,12 @@ pub struct ProvisionConfig {
     ///
     /// Absent joins the daemon's implicit session, shared by every request that
     /// names none.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub session_id: Option<String>,
+    #[serde(
+        rename = "session_id",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub session_ref: Option<String>,
 }
 
 /// Inputs to `start`: the container was created at provision; start boots it.
@@ -274,7 +279,10 @@ pub enum DaemonRequest {
 pub enum DaemonResponse {
     /// `provision_session` succeeded; carries the minted session id, which a
     /// later `provision` presents to place a container in that session.
-    SessionProvisioned { session_id: String },
+    SessionProvisioned {
+        #[serde(rename = "session_id")]
+        session_ref: String,
+    },
     /// `provision` succeeded; carries the minted sandbox id (the addressable
     /// handle a later phase presents).
     Provisioned { sandbox_id: String },
@@ -480,7 +488,7 @@ mod tests {
                 windows_port: 8080,
                 container_port: 80,
             }],
-            session_id: Some("wslcsess:abc".to_string()),
+            session_ref: Some("wslcsess:abc".to_string()),
         }));
     }
 
@@ -516,7 +524,7 @@ mod tests {
         }));
         roundtrip(DaemonRequest::DeprovisionSession(
             DeprovisionSessionConfig {
-                session_id: "wslcsess:abc123".to_string(),
+                session_ref: "wslcsess:abc123".to_string(),
             },
         ));
         roundtrip(DaemonRequest::Ping);
@@ -557,7 +565,7 @@ mod tests {
     #[test]
     fn roundtrip_each_response_variant() {
         roundtrip(DaemonResponse::SessionProvisioned {
-            session_id: "wslcsess:abc123".to_string(),
+            session_ref: "wslcsess:abc123".to_string(),
         });
         roundtrip(DaemonResponse::Provisioned {
             sandbox_id: "wslc:abc123".to_string(),
@@ -593,7 +601,7 @@ mod tests {
         let DaemonRequest::Provision(config) = decoded else {
             panic!("expected a provision request");
         };
-        assert_eq!(config.session_id, None);
+        assert_eq!(config.session_ref, None);
     }
 
     #[test]
@@ -604,7 +612,7 @@ mod tests {
             volumes: Vec::new(),
             network: NetworkMode::None,
             port_mappings: Vec::new(),
-            session_id: None,
+            session_ref: None,
         })
         .expect("serialize");
 
@@ -612,6 +620,32 @@ mod tests {
             !frame.contains("session_id"),
             "an absent session must not serialize as a present null: {frame}"
         );
+    }
+
+    #[test]
+    fn the_session_field_keeps_its_wire_name() {
+        let provision: DaemonRequest = serde_json::from_str(
+            r#"{"op":"provision","image":"alpine:latest","session_id":"wslcsess:abc"}"#,
+        )
+        .expect("decode a provision that names a session");
+        let deprovision: DaemonRequest =
+            serde_json::from_str(r#"{"op":"deprovision_session","session_id":"wslcsess:abc"}"#)
+                .expect("decode a session deprovision");
+        let provisioned: DaemonResponse =
+            serde_json::from_str(r#"{"status":"session_provisioned","session_id":"wslcsess:abc"}"#)
+                .expect("decode a session reply");
+
+        for encoded in [
+            serde_json::to_value(&provision),
+            serde_json::to_value(&deprovision),
+            serde_json::to_value(&provisioned),
+        ] {
+            let encoded = encoded.expect("encode");
+            assert_eq!(
+                encoded["session_id"], "wslcsess:abc",
+                "a session must travel under the documented `session_id` key: {encoded}"
+            );
+        }
     }
 
     #[test]

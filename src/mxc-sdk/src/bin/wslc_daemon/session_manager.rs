@@ -70,11 +70,11 @@ use mxc_sdk::wslc_common::wslc_bindings::{
 /// session id supplies the rest.
 const SESSION_NAME_PREFIX: &str = "mxc-wslc-daemon";
 
-/// The name the SDK is given for `session_id`.
-fn session_name(session_id: &str) -> String {
-    let suffix = session_id
+/// The name the SDK is given for `session_ref`.
+fn session_name(session_ref: &str) -> String {
+    let suffix = session_ref
         .rsplit_once(':')
-        .map_or(session_id, |(_, suffix)| suffix);
+        .map_or(session_ref, |(_, suffix)| suffix);
     format!("{SESSION_NAME_PREFIX}-{suffix}")
 }
 
@@ -111,14 +111,14 @@ const SESSION_IDLE_TIMEOUT_ENV: &str = "MXC_WSLC_DAEMON_SESSION_IDLE_SECS";
 ///
 /// Defaults to the daemon's idle window, since a session cannot outlive the
 /// daemon it lives in.
-fn session_idle_timeout() -> Duration {
+fn session_grace() -> Duration {
     session_grace_from(
         std::env::var(SESSION_IDLE_TIMEOUT_ENV).ok().as_deref(),
         std::env::var(crate::IDLE_TIMEOUT_ENV).ok().as_deref(),
     )
 }
 
-/// Pure core of [`session_idle_timeout`], split out so the rule is testable
+/// Pure core of [`session_grace`], split out so the rule is testable
 /// without mutating process-global environment state.
 fn session_grace_from(session_override: Option<&str>, daemon_override: Option<&str>) -> Duration {
     crate::resolve_duration(
@@ -249,7 +249,7 @@ pub enum WorkerCommand {
 
     /// Report an off-worker session boot, from its boot thread.
     SessionBooted {
-        session_id: String,
+        session_ref: String,
         outcome: Result<BootedSession, WorkerError>,
     },
     /// Report a parked provision's pull, from the pull thread or its deadline.
@@ -597,7 +597,7 @@ impl SessionHandle {
         &self.active_execs
     }
 
-    /// Boot a session, returning its minted `session_id`.
+    /// Boot a session, returning its minted `session_ref`.
     pub async fn provision_session(
         &self,
         config: ProvisionSessionConfig,
@@ -779,7 +779,7 @@ struct ContainerEntry {
     /// The container's handle belongs to that session, so this entry holds the
     /// session open for as long as it exists, `retired` and `quarantined`
     /// included.
-    session_id: String,
+    session_ref: String,
 
     /// Keeps a quarantined sandbox counted against exec capacity, because a run
     /// whose termination was never confirmed may still hold a live process.
@@ -793,7 +793,7 @@ struct PendingProvision {
 
     /// The session this provision will place its container in, pinned for as
     /// long as this entry exists.
-    session_id: String,
+    session_ref: String,
 
     /// Held only so dropping this entry retires the deadline thread.
     _retire_deadline: std::sync::mpsc::Sender<()>,
@@ -907,7 +907,7 @@ struct InFlightExec {
 
     /// Which session's utility VM the run is executing in, so it pins that
     /// session even in the window where its container entry has already gone.
-    session_id: String,
+    session_ref: String,
 
     /// Held only so the exec id stays reserved for as long as the run lasts.
     _registration: Arc<ExecRegistration>,
@@ -960,7 +960,7 @@ impl Drop for SessionCount {
 /// would stall every other sandbox on the daemon for that whole time.
 fn start_session_boot(
     job: SessionJob,
-    session_id: String,
+    session_ref: String,
     worker: mpsc::UnboundedSender<WorkerCommand>,
     in_flight: &Arc<AtomicUsize>,
 ) -> Result<(), std::io::Error> {
@@ -993,7 +993,7 @@ fn start_session_boot(
             };
 
             let _ = worker.send(WorkerCommand::SessionBooted {
-                session_id,
+                session_ref,
                 outcome,
             });
         });
@@ -1048,7 +1048,7 @@ impl Drop for SessionRelease {
 /// avoid.
 fn start_session_release(
     job: SessionRelease,
-    session_id: String,
+    session_ref: String,
     in_flight: &Arc<AtomicUsize>,
     reply: Option<oneshot::Sender<Result<(), WorkerError>>>,
 ) -> Result<(), SessionRelease> {
@@ -1084,7 +1084,7 @@ fn start_session_release(
                         }
                         Err(e) => {
                             log.log_line(&format!(
-                                "session {session_id} did not stop; keeping its store slot \
+                                "session {session_ref} did not stop; keeping its store slot \
                                  held: {}",
                                 e.error_message
                             ));
@@ -1242,7 +1242,7 @@ impl Worker {
         }
     }
 
-    /// What is still using `session_id`.
+    /// What is still using `session_ref`.
     ///
     /// Derived on every call rather than tracked, since containers leave the
     /// map by paths that do not agree and a stored count would drift across
@@ -1251,25 +1251,25 @@ impl Worker {
     /// A pull is counted separately from the provision that started it: the
     /// provision entry goes as soon as either the pull or its deadline reports,
     /// which can be long before the pull thread releases the handle.
-    fn session_hold(&self, session_id: &str) -> usize {
+    fn session_hold(&self, session_ref: &str) -> usize {
         let containers = self
             .containers
             .values()
-            .filter(|entry| entry.session_id == session_id)
+            .filter(|entry| entry.session_ref == session_ref)
             .count();
         let pending = self
             .pending
             .values()
-            .filter(|provision| provision.session_id == session_id)
+            .filter(|provision| provision.session_ref == session_ref)
             .count();
         let execs = self
             .exec_in_flight
             .values()
-            .filter(|exec| exec.session_id == session_id)
+            .filter(|exec| exec.session_ref == session_ref)
             .count();
         let pulls = self
             .sessions
-            .get(session_id)
+            .get(session_ref)
             .map_or(0, |entry| entry.pulls_in_flight.load(Ordering::SeqCst));
 
         containers + pending + execs + pulls
@@ -1296,15 +1296,15 @@ impl Worker {
         sizing: SessionSizing,
         worker: &mpsc::UnboundedSender<WorkerCommand>,
     ) -> Result<String, WorkerError> {
-        let session_id = format!("wslcsess:{}", uuid::Uuid::new_v4().simple());
-        let name = session_name(&session_id);
+        let session_ref = format!("wslcsess:{}", uuid::Uuid::new_v4().simple());
+        let name = session_name(&session_ref);
 
         // A release still running holds the warm slot its session was using,
         // so leasing now would hand this boot a cold one and refuse an
         // isolated provision for a missing image. Waiting costs a poll.
         if self.releases_in_flight.load(Ordering::SeqCst) > 0 {
             self.pending_sessions.insert(
-                session_id.clone(),
+                session_ref.clone(),
                 PendingSession {
                     store: None,
                     name,
@@ -1315,13 +1315,13 @@ impl Worker {
                     abandoned: false,
                 },
             );
-            return Ok(session_id);
+            return Ok(session_ref);
         }
 
-        let store = self.lease_and_boot(&session_id, &name, sizing, worker)?;
+        let store = self.lease_and_boot(&session_ref, &name, sizing, worker)?;
 
         self.pending_sessions.insert(
-            session_id.clone(),
+            session_ref.clone(),
             PendingSession {
                 store: Some(store),
                 name,
@@ -1332,13 +1332,13 @@ impl Worker {
                 abandoned: false,
             },
         );
-        Ok(session_id)
+        Ok(session_ref)
     }
 
     /// Lease a store slot and start the boot thread that opens it.
     fn lease_and_boot(
         &mut self,
-        session_id: &str,
+        session_ref: &str,
         name: &str,
         sizing: SessionSizing,
         worker: &mpsc::UnboundedSender<WorkerCommand>,
@@ -1364,13 +1364,13 @@ impl Worker {
 
         if let Err(e) = start_session_boot(
             job,
-            session_id.to_string(),
+            session_ref.to_string(),
             worker.clone(),
             &self.sessions_in_flight,
         ) {
             // The lease drops with `store` here, returning the slot.
             return Err(WorkerError::Backend(anyhow::anyhow!(
-                "could not start a thread to boot session {session_id}: {e}"
+                "could not start a thread to boot session {session_ref}: {e}"
             )));
         }
 
@@ -1387,18 +1387,20 @@ impl Worker {
             .pending_sessions
             .iter()
             .filter(|(_, pending)| pending.store.is_none() && !pending.abandoned)
-            .map(|(session_id, pending)| (session_id.clone(), pending.name.clone(), pending.sizing))
+            .map(|(session_ref, pending)| {
+                (session_ref.clone(), pending.name.clone(), pending.sizing)
+            })
             .collect();
 
-        for (session_id, name, sizing) in waiting {
-            match self.lease_and_boot(&session_id, &name, sizing, worker) {
+        for (session_ref, name, sizing) in waiting {
+            match self.lease_and_boot(&session_ref, &name, sizing, worker) {
                 Ok(store) => {
-                    if let Some(pending) = self.pending_sessions.get_mut(&session_id) {
+                    if let Some(pending) = self.pending_sessions.get_mut(&session_ref) {
                         pending.store = Some(store);
                         pending.started = Instant::now();
                     }
                 }
-                Err(e) => self.finish_session(&session_id, Err(e), worker),
+                Err(e) => self.finish_session(&session_ref, Err(e), worker),
             }
         }
     }
@@ -1409,16 +1411,16 @@ impl Worker {
     /// leaves the reply with its caller to answer.
     fn attach_session_reply(
         &mut self,
-        session_id: &str,
+        session_ref: &str,
         reply: oneshot::Sender<Result<String, WorkerError>>,
     ) {
-        match self.pending_sessions.get_mut(session_id) {
+        match self.pending_sessions.get_mut(session_ref) {
             Some(pending) => pending.reply = Some(reply),
 
             // Answered rather than dropped, since a dropped reply reaches the
             // client as a bare "worker gone".
             None => {
-                let _ = reply.send(Ok(session_id.to_string()));
+                let _ = reply.send(Ok(session_ref.to_string()));
             }
         }
     }
@@ -1427,11 +1429,11 @@ impl Worker {
     /// parked behind it.
     fn finish_session(
         &mut self,
-        session_id: &str,
+        session_ref: &str,
         outcome: Result<BootedSession, WorkerError>,
         worker: &mpsc::UnboundedSender<WorkerCommand>,
     ) {
-        let Some(pending) = self.pending_sessions.remove(session_id) else {
+        let Some(pending) = self.pending_sessions.remove(session_ref) else {
             return;
         };
         let PendingSession {
@@ -1450,7 +1452,7 @@ impl Worker {
                 // Retired with the slot, so a later provision boots a fresh
                 // implicit session rather than parking behind one that will
                 // never arrive.
-                if self.default_session.as_deref() == Some(session_id) {
+                if self.default_session.as_deref() == Some(session_ref) {
                     self.default_session = None;
                 }
                 let message = e.to_string();
@@ -1471,7 +1473,7 @@ impl Worker {
         // so the VM it eventually produced has no owner.
         if abandoned {
             self.logger.log_line(&format!(
-                "session {session_id} booted after it was given up on; releasing it"
+                "session {session_ref} booted after it was given up on; releasing it"
             ));
 
             // A job handed back could not start a thread. Its `Drop` leaks the
@@ -1483,7 +1485,7 @@ impl Worker {
                     store,
                     name,
                 },
-                session_id.to_string(),
+                session_ref.to_string(),
                 &self.releases_in_flight,
                 None,
             );
@@ -1494,7 +1496,7 @@ impl Worker {
         // no store to own.
         let Some(store) = store else {
             self.logger.log_line(&format!(
-                "session {session_id} reported a boot it had no store slot for; releasing it"
+                "session {session_ref} reported a boot it had no store slot for; releasing it"
             ));
             let _ = start_session_release(
                 SessionRelease {
@@ -1502,7 +1504,7 @@ impl Worker {
                     store: None,
                     name,
                 },
-                session_id.to_string(),
+                session_ref.to_string(),
                 &self.releases_in_flight,
                 None,
             );
@@ -1510,7 +1512,7 @@ impl Worker {
         };
 
         self.sessions.insert(
-            session_id.to_string(),
+            session_ref.to_string(),
             SessionEntry {
                 session: booted,
                 store,
@@ -1522,7 +1524,7 @@ impl Worker {
         );
 
         if let Some(reply) = reply {
-            let _ = reply.send(Ok(session_id.to_string()));
+            let _ = reply.send(Ok(session_ref.to_string()));
         }
 
         // Replayed only now the session is in the map, so each takes the
@@ -1539,8 +1541,8 @@ impl Worker {
     /// The reaper samples occupancy on its poll, so work that both starts and
     /// finishes between two polls would otherwise leave the grace running from
     /// before it arrived.
-    fn touch_session(&mut self, session_id: &str) {
-        if let Some(entry) = self.sessions.get_mut(session_id) {
+    fn touch_session(&mut self, session_ref: &str) {
+        if let Some(entry) = self.sessions.get_mut(session_ref) {
             entry.empty_since = None;
         }
     }
@@ -1550,9 +1552,9 @@ impl Worker {
     /// An abandoned entry keeps its slot until its boot thread settles, but
     /// nothing may park behind it: no later poll revisits it, and a boot that
     /// does land releases the VM rather than installing it.
-    fn is_booting(&self, session_id: &str) -> bool {
+    fn is_booting(&self, session_ref: &str) -> bool {
         self.pending_sessions
-            .get(session_id)
+            .get(session_ref)
             .is_some_and(|pending| !pending.abandoned)
     }
 
@@ -1561,13 +1563,13 @@ impl Worker {
         requested: Option<&str>,
         worker: &mpsc::UnboundedSender<WorkerCommand>,
     ) -> Result<SessionLookup, WorkerError> {
-        if let Some(session_id) = requested {
-            return if self.sessions.contains_key(session_id) {
-                Ok(SessionLookup::Ready(session_id.to_string()))
-            } else if self.is_booting(session_id) {
-                Ok(SessionLookup::Booting(session_id.to_string()))
+        if let Some(session_ref) = requested {
+            return if self.sessions.contains_key(session_ref) {
+                Ok(SessionLookup::Ready(session_ref.to_string()))
+            } else if self.is_booting(session_ref) {
+                Ok(SessionLookup::Booting(session_ref.to_string()))
             } else {
-                Err(WorkerError::UnknownSession(session_id.to_string()))
+                Err(WorkerError::UnknownSession(session_ref.to_string()))
             };
         }
 
@@ -1582,9 +1584,9 @@ impl Worker {
             }
         }
 
-        let session_id = self.begin_session(SessionSizing::default(), worker)?;
-        self.default_session = Some(session_id.clone());
-        Ok(SessionLookup::Booting(session_id))
+        let session_ref = self.begin_session(SessionSizing::default(), worker)?;
+        self.default_session = Some(session_ref.clone());
+        Ok(SessionLookup::Booting(session_ref))
     }
 
     /// Release a session a client asked to be rid of.
@@ -1594,34 +1596,34 @@ impl Worker {
     /// still hold those ids.
     fn release_session(
         &mut self,
-        session_id: &str,
+        session_ref: &str,
         reply: oneshot::Sender<Result<(), WorkerError>>,
     ) {
-        if !self.sessions.contains_key(session_id) {
-            let _ = reply.send(Err(WorkerError::UnknownSession(session_id.to_string())));
+        if !self.sessions.contains_key(session_ref) {
+            let _ = reply.send(Err(WorkerError::UnknownSession(session_ref.to_string())));
             return;
         }
 
         // The implicit session is shared by every request that named none, so
         // no single caller may release it.
-        if self.default_session.as_deref() == Some(session_id) {
+        if self.default_session.as_deref() == Some(session_ref) {
             let _ = reply.send(Err(WorkerError::Rejected(anyhow::anyhow!(
-                "session {session_id} is the daemon's implicit session and is released only \
+                "session {session_ref} is the daemon's implicit session and is released only \
                  once nothing is using it"
             ))));
             return;
         }
 
-        let hold = self.session_hold(session_id);
+        let hold = self.session_hold(session_ref);
         if hold > 0 {
             let _ = reply.send(Err(WorkerError::Rejected(anyhow::anyhow!(
-                "session {session_id} still has {hold} sandbox(es) or operation(s) in it; \
+                "session {session_ref} still has {hold} sandbox(es) or operation(s) in it; \
                  deprovision them first"
             ))));
             return;
         }
 
-        self.release_session_entry(session_id, Some(reply));
+        self.release_session_entry(session_ref, Some(reply));
     }
 
     /// Hand a session's VM to a thread that terminates it.
@@ -1630,16 +1632,16 @@ impl Worker {
     /// sandbox's work is serialized behind this thread.
     fn release_session_entry(
         &mut self,
-        session_id: &str,
+        session_ref: &str,
         reply: Option<oneshot::Sender<Result<(), WorkerError>>>,
     ) {
-        let Some(entry) = self.sessions.remove(session_id) else {
+        let Some(entry) = self.sessions.remove(session_ref) else {
             if let Some(reply) = reply {
                 let _ = reply.send(Ok(()));
             }
             return;
         };
-        if self.default_session.as_deref() == Some(session_id) {
+        if self.default_session.as_deref() == Some(session_ref) {
             self.default_session = None;
         }
 
@@ -1653,7 +1655,7 @@ impl Worker {
         } = entry;
 
         self.logger.log_line(&format!(
-            "releasing session {session_id} ('{name}', slot {}, cpu={}, memory_mb={}, gpu={})",
+            "releasing session {session_ref} ('{name}', slot {}, cpu={}, memory_mb={}, gpu={})",
             store.index(),
             sizing
                 .cpu_count
@@ -1670,7 +1672,7 @@ impl Worker {
                 store: Some(store),
                 name,
             },
-            session_id.to_string(),
+            session_ref.to_string(),
             &self.releases_in_flight,
             reply,
         );
@@ -1687,11 +1689,11 @@ impl Worker {
             return;
         };
         self.logger.log_line(&format!(
-            "could not start a release thread for session {session_id}; it stays held \
+            "could not start a release thread for session {session_ref}; it stays held \
              until the next poll retries"
         ));
         self.sessions.insert(
-            session_id.to_string(),
+            session_ref.to_string(),
             SessionEntry {
                 session,
                 store,
@@ -1717,7 +1719,7 @@ impl Worker {
         let deadline = session_boot_deadline();
         let mut gave_up = Vec::new();
 
-        for (session_id, pending) in self.pending_sessions.iter_mut() {
+        for (session_ref, pending) in self.pending_sessions.iter_mut() {
             if pending.abandoned || now.saturating_duration_since(pending.started) < deadline {
                 continue;
             }
@@ -1736,17 +1738,17 @@ impl Worker {
                     deadline.as_secs()
                 ))));
             }
-            gave_up.push(session_id.clone());
+            gave_up.push(session_ref.clone());
         }
 
-        for session_id in gave_up {
+        for session_ref in gave_up {
             // A later provision boots a fresh implicit session rather than
             // parking behind one nothing is waiting for any more.
-            if self.default_session.as_deref() == Some(&session_id) {
+            if self.default_session.as_deref() == Some(&session_ref) {
                 self.default_session = None;
             }
             self.logger.log_line(&format!(
-                "session {session_id} has been booting for over {}s; the clients waiting \
+                "session {session_ref} has been booting for over {}s; the clients waiting \
                  on it were let go",
                 deadline.as_secs()
             ));
@@ -1770,26 +1772,26 @@ impl Worker {
         let mut holds: HashMap<String, usize> = self
             .sessions
             .keys()
-            .map(|session_id| (session_id.clone(), 0))
+            .map(|session_ref| (session_ref.clone(), 0))
             .collect();
 
-        let mut bump = |session_id: &String| {
-            if let Some(hold) = holds.get_mut(session_id) {
+        let mut bump = |session_ref: &String| {
+            if let Some(hold) = holds.get_mut(session_ref) {
                 *hold += 1;
             }
         };
         for entry in self.containers.values() {
-            bump(&entry.session_id);
+            bump(&entry.session_ref);
         }
         for provision in self.pending.values() {
-            bump(&provision.session_id);
+            bump(&provision.session_ref);
         }
         for exec in self.exec_in_flight.values() {
-            bump(&exec.session_id);
+            bump(&exec.session_ref);
         }
 
-        for (session_id, entry) in &self.sessions {
-            if let Some(hold) = holds.get_mut(session_id) {
+        for (session_ref, entry) in &self.sessions {
+            if let Some(hold) = holds.get_mut(session_ref) {
                 *hold += entry.pulls_in_flight.load(Ordering::SeqCst);
             }
         }
@@ -1800,12 +1802,12 @@ impl Worker {
     /// Pure core of [`Worker::reap_idle_sessions`], taking the clock for the same
     /// reason as [`Worker::reap_stuck_boots_at`].
     fn reap_idle_sessions_at(&mut self, now: Instant) {
-        let grace = session_idle_timeout();
+        let grace = session_grace();
         let holds = self.session_holds();
 
         let mut expired = Vec::new();
-        for (session_id, hold) in holds {
-            let Some(entry) = self.sessions.get_mut(&session_id) else {
+        for (session_ref, hold) in holds {
+            let Some(entry) = self.sessions.get_mut(&session_ref) else {
                 continue;
             };
             if hold > 0 {
@@ -1813,11 +1815,11 @@ impl Worker {
                 continue;
             }
             if now.saturating_duration_since(*entry.empty_since.get_or_insert(now)) >= grace {
-                expired.push(session_id);
+                expired.push(session_ref);
             }
         }
 
-        for session_id in expired {
+        for session_ref in expired {
             // Each release takes a native thread, and a host that refuses to
             // make one would otherwise terminate on this thread. A session
             // skipped here stays expired and is retried on the next poll.
@@ -1826,10 +1828,10 @@ impl Worker {
             }
 
             self.logger.log_line(&format!(
-                "session {session_id} has held nothing for {}s",
+                "session {session_ref} has held nothing for {}s",
                 grace.as_secs()
             ));
-            self.release_session_entry(&session_id, None);
+            self.release_session_entry(&session_ref, None);
         }
     }
 
@@ -1844,14 +1846,14 @@ impl Worker {
         reply: oneshot::Sender<Result<String, WorkerError>>,
         worker: &mpsc::UnboundedSender<WorkerCommand>,
     ) {
-        let session_id = match self.ensure_session(config.session_id.as_deref(), worker) {
-            Ok(SessionLookup::Ready(session_id)) => session_id,
-            Ok(SessionLookup::Booting(session_id)) => {
+        let session_ref = match self.ensure_session(config.session_ref.as_deref(), worker) {
+            Ok(SessionLookup::Ready(session_ref)) => session_ref,
+            Ok(SessionLookup::Booting(session_ref)) => {
                 // Parking rather than waiting is what keeps this thread free,
                 // and what stops a second provision booting a second implicit
                 // session alongside the first.
                 self.pending_sessions
-                    .get_mut(&session_id)
+                    .get_mut(&session_ref)
                     .expect("ensure_session reported it booting")
                     .parked
                     .push((config, reply));
@@ -1864,11 +1866,11 @@ impl Worker {
         };
 
         let sdk = self.sdk.as_ref().expect("session ensured");
-        let session = self.sessions[&session_id].session.as_raw();
+        let session = self.sessions[&session_ref].session.as_raw();
 
         // The slot this session leased, not the daemon's — a store hint naming
         // another session's slot would send a caller to warm the wrong one.
-        let store = image::StoreHint::DaemonSlot(self.sessions[&session_id].store.index());
+        let store = image::StoreHint::DaemonSlot(self.sessions[&session_ref].store.index());
 
         // SAFETY: `sdk`/`session` are valid.
         let step = unsafe {
@@ -1896,7 +1898,7 @@ impl Worker {
 
         match step {
             image::ImageStep::Ready => {
-                let _ = reply.send(self.create_provisioned_container(&config, &session_id));
+                let _ = reply.send(self.create_provisioned_container(&config, &session_ref));
             }
             image::ImageStep::Pull => {
                 let token = self.next_pull_token;
@@ -1907,7 +1909,7 @@ impl Worker {
                 // The pending entry below is not enough on its own: the
                 // deadline thread can report first, and removing that entry
                 // would unpin a session the pull thread still dereferences.
-                let counter = Arc::clone(&self.sessions[&session_id].pulls_in_flight);
+                let counter = Arc::clone(&self.sessions[&session_ref].pulls_in_flight);
                 let started = unsafe {
                     image::start_pull_counted(
                         sdk,
@@ -1959,13 +1961,13 @@ impl Worker {
                     return;
                 }
 
-                self.touch_session(&session_id);
+                self.touch_session(&session_ref);
                 self.pending.insert(
                     token,
                     PendingProvision {
                         config,
                         reply,
-                        session_id,
+                        session_ref,
                         _retire_deadline: retire_deadline,
                     },
                 );
@@ -1980,7 +1982,7 @@ impl Worker {
         let Some(PendingProvision {
             config,
             reply,
-            session_id,
+            session_ref,
             _retire_deadline: _,
         }) = self.pending.remove(&token)
         else {
@@ -1997,7 +1999,7 @@ impl Worker {
         // The parked provision and its pull both pin this session, so it
         // cannot be missing. A session released under a running pull has
         // already been used after free, so there is nothing to recover.
-        let session = self.sessions[&session_id].session.as_raw();
+        let session = self.sessions[&session_ref].session.as_raw();
 
         // SAFETY: `sdk`/`session` are valid.
         if let Err(e) = unsafe {
@@ -2013,7 +2015,7 @@ impl Worker {
             return;
         }
 
-        let _ = reply.send(self.create_provisioned_container(&config, &session_id));
+        let _ = reply.send(self.create_provisioned_container(&config, &session_ref));
     }
 
     /// Everything after the image is in the store: create the container and
@@ -2021,11 +2023,11 @@ impl Worker {
     fn create_provisioned_container(
         &mut self,
         config: &ProvisionConfig,
-        session_id: &str,
+        session_ref: &str,
     ) -> Result<String, WorkerError> {
         let sdk = self.sdk.as_ref().expect("session ensured");
-        let session = self.sessions[session_id].session.as_raw();
-        let gpu = self.sessions[session_id].sizing.gpu;
+        let session = self.sessions[session_ref].session.as_raw();
+        let gpu = self.sessions[session_ref].sizing.gpu;
 
         let mounts: Vec<policy_mapping::VolumeMount> = config
             .volumes
@@ -2074,7 +2076,7 @@ impl Worker {
         };
 
         let sandbox_id = format!("wslc:{}", uuid::Uuid::new_v4().simple());
-        self.touch_session(session_id);
+        self.touch_session(session_ref);
         self.containers.insert(
             sandbox_id.clone(),
             ContainerEntry {
@@ -2082,7 +2084,7 @@ impl Worker {
                 quarantined: false,
                 retired: false,
                 container,
-                session_id: session_id.to_string(),
+                session_ref: session_ref.to_string(),
                 exec_slot: None,
             },
         );
@@ -2194,7 +2196,7 @@ impl Worker {
         // Recorded here rather than looked up when the run reports, because
         // quarantine can delete the container entry while the run is still
         // going.
-        let session_id = self.containers[&config.sandbox_id].session_id.clone();
+        let session_ref = self.containers[&config.sandbox_id].session_ref.clone();
 
         if cancellation.load(Ordering::Acquire) {
             if admit.send(Ok(())).is_ok() {
@@ -2216,13 +2218,13 @@ impl Worker {
             return;
         }
 
-        self.touch_session(&session_id);
+        self.touch_session(&session_ref);
         self.exec_in_flight.insert(
             sandbox_id,
             InFlightExec {
                 container,
                 done,
-                session_id,
+                session_ref,
                 _registration: registration,
                 slot,
                 parked: Vec::new(),
@@ -2491,15 +2493,15 @@ impl Worker {
 
         // A session still booting has clients waiting on it twice over: the one
         // that asked for the session, and every provision parked behind it.
-        for (session_id, pending) in self.pending_sessions.iter_mut() {
+        for (session_ref, pending) in self.pending_sessions.iter_mut() {
             if let Some(reply) = pending.reply.take() {
                 let _ = reply.send(Err(WorkerError::Backend(anyhow::anyhow!(
-                    "the WSLc daemon shut down while session {session_id} was booting"
+                    "the WSLc daemon shut down while session {session_ref} was booting"
                 ))));
             }
             for (_, parked) in std::mem::take(&mut pending.parked) {
                 let _ = parked.send(Err(WorkerError::Backend(anyhow::anyhow!(
-                    "the WSLc daemon shut down while session {session_id} was booting"
+                    "the WSLc daemon shut down while session {session_ref} was booting"
                 ))));
             }
         }
@@ -2531,9 +2533,9 @@ impl Worker {
                     // A boot that lands here owns a live handle, and the boot
                     // drain below runs too late to catch it.
                     WorkerCommand::SessionBooted {
-                        session_id,
+                        session_ref,
                         outcome,
-                    } => self.release_booted_during_shutdown(&session_id, outcome),
+                    } => self.release_booted_during_shutdown(&session_ref, outcome),
                     other => self.refuse_while_shutting_down(other),
                 }
             }
@@ -2598,10 +2600,10 @@ impl Worker {
     /// so only a successful one still owns a VM here.
     fn release_booted_during_shutdown(
         &mut self,
-        session_id: &str,
+        session_ref: &str,
         outcome: Result<BootedSession, WorkerError>,
     ) {
-        let Some(mut pending) = self.pending_sessions.remove(session_id) else {
+        let Some(mut pending) = self.pending_sessions.remove(session_ref) else {
             return;
         };
 
@@ -2610,14 +2612,14 @@ impl Worker {
         };
 
         self.logger.log_line(&format!(
-            "session {session_id} finished booting during shutdown; releasing it"
+            "session {session_ref} finished booting during shutdown; releasing it"
         ));
 
         match container_steps::release_daemon_session(session, &pending.name, &mut self.logger) {
             Ok(()) => drop(pending.store.take()),
             Err(e) => {
                 self.logger.log_line(&format!(
-                    "releasing session {session_id} reported a failure: {}",
+                    "releasing session {session_ref} reported a failure: {}",
                     e.error_message
                 ));
 
@@ -2662,9 +2664,9 @@ impl Worker {
                 };
                 match cmd {
                     WorkerCommand::SessionBooted {
-                        session_id,
+                        session_ref,
                         outcome,
-                    } => self.release_booted_during_shutdown(&session_id, outcome),
+                    } => self.release_booted_during_shutdown(&session_ref, outcome),
                     other => self.refuse_while_shutting_down(other),
                 }
             }
@@ -2677,10 +2679,10 @@ impl Worker {
         // Waiting first, so one session's stuck pull cannot spend the budget the
         // terminates below need.
         let mut drained = Vec::new();
-        for (session_id, entry) in self.sessions.drain() {
+        for (session_ref, entry) in self.sessions.drain() {
             if !wait_for_in_flight(&entry.pulls_in_flight, deadline) {
                 self.logger.log_line(&format!(
-                    "a WSLC image pull is still running on session {session_id}; leaking it \
+                    "a WSLC image pull is still running on session {session_ref}; leaking it \
                      rather than releasing a handle the pull is using"
                 ));
 
@@ -2691,7 +2693,7 @@ impl Worker {
                 continue;
             }
 
-            drained.push((session_id, entry));
+            drained.push((session_ref, entry));
         }
 
         // A budget of its own rather than whatever the waits left behind, since
@@ -2699,12 +2701,12 @@ impl Worker {
         // not.
         let release_deadline = Instant::now() + drain_budget;
 
-        for (session_id, entry) in drained {
+        for (session_ref, entry) in drained {
             // Terminating a VM is not instant, so N of them must not run
             // unbounded.
             if Instant::now() >= release_deadline {
                 self.logger.log_line(&format!(
-                    "the release budget expired before session {session_id} was released; \
+                    "the release budget expired before session {session_ref} was released; \
                      leaking it rather than returning a slot its VM still holds"
                 ));
                 std::mem::forget(entry);
@@ -2722,7 +2724,7 @@ impl Worker {
                 container_steps::release_daemon_session(session, &name, &mut self.logger)
             {
                 self.logger.log_line(&format!(
-                    "releasing session {session_id} reported a failure: {}",
+                    "releasing session {session_ref} reported a failure: {}",
                     e.error_message
                 ));
 
@@ -2800,8 +2802,8 @@ pub fn spawn() -> Result<SessionHandle> {
                             // answered once the VM is up, so a slow boot does
                             // not hold this thread.
                             match worker.begin_session(sizing, &worker_tx) {
-                                Ok(session_id) => {
-                                    worker.attach_session_reply(&session_id, reply);
+                                Ok(session_ref) => {
+                                    worker.attach_session_reply(&session_ref, reply);
                                 }
                                 Err(e) => {
                                     let _ = reply.send(Err(e));
@@ -2809,13 +2811,13 @@ pub fn spawn() -> Result<SessionHandle> {
                             }
                         }
                         WorkerCommand::SessionBooted {
-                            session_id,
+                            session_ref,
                             outcome,
                         } => {
-                            worker.finish_session(&session_id, outcome, &worker_tx);
+                            worker.finish_session(&session_ref, outcome, &worker_tx);
                         }
                         WorkerCommand::DeprovisionSession { config, reply } => {
-                            worker.release_session(&config.session_id, reply);
+                            worker.release_session(&config.session_ref, reply);
                         }
                         WorkerCommand::Provision { config, reply } => {
                             worker.begin_provision(config, reply, &worker_tx);
@@ -2975,7 +2977,7 @@ mod tests {
             // SAFETY: `release_noop` never dereferences the handle, so the guard
             // owns a value it can release without touching memory.
             container: unsafe { WslcContainerGuard::from_raw(sentinel, release_noop) },
-            session_id: TEST_SESSION.to_string(),
+            session_ref: TEST_SESSION.to_string(),
             exec_slot: None,
         }
     }
@@ -3015,10 +3017,10 @@ mod tests {
                     volumes: Vec::new(),
                     network: Default::default(),
                     port_mappings: Vec::new(),
-                    session_id: None,
+                    session_ref: None,
                 },
                 reply,
-                session_id: TEST_SESSION.to_string(),
+                session_ref: TEST_SESSION.to_string(),
                 _retire_deadline: std::sync::mpsc::channel().0,
             },
         );
@@ -3044,10 +3046,10 @@ mod tests {
                     volumes: Vec::new(),
                     network: Default::default(),
                     port_mappings: Vec::new(),
-                    session_id: None,
+                    session_ref: None,
                 },
                 reply,
-                session_id: TEST_SESSION.to_string(),
+                session_ref: TEST_SESSION.to_string(),
                 _retire_deadline: std::sync::mpsc::channel().0,
             },
         );
@@ -3131,7 +3133,7 @@ mod tests {
     }
 
     /// Register a session whose handle is never dereferenced.
-    fn register_test_session(worker: &mut Worker, session_id: &str) {
+    fn register_test_session(worker: &mut Worker, session_ref: &str) {
         unsafe extern "C" fn session_noop(
             _: mxc_sdk::wslc_common::wslc_bindings::WslcSession,
         ) -> i32 {
@@ -3146,7 +3148,7 @@ mod tests {
             .expect("lease a scratch slot");
 
         worker.sessions.insert(
-            session_id.to_string(),
+            session_ref.to_string(),
             SessionEntry {
                 // SAFETY: neither function pointer dereferences the handle, so
                 // the guard owns a value it can release without touching
@@ -3155,7 +3157,7 @@ mod tests {
                     WslcSessionGuard::from_raw(sentinel, session_noop, session_noop)
                 },
                 store,
-                name: session_name(session_id),
+                name: session_name(session_ref),
                 sizing: SessionSizing::default(),
                 pulls_in_flight: Arc::new(AtomicUsize::new(0)),
                 empty_since: None,
@@ -3164,17 +3166,17 @@ mod tests {
     }
 
     /// Register a session whose boot is still running.
-    fn register_booting_session(worker: &mut Worker, session_id: &str) {
+    fn register_booting_session(worker: &mut Worker, session_ref: &str) {
         let (store, ()) = worker
             .store_slots
             .lease_with(|_| Ok::<(), ()>(()))
             .expect("lease a scratch slot");
 
         worker.pending_sessions.insert(
-            session_id.to_string(),
+            session_ref.to_string(),
             PendingSession {
                 store: Some(store),
-                name: session_name(session_id),
+                name: session_name(session_ref),
                 sizing: SessionSizing::default(),
                 reply: None,
                 parked: Vec::new(),
@@ -3192,7 +3194,7 @@ mod tests {
             volumes: Vec::new(),
             network: Default::default(),
             port_mappings: Vec::new(),
-            session_id: None,
+            session_ref: None,
         }
     }
 
@@ -3238,7 +3240,7 @@ mod tests {
         worker.containers.insert(
             "wslc:elsewhere".to_string(),
             ContainerEntry {
-                session_id: "wslcsess:other".to_string(),
+                session_ref: "wslcsess:other".to_string(),
                 ..test_entry(false)
             },
         );
@@ -3260,10 +3262,10 @@ mod tests {
                     volumes: Vec::new(),
                     network: Default::default(),
                     port_mappings: Vec::new(),
-                    session_id: None,
+                    session_ref: None,
                 },
                 reply,
-                session_id: TEST_SESSION.to_string(),
+                session_ref: TEST_SESSION.to_string(),
                 _retire_deadline: std::sync::mpsc::channel().0,
             },
         );
@@ -3513,7 +3515,7 @@ mod tests {
                     volumes: Vec::new(),
                     network: Default::default(),
                     port_mappings: Vec::new(),
-                    session_id: None,
+                    session_ref: None,
                 },
                 parked,
             ));
@@ -3734,10 +3736,10 @@ mod tests {
     }
 
     /// Start a session's empty clock, so a reap at [`past_grace`] expires it.
-    fn age_out(worker: &mut Worker, session_id: &str) {
+    fn age_out(worker: &mut Worker, session_ref: &str) {
         worker
             .sessions
-            .get_mut(session_id)
+            .get_mut(session_ref)
             .expect("session is registered")
             .empty_since = Some(Instant::now());
     }
@@ -3801,9 +3803,9 @@ mod tests {
 
     /// Drive a release and read its refusal, which is sent before any thread
     /// starts.
-    fn refuse_release(worker: &mut Worker, session_id: &str) -> WorkerError {
+    fn refuse_release(worker: &mut Worker, session_ref: &str) -> WorkerError {
         let (reply, mut answer) = oneshot::channel();
-        worker.release_session(session_id, reply);
+        worker.release_session(session_ref, reply);
         answer
             .try_recv()
             .expect("a refusal answers without a release thread")
@@ -3811,8 +3813,8 @@ mod tests {
     }
 
     /// Release a session and wait for its thread to settle the store slot.
-    fn release_and_settle(worker: &mut Worker, session_id: &str) {
-        worker.release_session_entry(session_id, None);
+    fn release_and_settle(worker: &mut Worker, session_ref: &str) {
+        worker.release_session_entry(session_ref, None);
         assert!(
             wait_for_in_flight(
                 &worker.releases_in_flight,
@@ -3823,7 +3825,7 @@ mod tests {
     }
 
     /// Register a session whose terminate reports a failure.
-    fn register_failing_session(worker: &mut Worker, session_id: &str) -> std::path::PathBuf {
+    fn register_failing_session(worker: &mut Worker, session_ref: &str) -> std::path::PathBuf {
         unsafe extern "C" fn terminate_fails(
             _: mxc_sdk::wslc_common::wslc_bindings::WslcSession,
         ) -> i32 {
@@ -3844,7 +3846,7 @@ mod tests {
         let slot = store.path().to_path_buf();
 
         worker.sessions.insert(
-            session_id.to_string(),
+            session_ref.to_string(),
             SessionEntry {
                 // SAFETY: neither function pointer dereferences the handle, so
                 // the guard owns a value it can release without touching
@@ -3853,7 +3855,7 @@ mod tests {
                     WslcSessionGuard::from_raw(sentinel, terminate_fails, release_ok)
                 },
                 store,
-                name: session_name(session_id),
+                name: session_name(session_ref),
                 sizing: SessionSizing::default(),
                 pulls_in_flight: Arc::new(AtomicUsize::new(0)),
                 empty_since: None,
@@ -3963,7 +3965,7 @@ mod tests {
             .containers
             .insert("wslc:b".to_string(), test_entry(false));
         let mut other = test_entry(false);
-        other.session_id = "wslcsess:other".to_string();
+        other.session_ref = "wslcsess:other".to_string();
         worker.containers.insert("wslc:c".to_string(), other);
         worker.sessions[TEST_SESSION]
             .pulls_in_flight
@@ -3971,11 +3973,11 @@ mod tests {
 
         let aggregate = worker.session_holds();
 
-        for session_id in [TEST_SESSION, "wslcsess:other"] {
+        for session_ref in [TEST_SESSION, "wslcsess:other"] {
             assert_eq!(
-                aggregate.get(session_id).copied(),
-                Some(worker.session_hold(session_id)),
-                "the aggregate disagrees with the per-session scan for {session_id}"
+                aggregate.get(session_ref).copied(),
+                Some(worker.session_hold(session_ref)),
+                "the aggregate disagrees with the per-session scan for {session_ref}"
             );
         }
     }
@@ -4042,7 +4044,7 @@ mod tests {
             WslcSessionGuard::from_raw(std::ptr::dangling_mut(), terminate_fails, release_ok)
         });
         tx.send(WorkerCommand::SessionBooted {
-            session_id: TEST_SESSION.to_string(),
+            session_ref: TEST_SESSION.to_string(),
             outcome: Ok(booted),
         })
         .expect("queue the boot report");
@@ -4123,12 +4125,12 @@ mod tests {
         // Standing in for a release that has not finished terminating.
         worker.releases_in_flight.store(1, Ordering::SeqCst);
 
-        let session_id = worker
+        let session_ref = worker
             .begin_session(SessionSizing::default(), &worker_tx)
             .expect("a boot waiting for a release must neither lease a slot nor load the SDK");
 
         assert!(
-            worker.pending_sessions[&session_id].store.is_none(),
+            worker.pending_sessions[&session_ref].store.is_none(),
             "a boot started while a release holds the warm slot must wait for it \
              rather than lease the next, cold one"
         );
@@ -4141,7 +4143,7 @@ mod tests {
         worker.start_deferred_boots(&worker_tx);
 
         assert!(
-            !worker.pending_sessions.contains_key(&session_id),
+            !worker.pending_sessions.contains_key(&session_ref),
             "once the release is done the boot must stop waiting"
         );
     }
@@ -4268,7 +4270,7 @@ mod tests {
             WslcSessionGuard::from_raw(sentinel, terminate_counts, release_ok)
         });
         tx.send(WorkerCommand::SessionBooted {
-            session_id: TEST_SESSION.to_string(),
+            session_ref: TEST_SESSION.to_string(),
             outcome: Ok(booted),
         })
         .expect("queue the boot report");
@@ -4369,9 +4371,9 @@ mod tests {
         let (_root, mut worker) = worker_with_scratch_pool();
         let (_tx, mut rx) = mpsc::unbounded_channel();
         let budget = Duration::from_millis(300);
-        for session_id in ["wslcsess:a", "wslcsess:b", "wslcsess:c", "wslcsess:d"] {
-            register_test_session(&mut worker, session_id);
-            worker.sessions[session_id]
+        for session_ref in ["wslcsess:a", "wslcsess:b", "wslcsess:c", "wslcsess:d"] {
+            register_test_session(&mut worker, session_ref);
+            worker.sessions[session_ref]
                 .pulls_in_flight
                 .fetch_add(1, Ordering::SeqCst);
         }
@@ -4883,7 +4885,7 @@ mod tests {
             // SAFETY: `release` never dereferences the handle, so the guard owns
             // a value it can release without touching memory.
             container: unsafe { WslcContainerGuard::from_raw(sentinel, release) },
-            session_id: TEST_SESSION.to_string(),
+            session_ref: TEST_SESSION.to_string(),
             exec_slot: None,
         }
     }
@@ -4905,7 +4907,7 @@ mod tests {
             InFlightExec {
                 container: std::ptr::dangling_mut(),
                 done,
-                session_id: TEST_SESSION.to_string(),
+                session_ref: TEST_SESSION.to_string(),
                 _registration: registration,
                 slot: None,
                 parked: Vec::new(),
@@ -5597,10 +5599,10 @@ mod tests {
                     volumes: Vec::new(),
                     network: Default::default(),
                     port_mappings: Vec::new(),
-                    session_id: None,
+                    session_ref: None,
                 },
                 reply,
-                session_id: TEST_SESSION.to_string(),
+                session_ref: TEST_SESSION.to_string(),
                 _retire_deadline: std::sync::mpsc::channel().0,
             },
         );
@@ -5746,7 +5748,7 @@ mod tests {
     /// The behaviour the whole change exists for: a container lands in the
     /// session it named, and releasing one session leaves the other working.
     ///
-    /// A daemon that ignored `session_id` and routed everything through the
+    /// A daemon that ignored `session_ref` and routed everything through the
     /// implicit session would pass the single-session tests above.
     #[tokio::test]
     #[ignore = "requires a WSL2 host with alpine:latest cached in the daemon store slots"]
@@ -5779,7 +5781,7 @@ mod tests {
             String::from_utf8_lossy(&stdout).trim().to_string()
         }
 
-        async fn sandbox_in(handle: &SessionHandle, session_id: &str) -> String {
+        async fn sandbox_in(handle: &SessionHandle, session_ref: &str) -> String {
             let sandbox_id = handle
                 .provision(ProvisionConfig {
                     image: "alpine:latest".to_string(),
@@ -5787,7 +5789,7 @@ mod tests {
                     volumes: Vec::new(),
                     network: Default::default(),
                     port_mappings: Vec::new(),
-                    session_id: Some(session_id.to_string()),
+                    session_ref: Some(session_ref.to_string()),
                 })
                 .await
                 .expect("provision into the named session");
@@ -5824,10 +5826,10 @@ mod tests {
 
         // Each sandbox is held by the session it named, so neither session can
         // be released while its own sandbox is alive.
-        for session_id in [&first, &second] {
+        for session_ref in [&first, &second] {
             let refusal = handle
                 .deprovision_session(DeprovisionSessionConfig {
-                    session_id: session_id.clone(),
+                    session_ref: session_ref.clone(),
                 })
                 .await
                 .expect_err("a session holding a sandbox must not be released");
@@ -5842,7 +5844,7 @@ mod tests {
             .expect("deprovision the first sandbox");
         handle
             .deprovision_session(DeprovisionSessionConfig {
-                session_id: first.clone(),
+                session_ref: first.clone(),
             })
             .await
             .expect("the first session is empty now");
@@ -5860,7 +5862,9 @@ mod tests {
             .await
             .expect("deprovision the second sandbox");
         handle
-            .deprovision_session(DeprovisionSessionConfig { session_id: second })
+            .deprovision_session(DeprovisionSessionConfig {
+                session_ref: second,
+            })
             .await
             .expect("the second session is empty now");
 
@@ -5889,12 +5893,14 @@ mod tests {
 
         handle
             .deprovision_session(DeprovisionSessionConfig {
-                session_id: first.clone(),
+                session_ref: first.clone(),
             })
             .await
             .expect("release the first session");
         handle
-            .deprovision_session(DeprovisionSessionConfig { session_id: second })
+            .deprovision_session(DeprovisionSessionConfig {
+                session_ref: second,
+            })
             .await
             .expect("releasing one session must leave the other usable");
 
@@ -5965,15 +5971,15 @@ mod tests {
 
             match outcome {
                 Err(e) => println!("{label}: REFUSED in {elapsed:.1?} -- {e}\n"),
-                Ok(session_id) => {
+                Ok(session_ref) => {
                     let delta = before as i64 - available_memory_mb() as i64;
-                    let guest = guest_resources(&handle, &session_id).await;
+                    let guest = guest_resources(&handle, &session_ref).await;
                     println!(
                         "{label}: BOOTED in {elapsed:.1?}, host delta {delta} MB, \
                          guest sees {guest}\n"
                     );
                     handle
-                        .deprovision_session(DeprovisionSessionConfig { session_id })
+                        .deprovision_session(DeprovisionSessionConfig { session_ref })
                         .await
                         .expect("release");
                 }
@@ -5982,9 +5988,9 @@ mod tests {
         handle.shutdown().await.unwrap();
     }
 
-    /// Boot a throwaway sandbox in `session_id` and report what the guest
+    /// Boot a throwaway sandbox in `session_ref` and report what the guest
     /// believes its cpu count and memory are.
-    async fn guest_resources(handle: &SessionHandle, session_id: &str) -> String {
+    async fn guest_resources(handle: &SessionHandle, session_ref: &str) -> String {
         let sandbox_id = match handle
             .provision(ProvisionConfig {
                 image: "alpine:latest".to_string(),
@@ -5992,7 +5998,7 @@ mod tests {
                 volumes: Vec::new(),
                 network: Default::default(),
                 port_mappings: Vec::new(),
-                session_id: Some(session_id.to_string()),
+                session_ref: Some(session_ref.to_string()),
             })
             .await
         {
@@ -6076,7 +6082,7 @@ mod tests {
         let requested_mb = host.total_memory_mb * 2;
         let handle = spawn().unwrap();
 
-        let session_id = handle
+        let session_ref = handle
             .provision_session(ProvisionSessionConfig {
                 cpu_count: None,
                 memory_mb: Some(requested_mb),
@@ -6085,7 +6091,7 @@ mod tests {
             .await
             .expect("a ceiling past installed memory must be accepted");
 
-        let guest = guest_resources(&handle, &session_id).await;
+        let guest = guest_resources(&handle, &session_ref).await;
         println!(
             "requested {requested_mb} MB on a {} MB host; {guest}",
             host.total_memory_mb
@@ -6106,7 +6112,7 @@ mod tests {
         );
 
         handle
-            .deprovision_session(DeprovisionSessionConfig { session_id })
+            .deprovision_session(DeprovisionSessionConfig { session_ref })
             .await
             .unwrap();
         handle.shutdown().await.unwrap();
@@ -6171,9 +6177,9 @@ mod tests {
 
         let refusal = match outcome {
             Err(refusal) => refusal,
-            Ok(session_id) => {
+            Ok(session_ref) => {
                 handle
-                    .deprovision_session(DeprovisionSessionConfig { session_id })
+                    .deprovision_session(DeprovisionSessionConfig { session_ref })
                     .await
                     .ok();
                 handle.shutdown().await.unwrap();
@@ -6205,7 +6211,7 @@ mod tests {
     async fn a_sized_session_boots() {
         let handle = spawn().unwrap();
 
-        let session_id = handle
+        let session_ref = handle
             .provision_session(ProvisionSessionConfig {
                 cpu_count: Some(2),
                 memory_mb: Some(2048),
@@ -6215,7 +6221,7 @@ mod tests {
             .expect("a modestly sized session must boot");
 
         handle
-            .deprovision_session(DeprovisionSessionConfig { session_id })
+            .deprovision_session(DeprovisionSessionConfig { session_ref })
             .await
             .unwrap();
         handle.shutdown().await.unwrap();
@@ -6227,7 +6233,7 @@ mod tests {
     #[ignore = "requires a WSL2 host with alpine:latest cached in the daemon store slots"]
     async fn a_sandbox_can_be_placed_in_a_named_session() {
         let handle = spawn().unwrap();
-        let session_id = handle
+        let session_ref = handle
             .provision_session(ProvisionSessionConfig::default())
             .await
             .expect("session");
@@ -6239,14 +6245,14 @@ mod tests {
                 volumes: Vec::new(),
                 network: Default::default(),
                 port_mappings: Vec::new(),
-                session_id: Some(session_id.clone()),
+                session_ref: Some(session_ref.clone()),
             })
             .await
             .expect("provision into the named session");
 
         let refusal = handle
             .deprovision_session(DeprovisionSessionConfig {
-                session_id: session_id.clone(),
+                session_ref: session_ref.clone(),
             })
             .await
             .expect_err("a session holding a sandbox must not be released");
@@ -6259,7 +6265,7 @@ mod tests {
             .await
             .unwrap();
         handle
-            .deprovision_session(DeprovisionSessionConfig { session_id })
+            .deprovision_session(DeprovisionSessionConfig { session_ref })
             .await
             .expect("an emptied session releases");
 
@@ -6275,7 +6281,7 @@ mod tests {
                 volumes: Vec::new(),
                 network: Default::default(),
                 port_mappings: Vec::new(),
-                session_id: None,
+                session_ref: None,
             })
             .await
             .unwrap();
@@ -6364,7 +6370,7 @@ mod tests {
                 volumes: Vec::new(),
                 network: Default::default(),
                 port_mappings: Vec::new(),
-                session_id: None,
+                session_ref: None,
             })
             .await
             .unwrap();
@@ -6440,7 +6446,7 @@ mod tests {
                     volumes: Vec::new(),
                     network: Default::default(),
                     port_mappings: Vec::new(),
-                    session_id: None,
+                    session_ref: None,
                 })
                 .await
         });
@@ -6606,7 +6612,7 @@ mod tests {
                 volumes: Vec::new(),
                 network: Default::default(),
                 port_mappings: Vec::new(),
-                session_id: None,
+                session_ref: None,
             })
             .await
             .unwrap();
