@@ -145,12 +145,12 @@ impl Drop for ConsoleModeRestorer {
 
 // ── Console Ctrl handler RAII guard ──────────────────────────────────────
 //
-// When the executor or in-process/attached SDK path runs interactively, the
-// local console owns the keyboard. A Ctrl-C from the user — or the user clicking
-// the cmd.exe X button — fires `CTRL_C_EVENT` / `CTRL_CLOSE_EVENT` on the
-// hosting process. The OS default for `CTRL_CLOSE_EVENT` is to call
-// `ExitProcess` a short time later, which kills the relay threads mid-write and
-// drops the agent's final output.
+// When wxc-exec runs interactively, the local console owns the keyboard. A
+// Ctrl-C from the user — or the user clicking the cmd.exe X button — fires
+// `CTRL_C_EVENT` / `CTRL_CLOSE_EVENT` on wxc-exec. The OS default for
+// `CTRL_CLOSE_EVENT` is to call `ExitProcess` on wxc-exec a short time
+// later, which kills the relay threads mid-write and drops the agent's
+// final output.
 //
 // `CtrlHandlerGuard` installs a process-wide handler for the relay
 // lifetime that signals the stdin relay's stop event on either event,
@@ -216,9 +216,9 @@ unsafe extern "system" fn ctrl_handler(ctrl_type: u32) -> BOOL {
 /// `CTRL_CLOSE_EVENT`, allowing the stdin relay to exit gracefully rather
 /// than being killed by the OS default `ExitProcess`.
 ///
-/// Only one guard is alive at a time across the executor relay path and the
-/// in-process/attached SDK relay path. The static target handle is set at
-/// install and cleared at drop, both under [`CTRL_HANDLER_LOCK`].
+/// Only one guard is alive at a time in wxc-exec's lifecycle (calls into
+/// the manager are sequential per invocation). The static target handle
+/// is set at install and cleared at drop, both under [`CTRL_HANDLER_LOCK`].
 pub(super) struct CtrlHandlerGuard {
     installed: bool,
 }

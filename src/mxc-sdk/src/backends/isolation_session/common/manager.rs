@@ -426,6 +426,7 @@ impl IsolationSessionManager {
                 CreateEventW(None, true, false, PCWSTR::null())
                     .map_err(|e| lifecycle_err(format!("CreateEventW(stdin stop): {}", e)))?
             };
+            // Declared before `scope`, which holds a raw copy: it must drop last.
             let stdin_stop_owned = OwnedHandle::new(stdin_stop_event);
 
             // Relay threads bridge the calling process's stdio to
@@ -464,7 +465,7 @@ impl IsolationSessionManager {
                 None
             };
 
-            // Install a console Ctrl handler that signals `stdin_stop_event`
+            // Install a console Ctrl handler that signals `stdin_stop_owned`
             // on Ctrl-C or terminal-close events, so the relay loops drain
             // cleanly instead of being terminated by the OS default
             // `ExitProcess`. Interactive mode only — non-interactive mode
