@@ -122,8 +122,8 @@ impl ScriptRunner for IsolationSessionRunner {
             return e.into();
         }
 
-        let outcome = match manager.create_process(&options, Some(logger)) {
-            Ok(outcome) => outcome,
+        let exec_outcome = match manager.create_process(&options, Some(logger)) {
+            Ok(exec_outcome) => exec_outcome,
             Err(e) => {
                 let stopped = manager.stop_session().is_ok();
                 let deprovisioned = manager.deprovision_agent_user().is_ok();
@@ -159,7 +159,7 @@ impl ScriptRunner for IsolationSessionRunner {
         // Output already streamed live to wxc-exec's stdio via relay
         // threads in `create_process` — captured fields intentionally
         // empty (same pattern as AppContainer).
-        completed_response(outcome, options.timeout_ms)
+        completed_response(exec_outcome, options.timeout_ms)
     }
 }
 
@@ -167,7 +167,10 @@ impl ScriptRunner for IsolationSessionRunner {
 /// told apart from the sandbox failing around it.
 fn completed_response(outcome: ExecOutcome, timeout_ms: u32) -> ScriptResponse {
     match outcome {
-        ExecOutcome::Exited(0) => ScriptResponse::default(),
+        ExecOutcome::Exited(0) => ScriptResponse {
+            exit_code: 0,
+            ..Default::default()
+        },
         ExecOutcome::Exited(exit_code) => ScriptResponse {
             exit_code,
             failure_phase: FailurePhase::ProcessExited,

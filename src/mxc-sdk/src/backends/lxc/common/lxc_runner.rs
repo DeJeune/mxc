@@ -2937,9 +2937,9 @@ mod tests {
             "the fail-closed readiness timeout message changed unexpectedly: {}",
             response.error_message
         );
-        assert_eq!(
-            response.standard_err, response.error_message,
-            "error responses should carry the message in stderr as well"
+        assert!(
+            response.standard_err.is_empty(),
+            "the message belongs in the error envelope, not repeated in stderr"
         );
     }
 
