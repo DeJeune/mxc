@@ -76,10 +76,12 @@ fn dry_run_summary(response: &ScriptResponse) -> String {
 }
 
 /// Print a dry-run result message to the logger, flush, and exit the process.
+/// A failed dry run also emits its typed error envelope on stderr.
 pub fn handle_dry_run_exit(response: &ScriptResponse, logger: &mut Logger) -> ! {
     use std::fmt::Write;
     let _ = writeln!(logger, "{}", dry_run_summary(response));
     print!("{}", logger.get_buffer());
+    emit_backend_error_envelope(response);
     std::process::exit(response.exit_code);
 }
 

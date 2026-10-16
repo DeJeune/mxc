@@ -47,7 +47,7 @@ use crate::mxc_pty::{LivePty, PtySize as UnixPtySize};
 #[cfg(test)]
 use crate::seatbelt_common::default_env::DEFAULT_SANDBOX_PATH;
 use crate::seatbelt_common::default_env::{env_pairs, resolved_env};
-use crate::seatbelt_common::profile_builder::build_profile_with_proxy;
+use crate::seatbelt_common::profile_builder::{build_profile_with_proxy, ProfileError};
 
 #[link(name = "proc")]
 unsafe extern "C" {
@@ -310,7 +310,7 @@ impl SandboxBackend for SeatbeltScriptRunner {
             ));
         }
         let profile =
-            build_profile_with_proxy(request, proxy_address).map_err(rejected_response)?;
+            build_profile_with_proxy(request, proxy_address).map_err(profile_error_response)?;
         log_generated_profile(&profile, logger);
 
         // Determine launch method + GUI access from the seatbelt config.
@@ -1095,6 +1095,13 @@ fn rejected_response(message: String) -> ScriptResponse {
 /// accepted.
 fn launch_failed_response(message: String) -> ScriptResponse {
     ScriptResponse::failed(FailurePhase::LaunchFailed, &message)
+}
+
+fn profile_error_response(error: ProfileError) -> ScriptResponse {
+    match error {
+        ProfileError::Policy(message) => rejected_response(message),
+        ProfileError::Host(message) => launch_failed_response(message),
+    }
 }
 
 /// The optional run timeout — `None` when `scriptTimeout` is 0 (wait forever).
