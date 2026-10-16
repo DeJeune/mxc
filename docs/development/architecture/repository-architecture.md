@@ -113,8 +113,7 @@ flowchart LR
     engine["mxc_engine"]
     common["mxc_common<br/>exact contract parser"]
 
-    typescript --> executor
-    typescript -. exact JSON execution and request probe .-> ffi
+    typescript --> ffi
     cli --> executor
     csharp --> ffi --> sdk
     ffi -. exact config decoding .-> common
@@ -124,14 +123,18 @@ flowchart LR
     sdk --> engine
 ```
 
-`mxc_ffi` is the C ABI used by the Node and C# SDKs. Its generated C# P/Invoke
-file is created during the C# build. Both SDKs map their high-level requests to
-SDK-owned exact configuration JSON before calling the native execution or
-request-probe exports. The shared `mxc_common` contract parser decodes the
-declared exact version before the typed engine operation runs; there is no
-private binding-request parser. The public Rust SDK exposes the
-typed `SandboxRequest` probe API. Generated TypeScript wire types come from the
-schema tooling.
+`mxc_ffi` is the C ABI used by the versioned Node and .NET SDKs. Both map typed
+requests to SDK-owned MXC request JSON before calling native operations.
+The shared `mxc_common` contract parser decodes the declared version before
+engine dispatch. There is no separate binding-request parser.
+
+The Rust SDK calls the engine in-process. On Windows, `mxc_sdk::v1::probe`
+accepts an optional `ContainerRequest`. Executor binaries are separate engine
+clients; they do not implement the public SDK operations.
+
+Generated C# P/Invoke declarations are created during the .NET build.
+Generated contract types come from the schema tooling and are distinct from
+the public SDK request types.
 
 ## Tests
 

@@ -93,9 +93,29 @@ For those willing to help fix issues or implement features:
 
 ### To spec or not to spec
 
-Some issues are quick and simple to describe. Once a team member has agreed with your approach, skip ahead to "Fork, Clone, Branch, and Create your PR" below.
+Start with the GitHub issue, not a feature spec or implementation. Say if you
+want to work on it. Wait for a maintainer to confirm that the problem is valid,
+the change fits MXC, and you can take it on. Maintainers decide whether a
+separate spec is needed.
 
-Some changes require careful thought and a written design before implementation. For these, we'll request a short design document — typically a markdown file under `docs/` or a detailed comment on the issue describing the proposed configuration schema changes, runner behavior, or SDK API surface. Driving towards agreement in writing, before any code is written, often results in simpler code and less wasted effort.
+Small fixes and straightforward improvements usually need only an agreed
+approach in the issue. Then proceed to
+[Fork, Clone, Branch, and Create your PR](#fork-clone-branch-and-create-your-pr).
+Do not create a full spec before maintainers have asked for design work.
+
+For significant changes, maintainers may request a short feature spec in a
+separate documentation PR. Use the
+[feature spec template](./docs/development/architecture/designs/feature-spec-template.md)
+and save the design under `docs/development/architecture/designs/`. Link the
+issue and describe the proposed behavior, compatibility, security implications,
+and acceptance criteria. Wait for the spec to be approved and merged before
+starting implementation. Link the issue and accepted spec from the
+implementation PR. Agreement on the issue alone does not approve the design
+or guarantee a merge.
+
+The [feature authoring guide](./docs/development/guides/authoring-a-new-feature.md)
+covers this process and the later schema, backend, and Rust, .NET, and Node SDK
+stages.
 
 ### Documentation audiences
 
@@ -117,10 +137,14 @@ they describe.
 New, in-development features use their permanent JSON locations in the mutable
 development contract. They may still require the binary's `--experimental`
 runtime authorization until graduation; that gate is independent of JSON
-placement. If you're adding a new feature, follow the step-by-step checklist in
+placement. If you're adding a new feature, follow the staged process in
 [`docs/development/guides/authoring-a-new-feature.md`](./docs/development/guides/authoring-a-new-feature.md), which
-walks through the schema, Rust, and test-config changes required. The schema
-versioning model and promotion path from experimental to stable are described
+starts with issue and design agreement, then covers contracts, backends, tests,
+and the Rust, .NET, and Node SDKs. Put
+policy/schema additions in a separate PR, implement and validate the intended
+backends next, and expose the feature through public SDK APIs only in the
+final feature PR. The schema versioning model and promotion path from
+experimental to stable are described
 in [`docs/development/architecture/versioning.md`](./docs/development/architecture/versioning.md).
 
 ### Help Wanted

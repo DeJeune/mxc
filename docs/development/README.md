@@ -14,6 +14,7 @@ terms, plain-English alternatives, and guidance on naming specific types.
 - [Repository architecture](architecture/repository-architecture.md)
 - [Container lifecycle architecture](architecture/container-lifecycle.md)
 - [Versioning design](architecture/versioning.md)
+- [Feature spec and review template](architecture/designs/feature-spec-template.md)
 - [Telemetry architecture](architecture/telemetry.md)
 - [Telemetry consent design](architecture/telemetry-consent-design.md)
 - [IsolationSession one-shot architecture](architecture/backends/isolation-session/oneshot.md)

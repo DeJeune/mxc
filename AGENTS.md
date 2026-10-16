@@ -33,6 +33,28 @@ security, build, and SDK rules. The expectations below apply in addition.
   prerequisite refactoring from behavior changes; keep each step buildable
   and preserve existing behavior. Do not attempt the whole rewrite at once.
 
+## Land policy features in stages
+
+Start with a GitHub issue and maintainer agreement on the change and who will
+work on it. Maintainers decide whether a spec is needed; if requested, get the
+separate spec PR approved and merged before implementation. Small changes can
+proceed with an agreed approach in the issue.
+
+1. Put policy/schema additions in a separate PR from backend implementation
+   and public API changes. Update the development contract and required generated
+   artifacts without publishing the feature or accepting unenforced policy.
+
+2. Implement and validate the internal behavior for every backend the feature
+   claims to support. A backend-specific feature needs only that backend;
+   other backends must continue to reject unsupported requests.
+
+3. Add or update the public SDK/API only in the final feature PR, after the
+   intended backends work and have functional validation coverage. Do not
+   expose an API that promises behavior the backend cannot yet provide.
+
+Follow the [feature authoring guide](docs/development/guides/authoring-a-new-feature.md)
+for the issue, design, contract, implementation, and SDK stages.
+
 ## Write for everyday developers
 
 Use plain, precise language in code reviews, comments, documentation, and

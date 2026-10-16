@@ -48,6 +48,21 @@ review or stop after finding one working path.
   maintenance risk and recommend smaller, reviewable vertical slices with
   behavior coverage. Do not demand a rewrite for a local problem.
 
+- Check that the implementation links an agreed issue and, when maintainers
+  requested one, an approved and merged spec. Do not require a separate spec
+  for a small change whose approach is already agreed in the issue.
+
+- For a spec-only PR, use the
+  [feature spec review checklist](../../../docs/development/architecture/designs/feature-spec-template.md#review-checklist).
+  Review the proposed behavior and validation plan; do not require completed
+  implementation or present planned tests as results.
+
+- Check the PR sequence: policy/schema additions belong in a separate PR from
+  backend implementation and public API changes. SDK/API exposure comes last,
+  after internal behavior and functional tests are ready for every intended
+  backend, or the single backend for a backend-specific feature. Earlier
+  contract changes must not publish or silently accept unenforced policy.
+
 ## Check MXC rules
 
 - **Rust package boundaries:** Inspect `src/Cargo.toml` workspace members and
