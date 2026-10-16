@@ -77,6 +77,10 @@ disabled_test() {
     echo ""
 }
 
+echo "NOTE: LXC Rootless No-Network is not run here, because it adds a temporary user account to this machine."
+echo "      Run it manually with: sudo bash $SCRIPT_DIR/run_lxc_rootless_no_network_test.sh"
+echo ""
+
 run_test "Basic LXC" "$SCRIPT_DIR/run_lxc_basic_test.sh"
 run_test "LXC Filesystem" "$SCRIPT_DIR/run_lxc_filesystem_test.sh"
 run_test "LXC Object Validation" "$SCRIPT_DIR/run_lxc_object_test.sh"

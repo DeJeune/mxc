@@ -15,13 +15,31 @@ if [ ! -f "$LXC_EXEC" ]; then
     exit 1
 fi
 
-if [ -z "${SUDO_USER:-}" ]; then
-    echo "Error: run this under sudo, so the account that invoked sudo can run lxc-exec without root."
+if [ "$(id -u)" -ne 0 ]; then
+    echo "Error: run this under sudo, so it can create the unprivileged user that runs lxc-exec."
     exit 1
 fi
 
-echo "Running LXC rootless no-network test as $SUDO_USER..."
-OUTPUT=$(sudo -u "$SUDO_USER" -H "$LXC_EXEC" "$REPO_DIR/tests/configs/lxc_rootless_no_network.json" 2>&1) || {
+RUN_USER=mxc-rootless-e2e
+useradd -m "$RUN_USER"
+trap 'userdel -r "$RUN_USER" 2>/dev/null' EXIT
+
+RUN_HOME="/home/$RUN_USER"
+SUBUID_START=$(grep "^$RUN_USER:" /etc/subuid | cut -d: -f2)
+SUBGID_START=$(grep "^$RUN_USER:" /etc/subgid | cut -d: -f2)
+
+# The container's mapped root must be able to walk into the user's home to reach its rootfs.
+chmod 755 "$RUN_HOME"
+mkdir -p "$RUN_HOME/.config/lxc"
+cat > "$RUN_HOME/.config/lxc/default.conf" <<EOF
+lxc.include = /etc/lxc/default.conf
+lxc.idmap = u 0 $SUBUID_START 65536
+lxc.idmap = g 0 $SUBGID_START 65536
+EOF
+chown -R "$RUN_USER:" "$RUN_HOME/.config"
+
+echo "Running LXC rootless no-network test as $RUN_USER..."
+OUTPUT=$(sudo -u "$RUN_USER" -H "$LXC_EXEC" "$REPO_DIR/tests/configs/lxc_rootless_no_network.json" 2>&1) || {
     echo "FAIL: lxc-exec without root could not run a config that has no network section."
     echo "$OUTPUT"
     exit 1

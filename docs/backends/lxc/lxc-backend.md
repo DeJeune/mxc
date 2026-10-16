@@ -24,7 +24,8 @@ Creates an LXC container to provide:
 
 - Linux kernel >= 2.6.32, or >= 3.12 to run unprivileged
 - LXC >= 5.0 installed (`liblxc-dev` for building, `lxc-utils` for runtime)
-- Root privileges, or unprivileged LXC for a policy that asks for no network.
+- Root privileges, or [unprivileged LXC](#running-without-root) for a policy
+  that asks for no network.
   Filtering egress or ingress installs iptables rules in the container's
   network namespace, which requires root.
 
@@ -47,6 +48,36 @@ process.
 ```bash
 sudo pacman -S lxc
 ```
+
+### Running without root
+
+A config with no `network` section can run without sudo once the host is set up
+for unprivileged LXC.  Everything else needs root.
+
+1. Install `newuidmap` and `newgidmap` (`sudo apt install uidmap` on
+   Debian/Ubuntu).
+2. Make sure your account has a subordinate ID range.  On Ubuntu 24.04,
+   `useradd` creates one.  To check:
+   ```bash
+   grep "^$USER:" /etc/subuid /etc/subgid
+   ```
+   If nothing prints, an admin adds a range:
+   ```bash
+   sudo usermod --add-subuids 100000-165535 --add-subgids 100000-165535 "$USER"
+   ```
+3. Map the container's IDs onto that range in `~/.config/lxc/default.conf`,
+   using the start and count from step 2:
+   ```
+   lxc.include = /etc/lxc/default.conf
+   lxc.idmap = u 0 100000 65536
+   lxc.idmap = g 0 100000 65536
+   ```
+4. Let the container's root user reach its files under your home directory:
+   `chmod o+x ~`.
+
+`tests/scripts/run_lxc_rootless_no_network_test.sh` checks this with a temporary
+user.  CI runs it, and `run_lxc_all_tests.sh` leaves it out because it adds that
+user to the host.  Run it by hand with `sudo` when you need it locally.
 
 ### Container networking
 
