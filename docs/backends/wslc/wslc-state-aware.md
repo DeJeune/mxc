@@ -362,22 +362,32 @@ A session whose VM teardown could not stop keeps its slot leased rather than
 returning it, because that VM may still have the store's VHDX mounted and
 reissuing the slot would hand out a store nothing can open. Three cases reach
 that state: a pull still running when the drain budget expired, a terminate that
-reported a failure, and a session teardown ran out of budget to terminate at all.
+reported a failure (including one stopping a VM whose store probe failed), and a
+terminate still running when teardown's release budget expired.
 
 Teardown spends its budget twice over: once waiting for in-flight work across
-every session, and again terminating the VMs that drained. Sharing one budget
-would let a single stuck pull leave the remaining sessions no time to release,
-and a leaked slot costs capacity permanently where a slow terminate does not.
+every session, and again waiting for the VMs that drained to stop. Sharing one
+budget would let a single stuck pull leave the remaining sessions no time to
+release, and a leaked slot costs capacity permanently where a slow terminate does
+not.
 
 A session whose boot lands after teardown has begun is released before the SDK
 unloads rather than left for the command channel to drop.
 
 Stopping a VM runs on a thread of its own, as booting one does, so neither the
 empty-session reaper nor a `deprovision-session` holds up the sandboxes in every
-other session. Shutdown is the exception: it terminates on the spot, because its
-whole job is to finish before the SDK unloads. A client asking to release a
-session is answered when its VM has actually stopped, not when the request was
-accepted.
+other session. Shutdown uses the same threads: it starts every release at once
+and waits for them only until its budget runs out. A VM still stopping then is
+left running with its slot held, and the SDK stays loaded under it, rather than
+holding up the daemon's exit. A client asking to release a session is answered
+when its VM has actually stopped, not when the request was accepted.
+
+A session booted while another is being released waits for that release to
+return its store slot rather than taking a cold one, since the next free slot
+lacks the images the released session had pulled. Each finished release lets one
+waiting boot go. A release normally finishes in under a second; one still running
+after 60 seconds is treated as stuck, and the boots waiting on it take the next
+free slot instead.
 
 The boot timeout above bounds `WslcCreateSession` only — the store probe that
 follows it has no deadline of its own and has been measured taking minutes. A
@@ -385,7 +395,10 @@ boot still running after `MXC_WSLC_DAEMON_SESSION_BOOT_SECS` therefore has its
 waiting clients answered and its id retired, so a later request boots a fresh
 session rather than parking behind one that may never arrive. Its store slot
 stays held, because that boot thread may still open the store; if it does
-eventually produce a VM, that VM is released rather than installed.
+eventually produce a VM, that VM is released rather than installed. A boot still
+waiting for a releasing slot at that point has no thread and no slot, so it is
+dropped. The deadline runs from when the session was asked for, including any
+wait for a releasing slot.
 
 ### exec output semantics
 
@@ -583,13 +596,14 @@ whatever the first of these resolves to — see
 poll, and never waits for anything: a session still in use is simply left for
 the next poll, so one busy session cannot stall the others' requests.
 
-Teardown itself is bounded by a single **60s** budget covering the whole of it —
-draining off-worker execs, then every session's outstanding pulls. It is one
-budget rather than one per session, so a daemon holding four sessions does not
-take four times as long to exit as a daemon holding one. Whatever is still
-running when the budget expires has its handles abandoned rather than released,
-since freeing memory the SDK is still using is the worse failure; an abandoned
-session keeps its store slot leased, because its store's VHDX is still mounted.
+Teardown waits at most **60s** for off-worker execs and every session's
+outstanding pulls, then at most another **60s** for the VMs it is stopping. The
+first budget is shared across every session rather than spent once per session,
+so a daemon holding four sessions does not take four times as long to exit as a
+daemon holding one. Whatever is still running when a budget expires is abandoned
+rather than released, since freeing memory the SDK is still using is the worse
+failure: an abandoned session keeps its store slot leased, because its store's
+VHDX may still be mounted, and the SDK stays loaded under a VM still stopping.
 
 The lifecycle end-to-end test script (`tests/scripts/run_wslc_state_aware_tests.ps1`) uses short overrides so
 it can observe idle-teardown within seconds.

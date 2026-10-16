@@ -790,6 +790,21 @@ pub unsafe fn load_sdk_checked(logger: &mut Logger) -> Result<WslcSdk, ScriptRes
     Ok(sdk)
 }
 
+#[derive(Debug)]
+pub struct SessionCreateFailure {
+    pub response: ScriptResponse,
+    pub store_may_be_held: bool,
+}
+
+impl From<ScriptResponse> for SessionCreateFailure {
+    fn from(response: ScriptResponse) -> Self {
+        Self {
+            response,
+            store_may_be_held: false,
+        }
+    }
+}
+
 /// Create the shared daemon session (the WSL2 utility VM).
 ///
 /// # Safety
@@ -801,7 +816,7 @@ pub unsafe fn create_daemon_session(
     storage_path: &str,
     sizing: SessionSizing,
     logger: &mut Logger,
-) -> Result<WslcSessionGuard, ScriptResponse> {
+) -> Result<WslcSessionGuard, SessionCreateFailure> {
     // Both wide buffers must outlive `WslcCreateSession` (the SDK stores pointers
     // into them at `WslcInitSessionSettings` time); they are function locals held
     // through the create call below.
@@ -811,7 +826,7 @@ pub unsafe fn create_daemon_session(
     let mut settings = std::mem::zeroed::<WslcSessionSettings>();
     let hr = sdk.WslcInitSessionSettings(name_wide.as_ptr(), storage_wide.as_ptr(), &mut settings);
     if hr != S_OK {
-        return Err(sdk_error("WslcInitSessionSettings failed", hr, ""));
+        return Err(sdk_error("WslcInitSessionSettings failed", hr, "").into());
     }
     apply_session_sizing(sdk, &mut settings, sizing)?;
 
@@ -822,7 +837,7 @@ pub unsafe fn create_daemon_session(
     let created_in = started.elapsed();
     if hr != S_OK {
         let msg = err_msg.to_string_lossy();
-        return Err(sdk_error("WslcCreateSession failed", hr, &msg));
+        return Err(sdk_error("WslcCreateSession failed", hr, &msg).into());
     }
 
     let guard = WslcSessionGuard::from_raw(
@@ -848,7 +863,22 @@ pub unsafe fn create_daemon_session(
         probed_in.as_secs_f32(),
         if probe.is_ok() { "ok" } else { "failed" }
     );
-    probe?;
+
+    if let Err(response) = probe {
+        // Dropping the guard would ignore a failed terminate, and the caller
+        // must know whether this VM may still hold the store.
+        let store_may_be_held = match release_daemon_session(guard, session_name, logger) {
+            Ok(()) => false,
+            Err(release) => {
+                let _ = writeln!(logger, "[WSLC][daemon] {}", release.error_message);
+                true
+            }
+        };
+        return Err(SessionCreateFailure {
+            response,
+            store_may_be_held,
+        });
+    }
 
     Ok(guard)
 }

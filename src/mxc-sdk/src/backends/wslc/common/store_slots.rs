@@ -563,13 +563,18 @@ mod host_tests {
             )
         };
 
-        let refusal = match second {
-            Err(resp) => resp,
+        let failure = match second {
+            Err(failure) => failure,
             Ok(_) => panic!(
                 "a session on a held store must be refused at create; letting it \
                  through mints a sandbox id that dies at an arbitrary later phase"
             ),
         };
+        assert!(
+            !failure.store_may_be_held,
+            "the refused VM never opened the held store, so stopping it must succeed"
+        );
+        let refusal = failure.response;
         assert!(
             refusal.error_message.contains("80070020"),
             "the refusal must carry the sharing violation: {}",
