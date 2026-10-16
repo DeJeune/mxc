@@ -582,6 +582,7 @@ mod tests {
             let mut logger = Logger::new(Mode::Buffer);
             resolve_runner_inner_windows(&request, &mut logger).unwrap();
             assert!(logger.get_buffer().is_empty());
+            assert!(logger.warnings().is_empty());
         }
     }
 
@@ -596,7 +597,7 @@ mod tests {
 
         resolve_runner_inner_windows(&request, &mut logger).unwrap();
 
-        let warning = logger.get_buffer();
+        let warning = logger.warnings().join("\n");
         assert!(warning.contains("idleTimeoutMs"));
         assert!(warning.contains("daemonPipeName"));
         assert!(warning.contains("fresh VM"));
@@ -673,7 +674,10 @@ mod run_tests {
         let mut logger = Logger::new(Mode::Buffer);
         let response = run_resolved(
             ResolvedRunner::without_guard(Box::new(WarningRunner)),
-            &ExecutionRequest::default(),
+            &ExecutionRequest {
+                script_code: "echo hi".to_string(),
+                ..Default::default()
+            },
             &mut logger,
         );
         assert_eq!(response.warnings(), ["advisory"]);
