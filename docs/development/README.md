@@ -31,6 +31,8 @@ terms, plain-English alternatives, and guidance on naming specific types.
 
 ## Contributor guides
 
+- [Project management and triage](project-management.md)
+- [Release cadence and SDK versioning](../releases-and-sdk-versioning.md)
 - [Authoring a new feature](guides/authoring-a-new-feature.md)
 - [Diagnostics](guides/diagnostics.md)
 - [Adding ProcessContainer OS features](guides/process-container-adding-os-features.md)

@@ -14,6 +14,13 @@ The point of doing all this work in public is to ensure that we are holding ours
 
 The team triages new issues regularly. During triage, the team uses labels to categorize, manage, and drive the project workflow. Issues are categorized into one of four types — **Bug**, **Feature**, **Documentation**, or **Task** — and all new issues receive the `Needs-Triage` label until a team member has reviewed them.
 
+Release planning uses the GitHub project's `Release` field. Maintainers place
+new, unplanned issues in `VFUTURE` and select work for `VNEXT +1` and `VNEXT`.
+See [project management and triage](docs/development/project-management.md)
+for the two-week planning cycle and
+[MXC releases and SDK versioning](docs/releases-and-sdk-versioning.md) for the
+release windows and package-version policy.
+
 If you file issues or create PRs, please keep an eye on your GitHub notifications. Issues and PRs that remain unanswered for several days after a request for information may be closed.
 
 ### Maintainer issue investigation

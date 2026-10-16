@@ -72,6 +72,9 @@ The Node and .NET packages include the native runtime assets. The Rust crate
 builds the MXC SDK, engine, and selected backends into the consuming
 application.
 
+See [MXC releases and SDK versioning](docs/releases-and-sdk-versioning.md) for
+the release cadence, package-version policy, and host compatibility guidance.
+
 **Non-SDK consumption:** Platform-specific executor binaries, such as
 `wxc-exec.exe`, accept JSON container-creation requests defined by the
 [stable schema](schemas/stable/). Use for testing or when the

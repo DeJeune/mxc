@@ -5,6 +5,12 @@
 See the [developer glossary](../glossary.md) for terms such as "exact contract,"
 "wire format," and "request root."
 
+For release cadence and independently versioned SDK package policy, see
+[MXC releases and SDK versioning](../../releases-and-sdk-versioning.md).
+This design describes contract selection and the current implementation;
+the release overview identifies the tooling prerequisite for independent
+package publication.
+
 ## Architecture at a glance
 
 Versioning determines **which configuration contract is accepted**, not which
