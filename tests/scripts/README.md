@@ -69,7 +69,6 @@ assertions; the existing proxy assertions still apply.
 
 The loopback area checks direct access with both ingress defaults. The proxy
 area checks that other IPv4 and IPv6 loopback endpoints remain blocked.
-Run these areas from a non-elevated PowerShell session.
 
 Shared helpers live in `tests/scripts/lib/WinProcessContainer.Common.ps1`. It
 must be **dot-sourced, not imported as a module** — `Initialize-WpcContext`
