@@ -71,7 +71,7 @@ pub(crate) const PRIVACY_LEARNING_MODE_PROVIDER: GUID = GUID {
 };
 
 pub(crate) const NETWORK_DECISION_PROVIDER: GUID =
-    GUID::from_u128(0x71237669_21c3_4101_bd2f_ff38945d725a);
+    GUID::from_u128(0x301ec03d_2951_5efb_6d99_59c64628bbfc);
 pub(crate) const NETWORK_DECISION_EVENT_ID: u16 = 1;
 
 pub(crate) const ACCESS_CHECK_EVENT_ID: u16 = 14;

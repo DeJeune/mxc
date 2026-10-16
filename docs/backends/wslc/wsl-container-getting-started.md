@@ -131,6 +131,14 @@ Or pull a single image directly:
     --setup-wslc --image alpine:latest
 ```
 
+Repeat `--image` to pull several in one go, which opens each store once instead
+of once per image:
+
+```powershell
+.\src\target\x86_64-pc-windows-msvc\release\wxc-exec.exe `
+    --setup-wslc --image alpine:latest --image python:3.12-alpine
+```
+
 Pulled images persist in the cache until you remove them — pay the
 cost once per image, not once per run.
 
@@ -140,6 +148,15 @@ cost once per image, not once per run.
 > value here with `-StoragePath` (or `--storage-path` on
 > `wxc-exec.exe`), otherwise the runner will not find what you just
 > pulled and will pull it again under its own path.
+
+> **Container lifecycle operations use a different store.** The lifecycle
+> daemon leases its store from a pool under
+> `%LOCALAPPDATA%\mxc\wslc-store-slots` (or `%TEMP%\mxc\wslc-store-slots` when
+> `%LOCALAPPDATA%` is unresolvable), which `-StoragePath` does not reach.
+> Warm it with `setup-wslc.ps1 -DaemonSlots 1`, or `--wslc-daemon-slots 1` on
+> `wxc-exec.exe`; both default to 0, and each slot warmed costs another pull
+> and another multi-GiB store. See
+> [the lifecycle guide](wslc-state-aware.md#image-store).
 
 > **Bring-up reaches the network.** A cache miss makes the host fetch
 > from the image's registry before the container starts. That fetch is
@@ -212,6 +229,25 @@ prepare a machine that will run offline — warm the cache first:
 ```powershell
 .\scripts\setup-wslc.ps1 -Image <image>
 ```
+
+### How warming works
+
+A store is a directory holding a `storage.vhdx`, and the SDK offers no way to
+write into one directly — a pull needs a live session. So warming opens a
+short-lived WSLc session against each target store, pulls every requested image
+into it, and releases it. The session is only a way to reach the file; what
+persists is the VHDX, which a later run or a lifecycle daemon reads.
+
+One session is opened per *store*, not per image, so warming three images into
+two stores costs two sessions rather than six. Passing every image to one
+invocation is therefore cheaper than invoking the tool once per image:
+
+```powershell
+.\scripts\setup-wslc.ps1 -Image alpine:latest, python:3.12-alpine -DaemonSlots 1
+```
+
+That warms two stores — the create-and-run store and lifecycle slot 0 — with
+both images, booting two utility VMs in total.
 
 ## Usage
 
@@ -313,7 +349,7 @@ WSLC-specific settings go under `wslc` in the JSON config:
 | `cpuCount` | number | Host default | Number of CPU cores for the container |
 | `memoryMb` | number | Host default | Memory limit in MB |
 | `gpu` | boolean | `false` | Enable GPU passthrough |
-| `storagePath` | string | System default | Host path for container storage (VHD) |
+| `storagePath` | string | System default | Host path for container storage (VHD). Create-and-run execution only |
 | `imageTarPath` | string | — | Path to a local tar file to import as the image |
 | `portMappings` | array | `[]` | Host→container TCP forwards; each entry takes `windowsPort` and `containerPort` |
 
@@ -351,8 +387,11 @@ The separate `provision` operation takes the same list under
 
 The lifecycle daemon creates one container per sandbox, so a forward belongs
 to the sandbox that declared it. The session-wide `cpuCount` / `memoryMb` /
-`gpu` / `storagePath` settings remain available only for create-and-run execution, because that daemon shares a
-single WSL session across every sandbox.
+`gpu` settings remain available only for create-and-run execution, because that daemon shares a
+single WSL session across every sandbox. `storagePath` is create-and-run-only
+for a different reason: the daemon leases its store from a slot pool rather
+than taking a caller-named path, so warming its cache is a separate step. See
+[the lifecycle guide](wslc-state-aware.md#image-store).
 
 ### Image sources
 
@@ -634,7 +673,8 @@ images — cannot be used.
 | `Failed to load wslcsdk.dll` | DLL not in same directory as `wxc-exec.exe` | Copy `wslcsdk.dll` next to the binary |
 | `WSLC runtime unavailable` | WSL runtime package is missing, older than 2.9.9, or the Virtual Machine Platform optional component is disabled | Update WSL with `wsl --update --pre-release`, verify the installed version with `wsl --version`, and enable the Virtual Machine Platform optional component if required. The WSLC SDK DLL is a separate dependency and does not replace the WSL runtime package. |
 | `WSLC runtime unavailable. Missing components: SdkNeedsUpdate` | The opposite direction: your installed WSL is **newer** than the WSLc SDK this MXC build ships (specified by `WSLC_SDK_VERSION` in `src/mxc-sdk/build/build_wslc_common.rs`) | Update MXC to a build that includes a newer SDK. Do **not** update WSL — it is already ahead, and updating it further will not clear this. |
-| `WSLC image '<name>' is not cached, and this sandbox declares no egress` | An isolated config named an image the store does not have | Warm the cache with `--setup-wslc`, set `imageTarPath`, or allow egress |
+| `WSLC image '<name>' is not cached, and this sandbox declares no egress` | An isolated config named an image the store does not have | Warm the cache with `--setup-wslc`, set `imageTarPath`, or allow egress. For a lifecycle operation the store is a daemon slot, so warm it with `setup-wslc.ps1 -DaemonSlots 1` |
+| `WSLc store unavailable: the image store at <path> is already held by another live session` | Two processes reached the same store, which admits one live session | Wait for the holder to release it. A running `wxc-wslc-daemon.exe` releases its slot after `MXC_WSLC_DAEMON_IDLE_TIMEOUT_SECS` (default 300s); a create-and-run execution releases its store when the run ends |
 | `WSLC image '<name>' cannot be pulled: '<host>' is not in the administrative registry allowlist` | Machine policy restricts which registries may be used | Use a permitted registry, set `imageTarPath`, or ask an administrator to widen `WslcAllowedImageRegistries` |
 | `WSLC image '<name>' did not finish pulling within <n>s and was stopped` | The pull exceeded its budget and was aborted | Retry, raise `MXC_WSLC_PULL_TIMEOUT_SECS`, or warm the cache from a faster network |
 | `WSLC image '<name>' did not finish pulling within <n>s. The transfer was abandoned` | The registry stopped responding, so the pull was given up on rather than ended | Retry, or warm the cache from a faster network. For a separate `provision` operation, raise `MXC_WSLC_DAEMON_CALL_TIMEOUT_SECS` alongside `MXC_WSLC_PULL_TIMEOUT_SECS`, since the pull must finish before the daemon-call deadline |
