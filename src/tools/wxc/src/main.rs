@@ -656,15 +656,15 @@ fn run_state_aware_main(
             process::exit(0);
         }
         StateAwareExit::ExecCode(exit_code) => process::exit(exit_code),
-        StateAwareExit::Error(json) => {
+        StateAwareExit::Error(json, exit_code) => {
             println!("{}", json);
-            process::exit(1);
+            process::exit(exit_code);
         }
-        StateAwareExit::ExecError(json) => {
+        StateAwareExit::ExecError(json, exit_code) => {
             // The script's own stderr may not end in a newline, and gluing the
             // envelope onto those bytes would leave it unparseable.
             eprintln!("\n{}", json);
-            process::exit(1);
+            process::exit(exit_code);
         }
     }
 }
@@ -678,10 +678,10 @@ enum StateAwareExit {
     Envelope(String),
     /// Exit with this script exit code (its output was already streamed).
     ExecCode(i32),
-    /// Print this JSON error envelope to stdout, then exit 1.
-    Error(String),
-    /// Print this JSON error envelope to stderr, then exit 1.
-    ExecError(String),
+    /// Print this JSON error envelope to stdout, then exit with the code's status.
+    Error(String, i32),
+    /// Print this JSON error envelope to stderr, then exit with the code's status.
+    ExecError(String, i32),
 }
 
 /// Map a dispatch outcome to its terminal exit action. Pure — it neither prints
@@ -697,14 +697,15 @@ fn finalize_state_aware_outcome(
         Ok(DispatchOutcome::ExecCompleted { exit_code }) => StateAwareExit::ExecCode(exit_code),
         Err(e) => {
             let json = error_envelope_string(&e);
+            let exit_code = e.code.exit_code();
 
             // A failed exec has already streamed the script's output to stdout,
             // so an envelope appended there would corrupt both. A dry run
             // streams nothing and keeps its envelope on stdout.
             if phase == "exec" && !dry_run {
-                StateAwareExit::ExecError(json)
+                StateAwareExit::ExecError(json, exit_code)
             } else {
-                StateAwareExit::Error(json)
+                StateAwareExit::Error(json, exit_code)
             }
         }
     }
@@ -3137,11 +3138,12 @@ mod tests {
         let outcome: Result<DispatchOutcome, MxcError> =
             Err(MxcError::malformed_request("boom".to_string()));
         match finalize_state_aware_outcome(outcome, "provision", false) {
-            StateAwareExit::Error(json) => {
+            StateAwareExit::Error(json, exit_code) => {
                 // Must be a parseable envelope carrying the error code so consumers
                 // that key off `error.code` still work.
                 let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
                 assert!(parsed["error"]["code"].is_string(), "{json}");
+                assert_eq!(exit_code, 1);
             }
             other => panic!("expected Error, got {other:?}"),
         }
@@ -3152,10 +3154,11 @@ mod tests {
         let outcome: Result<DispatchOutcome, MxcError> =
             Err(MxcError::backend_error("output was truncated".to_string()));
         match finalize_state_aware_outcome(outcome, "exec", false) {
-            StateAwareExit::ExecError(json) => {
+            StateAwareExit::ExecError(json, exit_code) => {
                 // Still a parseable envelope; only the stream it lands on changes.
                 let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
                 assert!(parsed["error"]["code"].is_string(), "{json}");
+                assert_eq!(exit_code, -1);
             }
             other => panic!("expected ExecError, got {other:?}"),
         }
@@ -3167,7 +3170,7 @@ mod tests {
             Err(MxcError::malformed_request("boom".to_string()));
         assert!(matches!(
             finalize_state_aware_outcome(outcome, "exec", true),
-            StateAwareExit::Error(_)
+            StateAwareExit::Error(_, 1)
         ));
     }
 }

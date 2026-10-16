@@ -11,6 +11,7 @@ use std::io::IsTerminal;
 use crate::mxc_common::logger::Logger;
 use crate::mxc_common::models::{ExecutionRequest, FailurePhase, ScriptResponse};
 use crate::mxc_common::script_runner::ScriptRunner;
+use crate::mxc_common::state_aware_backend::ExecOutcome;
 use crate::mxc_common::validator::{validate_network_policy_support, NetworkPolicySupport};
 
 use super::manager::{log_sandbox_torn_down, IsolationSessionManager, TeardownOutcome};
@@ -121,8 +122,8 @@ impl ScriptRunner for IsolationSessionRunner {
             return e.into();
         }
 
-        let exit_code = match manager.create_process(&options, Some(logger)) {
-            Ok(code) => code,
+        let outcome = match manager.create_process(&options, Some(logger)) {
+            Ok(outcome) => outcome,
             Err(e) => {
                 let stopped = manager.stop_session().is_ok();
                 let deprovisioned = manager.deprovision_agent_user().is_ok();
@@ -158,24 +159,24 @@ impl ScriptRunner for IsolationSessionRunner {
         // Output already streamed live to wxc-exec's stdio via relay
         // threads in `create_process` — captured fields intentionally
         // empty (same pattern as AppContainer).
-        ScriptResponse {
-            exit_code,
-            standard_out: String::new(),
-            standard_err: String::new(),
-            error_message: String::new(),
-            failure_phase: exited_phase(exit_code),
-            ..Default::default()
-        }
+        completed_response(outcome, options.timeout_ms)
     }
 }
 
-/// The phase a completed run reports, so a workload that failed on its own is
+/// The response for a completed run, so a workload that failed or timed out is
 /// told apart from the sandbox failing around it.
-fn exited_phase(exit_code: i32) -> FailurePhase {
-    if exit_code == 0 {
-        FailurePhase::None
-    } else {
-        FailurePhase::ProcessExited
+fn completed_response(outcome: ExecOutcome, timeout_ms: u32) -> ScriptResponse {
+    match outcome {
+        ExecOutcome::Exited(0) => ScriptResponse::default(),
+        ExecOutcome::Exited(exit_code) => ScriptResponse {
+            exit_code,
+            failure_phase: FailurePhase::ProcessExited,
+            ..Default::default()
+        },
+        ExecOutcome::TimedOut => ScriptResponse::failed(
+            FailurePhase::Timeout,
+            &format!("script timed out after {timeout_ms}ms"),
+        ),
     }
 }
 
@@ -187,10 +188,19 @@ mod tests {
     };
 
     #[test]
-    fn a_nonzero_workload_exit_is_reported_as_a_process_exit() {
-        assert_eq!(exited_phase(0), FailurePhase::None);
-        assert_eq!(exited_phase(3), FailurePhase::ProcessExited);
-        assert_eq!(exited_phase(-1), FailurePhase::ProcessExited);
+    fn completed_runs_distinguish_exit_from_timeout() {
+        let ok = completed_response(ExecOutcome::Exited(0), 5_000);
+        assert_eq!((ok.exit_code, ok.failure_phase), (0, FailurePhase::None));
+
+        let exited = completed_response(ExecOutcome::Exited(-1), 5_000);
+        assert_eq!(
+            (exited.exit_code, exited.failure_phase),
+            (-1, FailurePhase::ProcessExited)
+        );
+
+        let timed_out = completed_response(ExecOutcome::TimedOut, 5_000);
+        assert_eq!(timed_out.failure_phase, FailurePhase::Timeout);
+        assert_eq!(timed_out.error_message, "script timed out after 5000ms");
     }
 
     #[test]

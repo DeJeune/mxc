@@ -398,7 +398,7 @@ impl IsolationSessionManager {
 
     /// Step 3: Create a process inside the started isolation session and run it
     /// to completion. Output is streamed live to the calling process's stdio via
-    /// internal relay threads; only the exit code is returned.
+    /// internal relay threads; only the exit code or timeout is returned.
     ///
     /// This is the **relay** path, reached by `wxc-exec` and by an in-process
     /// caller that asked to attach. A caller that wants the streams handed back
@@ -407,7 +407,7 @@ impl IsolationSessionManager {
         &self,
         options: &ProcessOptions,
         logger: Option<&mut Logger>,
-    ) -> Result<i32, IsolationSessionError> {
+    ) -> Result<ExecOutcome, IsolationSessionError> {
         owned_thread::call(&self.impersonation, || {
             // Everything fallible that does not need the workload runs first, so no
             // failure can strand a running one.
@@ -583,10 +583,7 @@ impl IsolationSessionManager {
             scope.stop_stdin();
             scope.finish();
 
-            Ok(match outcome {
-                ExecOutcome::Exited(exit_code) => exit_code,
-                ExecOutcome::TimedOut => WAIT_FOR_EXIT_TIMEOUT,
-            })
+            Ok(outcome)
         })
     }
 
@@ -1219,7 +1216,7 @@ const STILL_ACTIVE: i32 = windows::Win32::Foundation::STATUS_PENDING.0;
 /// What `WaitForExit` returns when the deadline elapses before the process
 /// exits. Like [`STILL_ACTIVE`] this is a legal exit code in its own right, so
 /// it is never used alone to conclude a timeout.
-const WAIT_FOR_EXIT_TIMEOUT: i32 = -1;
+pub(super) const WAIT_FOR_EXIT_TIMEOUT: i32 = -1;
 
 /// How long [`StartedProcess::terminate`] waits for a kill to land before
 /// reporting success anyway. Bounded so a failed `Terminate` cannot wedge that

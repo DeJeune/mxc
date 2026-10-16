@@ -145,10 +145,12 @@ fn warning_envelope_lines(warnings: &[String]) -> Vec<String> {
 /// Warnings are reported on success as well as on failure, so this is separate
 /// from [`emit_backend_error_envelope`] rather than folded into it. One object
 /// per line keeps the stream parseable a line at a time, matching the error
-/// envelope.
+/// envelope. The batch starts on a fresh line because the workload's stderr may
+/// not end in a newline.
 pub fn emit_warning_envelopes(warnings: &[String]) {
-    for line in warning_envelope_lines(warnings) {
-        eprintln!("{line}");
+    let lines = warning_envelope_lines(warnings);
+    if !lines.is_empty() {
+        eprintln!("\n{}", lines.join("\n"));
     }
 }
 

@@ -25,7 +25,9 @@ use crate::mxc_common::validator::{
 use windows::Win32::Foundation::HANDLE;
 
 use super::error::map_lifecycle_error;
-use super::manager::{log_sandbox_torn_down, IsolationSessionManager, TeardownOutcome};
+use super::manager::{
+    log_sandbox_torn_down, IsolationSessionManager, TeardownOutcome, WAIT_FOR_EXIT_TIMEOUT,
+};
 use super::policy::{
     reject_unhonorable_environment, validate_post_provision_policy, validate_provision_policy,
 };
@@ -316,9 +318,13 @@ impl StatefulSandboxBackend for IsolationSessionRunner {
                 );
 
                 let mut logger = Logger::inherit_thread_diagnostic_sink();
-                let exit_code = manager
+                let exit_code = match manager
                     .create_process(&options, Some(&mut logger))
-                    .map_err(map_lifecycle_error)?;
+                    .map_err(map_lifecycle_error)?
+                {
+                    ExecOutcome::Exited(exit_code) => exit_code,
+                    ExecOutcome::TimedOut => WAIT_FOR_EXIT_TIMEOUT,
+                };
 
                 // The output relay completed inside `create_process`. The
                 // dispatcher sees zero pipe handles, skips its own relay setup,
