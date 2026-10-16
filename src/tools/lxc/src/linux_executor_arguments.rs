@@ -3,7 +3,7 @@
 
 use clap::Parser;
 use mxc_sdk::mxc_common::config_parser::load_one_shot_request;
-use mxc_sdk::mxc_common::logger::{Logger, Mode};
+use mxc_sdk::mxc_common::logger::Logger;
 use mxc_sdk::mxc_common::models::ExecutionRequest;
 use std::process;
 
@@ -83,7 +83,7 @@ impl LinuxExecutorArguments {
         self.debug
     }
 
-    pub fn should_display_avalible_backends(&self) -> bool {
+    pub fn should_display_available_backends(&self) -> bool {
         self.available_backends
     }
 
@@ -91,7 +91,7 @@ impl LinuxExecutorArguments {
         self.dry_run
     }
 
-    pub fn get_request(&self) -> ExecutionRequest {
+    pub fn get_request(&self, logger: &mut Logger) -> ExecutionRequest {
         let (config_data, is_base64) = if let Some(ref b64) = self.config_base64 {
             (b64.clone(), true)
         } else if let Some(ref path) = self.config {
@@ -105,16 +105,12 @@ impl LinuxExecutorArguments {
             process::exit(1);
         };
 
-        let mut logger = Logger::new(if self.debug {
-            Mode::Console
-        } else {
-            Mode::Buffer
-        });
-
-        let mut request = match load_one_shot_request(&config_data, &mut logger, is_base64) {
+        let mut request = match load_one_shot_request(&config_data, logger, is_base64) {
             Ok(r) => r,
             Err(_) => {
-                eprint!("Request error\n{}", logger.get_buffer());
+                eprintln!("Request error");
+                crate::emit_warnings(logger);
+                eprint!("{}", logger.get_buffer());
                 process::exit(1);
             }
         };
@@ -187,27 +183,37 @@ impl LinuxExecutorArguments {
         self.delete
     }
 
-    pub fn delete_container(&self) -> Result<String, String> {
+    pub fn delete_container(&self, logger: &mut Logger) -> bool {
         let name = match self.containername {
             Some(ref n) => n,
-            None => return Err("Error: --containername is required with --delete".to_string()),
+            None => {
+                eprintln!("Error: --containername is required with --delete");
+                process::exit(1);
+            }
         };
 
-        Self::delete_lxc_container(name)
+        Self::delete_lxc_container(name, logger)
     }
 
-    fn delete_lxc_container(name: &str) -> Result<String, String> {
+    fn delete_lxc_container(name: &str, logger: &mut Logger) -> bool {
         use mxc_sdk::lxc_common::lxc_bindings::LxcContainer;
 
         let container = LxcContainer::new(name, None);
 
         if !container.is_defined() {
-            return Err(format!("Container '{}' does not exist.", name));
+            logger.log_line(&format!("Container '{}' does not exist.", name));
+            return false;
         }
 
         match container.destroy() {
-            Ok(()) => Ok(format!("Deleted LXC container: {}", name)),
-            Err(e) => Err(format!("Failed to delete LXC container '{}': {}", name, e)),
+            Ok(()) => {
+                logger.log_line(&format!("Deleted LXC container: {}", name));
+                true
+            }
+            Err(e) => {
+                logger.log_line(&format!("Failed to delete LXC container '{}': {}", name, e));
+                false
+            }
         }
     }
 }

@@ -341,14 +341,21 @@ The zone query should answer the zone you assigned.
   Without the drop a workload holding `CAP_NET_RAW` could put frames on the wire
   beneath the chains, which filter at the IP layer. The drop also ends raw ICMP,
   and MXC reopens unprivileged ping by widening `net.ipv4.ping_group_range` inside
-  the container; a `SOCK_DGRAM` `IPPROTO_ICMP` echo still works. Default-deny
+  the container.  The workload can then send ICMP Echo requests through a
+  `SOCK_DGRAM` `IPPROTO_ICMP` socket, and the kernel refuses every other ICMP type
+  on that socket.  A `protocol: "icmp"` policy rule is broader: it matches every
+  ICMP type at the firewall.  The rule decides which ICMP may pass; the workload
+  can only originate Echo. Default-deny
   closes external reachability for a container that does not deliberately tear it
   down, including services the workload itself starts.
 - **The drop covers the command MXC runs, not container init.** Init keeps
   `CAP_NET_RAW` just as it keeps `CAP_NET_ADMIN`. A privileged process inside the
   container can still open a packet socket. The kernel checks the capability at
   creation, never at transmit, and an already-open descriptor handed to the
-  workload keeps sending. Nothing in a stock container image opens one; closing the
+  workload keeps sending.  An io_uring ring handed down the same way is the same
+  case: an operation submitted under a personality init registered runs with
+  init's credentials.  A ring the workload creates itself carries the workload's
+  credentials. Nothing in a stock container image opens either; closing the
   gap entirely needs a gate below the socket layer, which this backend does not add
   today.
 - **Policy is not in force while the container starts.** The chains are installed

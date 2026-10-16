@@ -547,7 +547,7 @@ impl LxcContainer {
         env: &[String],
         force_clear_env: bool,
         timeout: Option<std::time::Duration>,
-        _firewall: ContainerFirewall,
+        firewall: ContainerFirewall,
     ) -> Result<(i32, String, String), String> {
         use crate::mxc_pty::{run_with_pty, PtyOptions, PtyOutcome, Signal};
 
@@ -563,7 +563,9 @@ impl LxcContainer {
             force_clear_env,
         ));
 
-        confine_network_capabilities(&mut cmd);
+        if firewall == ContainerFirewall::Installed {
+            confine_network_capabilities(&mut cmd);
+        }
 
         let options = PtyOptions {
             unblock_signals: UNBLOCK,
@@ -607,7 +609,7 @@ impl LxcContainer {
         env: &[String],
         force_clear_env: bool,
         timeout: Option<std::time::Duration>,
-        _firewall: ContainerFirewall,
+        firewall: ContainerFirewall,
     ) -> Result<(i32, String, String), String> {
         use crate::mxc_common::interruptible_reader::wrap_pipe;
         use crate::mxc_common::sandbox_process::{wait_with_timeout, StreamCloser, WaitError};
@@ -626,7 +628,9 @@ impl LxcContainer {
 
         unblock_fatal_signals(&mut cmd);
 
-        confine_network_capabilities(&mut cmd);
+        if firewall == ContainerFirewall::Installed {
+            confine_network_capabilities(&mut cmd);
+        }
 
         let mut child = cmd
             .spawn()
@@ -790,7 +794,7 @@ impl LxcContainer {
         working_directory: &str,
         env: &[String],
         force_clear_env: bool,
-        _firewall: ContainerFirewall,
+        firewall: ContainerFirewall,
     ) -> std::process::Command {
         let mut cmd = self.lxc_command("lxc-attach");
         cmd.args(build_attach_args_with_env_control(
@@ -799,7 +803,9 @@ impl LxcContainer {
             command,
             force_clear_env,
         ));
-        confine_network_capabilities(&mut cmd);
+        if firewall == ContainerFirewall::Installed {
+            confine_network_capabilities(&mut cmd);
+        }
         cmd
     }
 

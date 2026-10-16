@@ -33,7 +33,7 @@ fn main() {
     }
 
     // Go through the different operating modes
-    if arguments.should_display_avalible_backends() {
+    if arguments.should_display_available_backends() {
         match mxc_sdk::mxc_engine::to_json_pretty(&mxc_sdk::mxc_engine::available_backends()) {
             Ok(json) => {
                 println!("{json}");
@@ -56,21 +56,14 @@ fn main() {
             }
         }
     } else if arguments.does_user_want_to_delete_a_container() {
-        match arguments.delete_container() {
-            Ok(message) => {
-                eprintln!("{message}");
-                process::exit(0);
-            }
-            Err(message) => {
-                eprintln!("{message}");
-                process::exit(1);
-            }
-        }
+        let success = arguments.delete_container(&mut logger);
+        print!("{}", logger.get_buffer());
+        process::exit(if success { 0 } else { 1 });
     }
 
     // User wants to run a request.
     // Make the request.
-    let request = arguments.get_request();
+    let request = arguments.get_request(&mut logger);
 
     let telemetry_active = request
         .telemetry
