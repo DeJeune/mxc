@@ -102,10 +102,11 @@ pub fn handle_dry_run_exit(response: &ScriptResponse, logger: &mut Logger) -> ! 
 /// [`FailurePhase`](crate::mxc_common::models::FailurePhase), so a refused policy is
 /// reported as `policy_validation` and a host that cannot provide the backend
 /// as `backend_unavailable`, rather than both being flattened into the generic
-/// `backend_error` every other failure uses.
+/// `backend_error` every other failure uses. The envelope starts on a fresh line
+/// because the workload's stderr may not end in a newline.
 pub fn emit_backend_error_envelope(response: &ScriptResponse) {
     if let Some(line) = backend_error_envelope_line(response) {
-        eprintln!("{line}");
+        eprintln!("\n{line}");
     }
 }
 

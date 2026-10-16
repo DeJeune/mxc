@@ -365,11 +365,10 @@ $null = $results.Add((Run-IsolationSessionTest "isolation_session_stderr.json" `
 # must appear in the captured output (proves streams aren't crossed or dropped mid-run).
 $null = $results.Add((Run-IsolationSessionTest "isolation_session_stdout_stderr_interleaved.json" `
     -OutputContains @("OUT_A", "ERR_A", "OUT_B", "ERR_B", "OUT_C")))
-# Timeout: ping runs ~30s against a 1500ms deadline. The service-side timer and
-# the local wait report different codes, and either can win the race to end the
-# run.
+# Timeout: ping runs ~30s against a 1500ms deadline. The local wait enforces the
+# deadline, so the run reports a typed timeout rather than the service's kill.
 $null = $results.Add((Run-IsolationSessionTest "isolation_session_timeout.json" `
-    -ExpectedExitAnyOf 1, -1))
+    -ExpectedExit -1 -OutputContains @('"code":"backend_error"', 'timed out after')))
 
 # Any IsolationSession-specific object is rejected at the same closed exact
 # contract boundary, before the command can run.
