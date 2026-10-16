@@ -36,6 +36,10 @@ public enum BackendCapability
     CaptureDenials = 1,
     ProxyEnforcement = 2,
     FilesystemDeniedPaths = 3,
+    /// <summary>
+    /// Native bidirectional host loopback, including container-hosted loopback servers.
+    /// Policy-permitted stateful outbound loopback does not require this capability.
+    /// </summary>
     IngressHostLoopbackAllow = 4,
     FilesystemEnumeratePaths = 5,
     IdentitylessLoopbackProxy = 6,
@@ -954,6 +958,10 @@ public sealed class ProbeFacts
     public bool BfsCompiledIn { get; init; }
     public bool BaseContainerSupportsDenyPaths { get; init; }
     public bool BaseContainerSupportsEnumeratePaths { get; init; }
+    /// <summary>
+    /// Native bidirectional host loopback, including container-hosted loopback servers.
+    /// Policy-permitted stateful outbound loopback does not require this capability.
+    /// </summary>
     public bool BaseContainerSupportsIngressHostLoopbackAllow { get; init; }
     public bool BaseContainerSupportsIdentitylessLoopbackProxy { get; init; }
     public bool IsolationSessionAvailable { get; init; }

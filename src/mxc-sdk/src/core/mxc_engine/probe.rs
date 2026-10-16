@@ -26,7 +26,8 @@ pub enum BackendCapability {
     FilesystemDeniedPaths,
     /// Native `processContainer.filesystem.enumeratePaths` enforcement at the reported tier.
     FilesystemEnumeratePaths,
-    /// `network.ingress.hostLoopback = "allow"` at the reported tier.
+    /// Native bidirectional host loopback, including container-hosted loopback servers.
+    /// Policy-permitted stateful outbound loopback does not require this capability.
     IngressHostLoopbackAllow,
     /// Bubblewrap proxy-only egress in a private network namespace.
     ProxyEnforcement,

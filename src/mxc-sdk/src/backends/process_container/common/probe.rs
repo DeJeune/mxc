@@ -71,8 +71,8 @@ pub struct ProbeFacts {
     pub base_container_supports_deny_paths: bool,
     /// Whether PSEC 1.1 can enforce `processContainer.filesystem.enumeratePaths` at Tier 1.
     pub base_container_supports_enumerate_paths: bool,
-    /// Whether BaseContainer can honor
-    /// `network.ingress.hostLoopback = "allow"`.
+    /// Native bidirectional host loopback, including container-hosted loopback servers.
+    /// Policy-permitted stateful outbound loopback does not require this capability.
     pub base_container_supports_ingress_host_loopback_allow: bool,
     /// Whether BaseContainer supports an identity-less proxy on loopback.
     /// Requires explicit host-loopback allow; not general ingress support.

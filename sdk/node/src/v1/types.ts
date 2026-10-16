@@ -681,6 +681,10 @@ export type BackendCapability =
   | 'captureDenials'
   | 'filesystemDeniedPaths'
   | 'filesystemEnumeratePaths'
+  /**
+   * Native bidirectional host loopback, including container-hosted loopback servers.
+   * Policy-permitted stateful outbound loopback does not require this capability.
+   */
   | 'ingressHostLoopbackAllow'
   | 'proxyEnforcement'
   | 'identitylessLoopbackProxy'
@@ -756,6 +760,10 @@ export interface ProbeFacts {
   bfsCompiledIn: boolean;
   baseContainerSupportsDenyPaths: boolean;
   baseContainerSupportsEnumeratePaths: boolean;
+  /**
+   * Native bidirectional host loopback, including container-hosted loopback servers.
+   * Policy-permitted stateful outbound loopback does not require this capability.
+   */
   baseContainerSupportsIngressHostLoopbackAllow: boolean;
   /** Identity-less proxy support on loopback; requires explicit host-loopback allow. */
   baseContainerSupportsIdentitylessLoopbackProxy: boolean;
