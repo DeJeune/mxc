@@ -557,7 +557,8 @@ An exited process is never routed through the shutdown ladder, which reads only 
 and so cannot tell a `259` exit from a live process. The adapter maps
 `TimedOut` onto `ErrorKind::TimedOut`, which is what
 `mxc_sdk::v1::MxcProcess::wait` reads as `WaitResult::TimedOut`. That outcome
-is reachable only under `Piped`; the `Relayed` arm reports `Exited`.
+is reachable only under `Piped`; the `Relayed` arm reports a timeout as a
+`backend_error` instead.
 
 Teardown is bounded only insofar as the kill is: the streaming adapter's
 `Drop` joins the waiter when the kill was accepted, and abandons the
