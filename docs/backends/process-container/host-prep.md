@@ -90,8 +90,12 @@ What this **does not** grant:
 - `FILE_READ_DATA` — irrelevant on a directory, but explicit.
 - any write rights.
 
-Because the ACEs are non-inheriting, descendant files and
-subdirectories of `C:\` are unaffected.
+The ACEs are non-inheriting, and prepare/unprepare write the target
+DACL through a handle opened with `MAXIMUM_ALLOWED`. As documented by
+[`SetSecurityInfo`](https://learn.microsoft.com/en-us/windows/win32/api/aclapi/nf-aclapi-setsecurityinfo),
+this suppresses propagation of existing inheritable ACEs to descendants.
+Existing child ACLs and the target's inheritance protection remain unchanged;
+runtime subtree grants continue to use the propagating write path.
 
 Re-running `prepare-system-drive` is idempotent: when our exact ACE
 is already present, the scan-before-apply path detects the match and

@@ -78,8 +78,8 @@ use windows::Win32::Foundation::{
 };
 use windows::Win32::Security::Authorization::{
     ConvertSidToStringSidW, ConvertStringSidToSidW, GetNamedSecurityInfoW, SetEntriesInAclW,
-    SetNamedSecurityInfoW, EXPLICIT_ACCESS_W, GRANT_ACCESS, SE_FILE_OBJECT, TRUSTEE_IS_SID,
-    TRUSTEE_IS_UNKNOWN, TRUSTEE_W,
+    SetNamedSecurityInfoW, SetSecurityInfo, EXPLICIT_ACCESS_W, GRANT_ACCESS, SE_FILE_OBJECT,
+    TRUSTEE_IS_SID, TRUSTEE_IS_UNKNOWN, TRUSTEE_W,
 };
 // DENY_ACCESS lives on ACCESS_MODE in windows 0.62
 use windows::Win32::Security::Authorization::DENY_ACCESS;
@@ -93,8 +93,11 @@ use windows::Win32::Security::{
     TOKEN_OWNER, TOKEN_QUERY, TOKEN_USER,
 };
 use windows::Win32::Storage::FileSystem::{
-    DELETE, FILE_ALL_ACCESS, FILE_GENERIC_EXECUTE, FILE_GENERIC_READ, FILE_GENERIC_WRITE,
+    CreateFileW, DELETE, FILE_ALL_ACCESS, FILE_FLAG_BACKUP_SEMANTICS, FILE_GENERIC_EXECUTE,
+    FILE_GENERIC_READ, FILE_GENERIC_WRITE, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+    OPEN_EXISTING,
 };
+use windows::Win32::System::SystemServices::MAXIMUM_ALLOWED;
 use windows::Win32::System::Threading::{
     CreateMutexW, GetCurrentProcess, GetProcessTimes, OpenProcess, QueryFullProcessImageNameW,
     ReleaseMutex, WaitForSingleObject, PROCESS_NAME_FORMAT, PROCESS_QUERY_LIMITED_INFORMATION,
@@ -1098,6 +1101,42 @@ pub fn apply_explicit_ace(
     ace_type: AceType,
     inheritable: bool,
 ) -> Result<(), DaclError> {
+    apply_explicit_ace_with_mode(
+        path,
+        sid_str,
+        access_mask,
+        ace_type,
+        inheritable,
+        DaclWriteMode::Propagate,
+    )
+}
+
+/// Apply a non-inheriting ACE without propagating existing inheritable ACEs to descendants.
+/// Intended for persistent host preparation, not runtime subtree grants.
+pub fn apply_explicit_ace_to_object(
+    path: &Path,
+    sid_str: &str,
+    access_mask: u32,
+    ace_type: AceType,
+) -> Result<(), DaclError> {
+    apply_explicit_ace_with_mode(
+        path,
+        sid_str,
+        access_mask,
+        ace_type,
+        false,
+        DaclWriteMode::TargetOnly,
+    )
+}
+
+fn apply_explicit_ace_with_mode(
+    path: &Path,
+    sid_str: &str,
+    access_mask: u32,
+    ace_type: AceType,
+    inheritable: bool,
+    mode: DaclWriteMode,
+) -> Result<(), DaclError> {
     let sid = OwnedSid::parse(sid_str)?;
 
     let inheritance: u32 = if inheritable {
@@ -1105,13 +1144,13 @@ pub fn apply_explicit_ace(
     } else {
         0
     };
-    let mode = match ace_type {
+    let access_mode = match ace_type {
         AceType::Allow => GRANT_ACCESS,
         AceType::Deny => DENY_ACCESS,
     };
     let ea = EXPLICIT_ACCESS_W {
         grfAccessPermissions: access_mask,
-        grfAccessMode: mode,
+        grfAccessMode: access_mode,
         grfInheritance: ACE_FLAGS(inheritance),
         Trustee: trustee_for(&sid),
     };
@@ -1153,35 +1192,74 @@ pub fn apply_explicit_ace(
         return Err(win32_err(path, "SetEntriesInAclW", rc));
     }
 
-    let rc = unsafe {
-        SetNamedSecurityInfoW(
-            object_name,
-            SE_FILE_OBJECT,
-            DACL_SECURITY_INFORMATION,
-            None,
-            None,
-            Some(new_dacl as *const ACL),
-            None,
-        )
-    };
-
+    let result = write_dacl(path, new_dacl, mode);
     unsafe {
         if !new_dacl.is_null() {
             let _ = LocalFree(Some(HLOCAL(new_dacl as *mut c_void)));
         }
         let _ = LocalFree(Some(HLOCAL(sd.0)));
     }
+    result
+}
 
-    if rc != ERROR_SUCCESS {
-        if rc.0 == 5 {
-            return Err(DaclError::WriteDacDenied {
-                path: path.to_path_buf(),
-                reason: format!("SetNamedSecurityInfoW: {rc:?}"),
-            });
+#[derive(Clone, Copy)]
+enum DaclWriteMode {
+    Propagate,
+    TargetOnly,
+}
+
+fn write_dacl(path: &Path, dacl: *const ACL, mode: DaclWriteMode) -> Result<(), DaclError> {
+    let path_w = wide(path);
+    // SAFETY: callers keep a valid ACL buffer alive until this synchronous write returns.
+    let (operation, rc) = unsafe {
+        match mode {
+            DaclWriteMode::Propagate => (
+                "SetNamedSecurityInfoW",
+                SetNamedSecurityInfoW(
+                    PCWSTR(path_w.as_ptr()),
+                    SE_FILE_OBJECT,
+                    DACL_SECURITY_INFORMATION,
+                    None,
+                    None,
+                    Some(dacl),
+                    None,
+                ),
+            ),
+            DaclWriteMode::TargetOnly => {
+                // MAXIMUM_ALLOWED disables SetSecurityInfo's descendant propagation.
+                let handle = CreateFileW(
+                    PCWSTR(path_w.as_ptr()),
+                    MAXIMUM_ALLOWED,
+                    FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                    None,
+                    OPEN_EXISTING,
+                    FILE_FLAG_BACKUP_SEMANTICS,
+                    None,
+                )
+                .map_err(|e| win32_err_str(path, &format!("CreateFileW: {e}")))?;
+                let rc = SetSecurityInfo(
+                    handle,
+                    SE_FILE_OBJECT,
+                    DACL_SECURITY_INFORMATION,
+                    None,
+                    None,
+                    Some(dacl),
+                    None,
+                );
+                let _ = CloseHandle(handle);
+                ("SetSecurityInfo", rc)
+            }
         }
-        return Err(win32_err(path, "SetNamedSecurityInfoW", rc));
+    };
+    if rc.0 == 5 {
+        return Err(DaclError::WriteDacDenied {
+            path: path.to_path_buf(),
+            reason: format!("{operation}: {rc:?}"),
+        });
     }
-
+    if rc != ERROR_SUCCESS {
+        return Err(win32_err(path, operation, rc));
+    }
     Ok(())
 }
 
@@ -1439,6 +1517,41 @@ pub fn revoke_specific_aces_for_sid(
     ace_type: AceType,
     inheritable: bool,
 ) -> Result<usize, DaclError> {
+    revoke_specific_aces_with_mode(
+        path,
+        sid_str,
+        access_mask,
+        ace_type,
+        inheritable,
+        DaclWriteMode::Propagate,
+    )
+}
+
+/// Revoke matching non-inheriting ACEs without changing descendants' security descriptors.
+pub fn revoke_specific_aces_from_object(
+    path: &Path,
+    sid_str: &str,
+    access_mask: u32,
+    ace_type: AceType,
+) -> Result<usize, DaclError> {
+    revoke_specific_aces_with_mode(
+        path,
+        sid_str,
+        access_mask,
+        ace_type,
+        false,
+        DaclWriteMode::TargetOnly,
+    )
+}
+
+fn revoke_specific_aces_with_mode(
+    path: &Path,
+    sid_str: &str,
+    access_mask: u32,
+    ace_type: AceType,
+    inheritable: bool,
+    mode: DaclWriteMode,
+) -> Result<usize, DaclError> {
     // Compute the inherit-flags byte we'd have applied (matches the
     // logic in `apply_explicit_ace`). Inherited ACEs are masked off by
     // `scan_explicit_aces_for_sid` so the captured `inherit_flags`
@@ -1471,7 +1584,7 @@ pub fn revoke_specific_aces_for_sid(
     // `restore_one`: `SetEntriesInAclW(REVOKE_ACCESS)` doesn't
     // reliably remove explicit DENY ACEs on Windows 11 25H2, so we
     // rebuild the DACL by hand.
-    replace_explicit_aces_for_sid(path, sid_str, &keeps)?;
+    replace_explicit_aces_for_sid(path, sid_str, &keeps, mode)?;
     Ok(removed)
 }
 
@@ -1491,7 +1604,12 @@ pub fn revoke_specific_aces_for_sid(
 /// had no DACL); `Ok(None)` on a fully applied restore.
 fn restore_one(entry: &AppliedAce) -> Result<Option<String>, DaclError> {
     let _guard = PathMutexGuard::acquire(&entry.canonical_path)?;
-    replace_explicit_aces_for_sid(&entry.canonical_path, &entry.sid_string, &entry.prior_state)?;
+    replace_explicit_aces_for_sid(
+        &entry.canonical_path,
+        &entry.sid_string,
+        &entry.prior_state,
+        DaclWriteMode::Propagate,
+    )?;
     Ok(None)
 }
 
@@ -1888,6 +2006,7 @@ fn replace_explicit_aces_for_sid(
     path: &Path,
     sid_str: &str,
     replay: &[PriorAce],
+    mode: DaclWriteMode,
 ) -> Result<(), DaclError> {
     let sid = OwnedSid::parse(sid_str)?;
     let path_w = wide(path);
@@ -1911,38 +2030,12 @@ fn replace_explicit_aces_for_sid(
         return Err(win32_err(path, "GetNamedSecurityInfoW", rc));
     }
 
-    let result = replace_explicit_aces_for_sid_inner(path, &sid, existing_dacl, replay);
-
+    let result = replace_explicit_aces_for_sid_inner(path, &sid, existing_dacl, replay)
+        .and_then(|new_acl_dwords| write_dacl(path, new_acl_dwords.as_ptr().cast(), mode));
     unsafe {
         let _ = LocalFree(Some(HLOCAL(sd.0)));
     }
-    result.and_then(|new_acl_dwords| {
-        // `new_acl_dwords` is the freshly-built ACL buffer; we apply
-        // it via `SetNamedSecurityInfoW` outside the inner helper so
-        // the SD cleanup above can still run on the early-return path.
-        let new_acl_ptr = new_acl_dwords.as_ptr() as *const ACL;
-        let rc = unsafe {
-            SetNamedSecurityInfoW(
-                object_name,
-                SE_FILE_OBJECT,
-                DACL_SECURITY_INFORMATION,
-                None,
-                None,
-                Some(new_acl_ptr),
-                None,
-            )
-        };
-        if rc != ERROR_SUCCESS {
-            if rc.0 == 5 {
-                return Err(DaclError::WriteDacDenied {
-                    path: path.to_path_buf(),
-                    reason: format!("SetNamedSecurityInfoW: {rc:?}"),
-                });
-            }
-            return Err(win32_err(path, "SetNamedSecurityInfoW", rc));
-        }
-        Ok(())
-    })
+    result
 }
 
 /// Canonical-order bucket for an ACE. Smaller bucket = earlier slot
@@ -2871,17 +2964,27 @@ mod tests {
     fn inheritance_propagation() {
         let _scope = ScopedStateDir::new();
         let td = tempfile::tempdir().unwrap();
+        set_owner_only_dacl(td.path(), true).unwrap();
         let sub = td.path().join("sub");
         std::fs::create_dir(&sub).unwrap();
         let f = sub.join("file.txt");
         std::fs::write(&f, b"x").unwrap();
+        for path in [&sub, &f] {
+            assert_eq!(compute_appcontainer_effective_access(path).unwrap(), 0);
+        }
         let mut m = DaclManager::new().unwrap();
-        m.grant_appcontainer_access("S-1-1-0", &[td.path().to_path_buf()], &[])
+        m.grant_appcontainer_access("S-1-15-2-1", &[td.path().to_path_buf()], &[])
             .unwrap();
-        // We don't inspect the child's ACL programmatically here (that
-        // would re-implement most of the apply path). The contract being
-        // exercised is "no error on apply, no error on restore."
+        for path in [&sub, &f] {
+            assert_eq!(
+                compute_appcontainer_effective_access(path).unwrap(),
+                RW_MASK
+            );
+        }
         m.restore().unwrap();
+        for path in [&sub, &f] {
+            assert_eq!(compute_appcontainer_effective_access(path).unwrap(), 0);
+        }
     }
 
     /// Apply twice to the same path with overlapping rights, then

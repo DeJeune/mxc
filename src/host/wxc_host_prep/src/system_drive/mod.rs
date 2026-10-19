@@ -42,8 +42,8 @@
 use std::path::{Path, PathBuf};
 
 use mxc_sdk::mxc_common::filesystem_dacl::{
-    apply_explicit_ace, revoke_specific_aces_for_sid, scan_explicit_aces_for_sid, AceType,
-    DaclError,
+    apply_explicit_ace_to_object, revoke_specific_aces_from_object, scan_explicit_aces_for_sid,
+    AceType, DaclError,
 };
 
 /// Well-known SID for the AppContainer "ALL APPLICATION PACKAGES" group.
@@ -212,7 +212,7 @@ fn apply_all(path: &Path) -> Result<(), PrepError> {
         }
 
         println!("  + {name:<45} ({sid})");
-        apply_explicit_ace(path, sid, STAT_ACCESS_MASK, AceType::Allow, false)?;
+        apply_explicit_ace_to_object(path, sid, STAT_ACCESS_MASK, AceType::Allow)?;
     }
     Ok(())
 }
@@ -224,7 +224,7 @@ fn apply_all(path: &Path) -> Result<(), PrepError> {
 fn revoke_all(path: &Path) -> Result<(), PrepError> {
     for (name, sid) in TRUSTEES {
         let removed =
-            revoke_specific_aces_for_sid(path, sid, STAT_ACCESS_MASK, AceType::Allow, false)?;
+            revoke_specific_aces_from_object(path, sid, STAT_ACCESS_MASK, AceType::Allow)?;
         if removed > 0 {
             println!("  - {name:<45} ({sid}) [{removed} ACE(s) removed]");
         } else {
@@ -302,6 +302,7 @@ mod tests {
     // (redirected via MXC_PREPARE_PATH_OVERRIDE).
 
     use super::*;
+    use mxc_sdk::mxc_common::filesystem_dacl::{apply_explicit_ace, revoke_specific_aces_for_sid};
     use std::sync::Mutex;
 
     // Serialize tests that mutate process-wide env vars.
@@ -418,6 +419,153 @@ mod tests {
         let _g = SystemDriveGuard::set("C:");
         let resolved = resolve_target_path(Some("Z:\\")).unwrap();
         assert_eq!(resolved, PathBuf::from("Z:\\"));
+    }
+
+    fn read_dacl(path: &Path) -> Vec<u8> {
+        use std::os::windows::ffi::OsStrExt;
+        use windows::core::PCWSTR;
+        use windows::Win32::Security::{
+            GetFileSecurityW, DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR,
+        };
+        let name: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+        let mut needed = 0;
+        // SAFETY: first obtain the buffer size, then provide that many writable bytes.
+        unsafe {
+            let _ = GetFileSecurityW(
+                PCWSTR(name.as_ptr()),
+                DACL_SECURITY_INFORMATION.0,
+                None,
+                0,
+                &mut needed,
+            );
+            assert!(needed > 0);
+            let mut buffer = vec![0; needed as usize];
+            GetFileSecurityW(
+                PCWSTR(name.as_ptr()),
+                DACL_SECURITY_INFORMATION.0,
+                Some(PSECURITY_DESCRIPTOR(buffer.as_mut_ptr().cast())),
+                needed,
+                &mut needed,
+            )
+            .ok()
+            .unwrap();
+            buffer
+        }
+    }
+
+    fn restore_dacl(path: &Path, descriptor: &[u8]) -> Vec<u8> {
+        use std::os::windows::ffi::OsStrExt;
+        use windows::core::PCWSTR;
+        use windows::Win32::Security::{
+            SetFileSecurityW, SetSecurityDescriptorControl, DACL_SECURITY_INFORMATION,
+            PSECURITY_DESCRIPTOR, SECURITY_DESCRIPTOR_CONTROL, SE_DACL_AUTO_INHERITED,
+            SE_DACL_AUTO_INHERIT_REQ,
+        };
+        let name: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+        let mut descriptor = descriptor.to_vec();
+        // SAFETY: descriptor is a complete self-relative SD returned by GetFileSecurityW.
+        unsafe {
+            SetSecurityDescriptorControl(
+                PSECURITY_DESCRIPTOR(descriptor.as_mut_ptr().cast()),
+                SE_DACL_AUTO_INHERITED | SE_DACL_AUTO_INHERIT_REQ,
+                SECURITY_DESCRIPTOR_CONTROL(0),
+            )
+            .unwrap();
+            SetFileSecurityW(
+                PCWSTR(name.as_ptr()),
+                DACL_SECURITY_INFORMATION,
+                PSECURITY_DESCRIPTOR(descriptor.as_ptr().cast_mut().cast()),
+            )
+            .ok()
+            .unwrap();
+        }
+        descriptor
+    }
+
+    fn assert_descendants_unchanged(prepare: bool, protected: bool) {
+        let root = tempfile::tempdir().unwrap();
+        if protected {
+            mxc_sdk::mxc_common::filesystem_dacl::set_owner_only_dacl(root.path(), true).unwrap();
+        }
+        let child = root.path().join("child");
+        let nested = child.join("nested");
+        let file = nested.join("file.txt");
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::write(&file, b"fixture").unwrap();
+        let paths = [&child, &nested, &file];
+        let original: Vec<_> = paths.iter().map(|p| read_dacl(p)).collect();
+        // A parent ACE absent from existing children exposes unintended inheritance reconciliation.
+        apply_explicit_ace(
+            root.path(),
+            "S-1-5-21-424242-424242-424242-1234",
+            STAT_ACCESS_MASK,
+            AceType::Allow,
+            true,
+        )
+        .unwrap();
+        assert_ne!(
+            read_dacl(&child),
+            original[0],
+            "positive control must propagate"
+        );
+        if !prepare {
+            apply_all(root.path()).unwrap();
+        }
+        for (path, sd) in paths.iter().zip(&original) {
+            let expected = restore_dacl(path, sd);
+            assert_eq!(
+                read_dacl(path),
+                expected,
+                "fixture must restore the original DACL"
+            );
+        }
+        let original: Vec<_> = paths.iter().map(|p| read_dacl(p)).collect();
+        let parent_before = read_dacl(root.path());
+        for _ in 0..2 {
+            if prepare {
+                apply_all(root.path()).unwrap();
+            } else {
+                revoke_all(root.path()).unwrap();
+            }
+            for (path, expected) in paths.iter().zip(&original) {
+                assert_eq!(
+                    read_dacl(path),
+                    *expected,
+                    "descendant ACL changed: {}",
+                    path.display()
+                );
+            }
+            for (_, sid) in TRUSTEES {
+                let entries = scan_explicit_aces_for_sid(root.path(), sid).unwrap();
+                assert_eq!(entries.len(), usize::from(prepare));
+                if prepare {
+                    assert_eq!(entries[0].access_mask, STAT_ACCESS_MASK);
+                    assert_eq!(entries[0].inherit_flags, 0);
+                }
+            }
+        }
+        if prepare {
+            revoke_all(root.path()).unwrap();
+            assert_eq!(
+                read_dacl(root.path()),
+                parent_before,
+                "parent DACL must round-trip"
+            );
+        }
+    }
+
+    #[test]
+    fn prepare_does_not_reconcile_descendant_dacls() {
+        for protected in [false, true] {
+            assert_descendants_unchanged(true, protected);
+        }
+    }
+
+    #[test]
+    fn unprepare_does_not_reconcile_descendant_dacls() {
+        for protected in [false, true] {
+            assert_descendants_unchanged(false, protected);
+        }
     }
 
     #[test]
